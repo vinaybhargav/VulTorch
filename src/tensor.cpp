@@ -18,18 +18,38 @@ namespace {
 
 // GEMM variants. Which one is fastest depends on the shape *and* the device
 // (tile reuse vs occupancy), so the choice is measured, not hardcoded.
+enum class MatmulRequirement {
+    None,
+    // Needs a 16x16x16 f16 x f16 -> f32 cooperative-matrix configuration.
+    Fp16CoopMat,
+};
+
 struct MatmulCandidate {
     const char* shader;
     uint32_t tile;
     uint32_t shared_bytes;
+    uint32_t workgroup_size;
+    MatmulRequirement requirement;
+    // Opt-in kernels are selectable by name but excluded from automatic
+    // selection, so a variant that loses the measurement never spends
+    // autotune time or changes numerics behind the user's back.
+    bool auto_candidate;
 };
 
 constexpr MatmulCandidate kMatmulCandidates[] = {
     // Purely register/shared-free baseline; always available.
-    {"matmul", 32u, 0u},
+    {"matmul", 32u, 0u, 256u, MatmulRequirement::None, true},
     // TK * (TILE + PAD) * sizeof(float) * 2
-    {"matmul_tiled64", 64u, 16u * (64u + 1u) * 4u * 2u},
-    {"matmul_tiled", 128u, 16u * (128u + 1u) * 4u * 2u},
+    {"matmul_tiled64", 64u, 16u * (64u + 1u) * 4u * 2u, 256u, MatmulRequirement::None, true},
+    {"matmul_tiled", 128u, 16u * (128u + 1u) * 4u * 2u, 256u, MatmulRequirement::None, true},
+    // sA + sB (f16, padded) + output staging (f32, padded).
+    // Measured 5x slower than matmul_tiled on the RX 7900 XTX (2.9 vs 15.6
+    // TFLOPS at 2048^3): one subgroup per workgroup is too little parallelism
+    // for the fp32->f16 staging loop. Kept selectable for further work; see
+    // docs/kernels/gemm.md.
+    {"matmul_coopmat", 64u,
+     64u * 17u * 2u + 16u * 68u * 2u + 64u * 68u * 4u, 64u,
+     MatmulRequirement::Fp16CoopMat, false},
 };
 
 struct MatmulChoice {
@@ -65,11 +85,22 @@ MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, ui
     const DeviceCapabilities& caps = dev->capabilities;
 
     // 1. Capability filter: only variants this device reports it can run.
-    std::vector<MatmulChoice> candidates;
+    std::vector<MatmulChoice> candidates;      // legal here, including opt-in
+    std::vector<MatmulChoice> auto_candidates; // eligible for automatic use
     for (const auto& candidate : kMatmulCandidates) {
         if (candidate.shared_bytes > caps.max_shared_memory_bytes) continue;
-        if (caps.max_workgroup_invocations < 256u) continue;
+        if (candidate.workgroup_size > caps.max_workgroup_invocations) continue;
+        if (candidate.requirement == MatmulRequirement::Fp16CoopMat) {
+            // The kernel splits 64 columns across gl_NumSubgroups, so each
+            // subgroup must own at least one 16-wide tile.
+            if (!caps.fp16_coopmat_16x16) continue;
+            if (caps.subgroup_size < 16u || caps.subgroup_size % 16u != 0u) continue;
+            if (64u % caps.subgroup_size != 0u) continue;
+        }
         candidates.push_back({candidate.shader, candidate.tile});
+        if (candidate.auto_candidate) {
+            auto_candidates.push_back({candidate.shader, candidate.tile});
+        }
     }
     if (candidates.empty()) return {"matmul", 32u};
 
@@ -89,7 +120,8 @@ MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, ui
     //    autotune sweep would cost far more than the multiplication.
     if (2ull * M * N * K < 1'000'000ull) return {"matmul", 32u};
 
-    if (candidates.size() == 1) return candidates.front();
+    if (auto_candidates.empty()) return {"matmul", 32u};
+    if (auto_candidates.size() == 1) return auto_candidates.front();
 
     // 4. Measured selection, cached per (device, shape). Training reuses a
     //    handful of shapes, so this cost is paid a few times per process.
@@ -100,12 +132,12 @@ MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, ui
         if (it != g_matmul_choice_cache.end()) return it->second;
     }
 
-    if (!env_flag_enabled("VULTORCH_AUTOTUNE", true)) return candidates.back();
+    if (!env_flag_enabled("VULTORCH_AUTOTUNE", true)) return auto_candidates.back();
 
-    MatmulChoice best = candidates.front();
+    MatmulChoice best = auto_candidates.front();
     double best_ms = 0.0;
 
-    for (const auto& candidate : candidates) {
+    for (const auto& candidate : auto_candidates) {
         // Fixed *time* budget of warmup: the first runs of a kernel happen at
         // low clocks while the GPU ramps, and the operands are still cold. A
         // count-based warmup would let power management decide the contest.

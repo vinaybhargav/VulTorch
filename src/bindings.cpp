@@ -37,6 +37,7 @@ PYBIND11_MODULE(_vultorch_backend, m) {
         caps["storage_16bit"] = info.capabilities.storage_16bit;
         caps["subgroup_basic"] = info.capabilities.subgroup_basic;
         caps["subgroup_arithmetic"] = info.capabilities.subgroup_arithmetic;
+        caps["fp16_coopmat_16x16"] = info.capabilities.fp16_coopmat_16x16;
         d["capabilities"] = caps;
 
         py::list configs;

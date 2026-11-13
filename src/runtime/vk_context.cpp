@@ -147,6 +147,18 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
                 }
             }
         }
+
+        // Does this device expose the shape the coopmat kernel is written for?
+        for (const auto& config : cooperative_matrix_configs) {
+            if (config.M == 16 && config.N == 16 && config.K == 16 &&
+                config.a_type == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                config.b_type == VK_COMPONENT_TYPE_FLOAT16_KHR &&
+                config.c_type == VK_COMPONENT_TYPE_FLOAT32_KHR &&
+                config.scope == VK_SCOPE_SUBGROUP_KHR) {
+                capabilities.fp16_coopmat_16x16 = true;
+                break;
+            }
+        }
     }
 
     vkGetDeviceQueue(device, compute_queue_family, 0, &compute_queue);

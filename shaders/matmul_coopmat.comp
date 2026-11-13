@@ -1,0 +1,164 @@
+#version 450
+
+// SGEMM via VK_KHR_cooperative_matrix.
+//
+// Both target devices report a 16x16x16 f16 x f16 -> f32 configuration at
+// subgroup scope, which is what this kernel targets. Operands are fp32 in
+// global memory (the framework has one dtype) and are narrowed to f16 while
+// staging into shared memory; accumulation stays fp32.
+//
+// Workgroup tile: 64x64. A workgroup is one subgroup on wave64 hardware and two
+// on wave32 hardware, so the column range is split by gl_NumSubgroups rather
+// than assumed.
+//
+// Results are staged through shared memory before being written out, because
+// coopMatStore cannot bounds-check and M/N are not always multiples of 16.
+
+#extension GL_KHR_cooperative_matrix : enable
+#extension GL_KHR_memory_scope_semantics : enable
+#extension GL_KHR_shader_subgroup_basic : enable
+#extension GL_EXT_shader_explicit_arithmetic_types_float16 : enable
+#extension GL_EXT_control_flow_attributes : enable
+
+#define BM 64
+#define BN 64
+#define BK 16
+#define CM 16
+#define BKP 17  // BM stride in shared, padded
+#define BNP 68  // BK stride in shared, padded
+#define SOP 68  // output staging stride, padded
+
+layout(local_size_x = 64) in;
+
+layout(std430, binding = 0) readonly buffer BufferA {
+    float dataA[];
+};
+
+layout(std430, binding = 1) readonly buffer BufferB {
+    float dataB[];
+};
+
+layout(std430, binding = 2) writeonly buffer BufferC {
+    float dataC[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+    uint batch_count;
+    uint strideA_b;
+    uint strideA_m;
+    uint strideA_k;
+    uint strideB_b;
+    uint strideB_k;
+    uint strideB_n;
+    uint strideC_b;
+    uint strideC_m;
+    uint strideC_n;
+} pc;
+
+shared float16_t sA[BM * BKP];
+shared float16_t sB[BK * BNP];
+shared float sOut[BM * SOP];
+
+#define ACCUM coopmat<float, gl_ScopeSubgroup, CM, CM, gl_MatrixUseAccumulator>
+#define FRAG_A coopmat<float16_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseA>
+#define FRAG_B coopmat<float16_t, gl_ScopeSubgroup, CM, CM, gl_MatrixUseB>
+
+void main() {
+    const uint tid = gl_LocalInvocationID.x;
+    const uint subgroup = gl_SubgroupID;
+    const uint num_subgroups = gl_NumSubgroups;
+
+    const uint block_y = gl_WorkGroupID.y;
+    const uint block_x = gl_WorkGroupID.x;
+    const uint batch = gl_WorkGroupID.z;
+
+    // Each subgroup owns a slice of the 64 output columns.
+    const uint cols_per_subgroup = BN / num_subgroups; // 64 (wave64) or 32 (wave32)
+    const uint col_tiles = cols_per_subgroup / CM;     // 4 or 2
+    const uint col_base = subgroup * cols_per_subgroup;
+
+    ACCUM acc[4][4];
+    [[unroll]] for (int i = 0; i < 4; ++i) {
+        [[unroll]] for (int j = 0; j < 4; ++j) {
+            acc[i][j] = ACCUM(0.0);
+        }
+    }
+
+    const uint baseA = batch * pc.strideA_b;
+    const uint baseB = batch * pc.strideB_b;
+    const uint baseC = batch * pc.strideC_b;
+
+    const uint num_k_tiles = (pc.K + BK - 1u) / BK;
+
+    for (uint tile = 0; tile < num_k_tiles; ++tile) {
+        const uint k_base = tile * BK;
+
+        // Stage 64 x BK of A, narrowing fp32 -> f16.
+        for (uint idx = tid; idx < BM * BK; idx += 64u) {
+            const uint m = idx / BK;
+            const uint k = idx % BK;
+            const uint gm = block_y * BM + m;
+            const uint gk = k_base + k;
+            const float v = (gm < pc.M && gk < pc.K)
+                                ? dataA[baseA + gm * pc.strideA_m + gk * pc.strideA_k]
+                                : 0.0;
+            sA[m * BKP + k] = float16_t(v);
+        }
+
+        // Stage BK x 64 of B.
+        for (uint idx = tid; idx < BK * BN; idx += 64u) {
+            const uint k = idx / BN;
+            const uint n = idx % BN;
+            const uint gk = k_base + k;
+            const uint gn = block_x * BN + n;
+            const float v = (gk < pc.K && gn < pc.N)
+                                ? dataB[baseB + gk * pc.strideB_k + gn * pc.strideB_n]
+                                : 0.0;
+            sB[k * BNP + n] = float16_t(v);
+        }
+
+        barrier();
+
+        [[unroll]] for (int rt = 0; rt < 4; ++rt) {
+            FRAG_A frag_a;
+            coopMatLoad(frag_a, sA, rt * CM * BKP, BKP, gl_CooperativeMatrixLayoutRowMajor);
+
+            [[unroll]] for (int ct = 0; ct < 4; ++ct) {
+                if (uint(ct) < col_tiles) {
+                    FRAG_B frag_b;
+                    coopMatLoad(frag_b, sB, int(col_base) + ct * CM, BNP,
+                                gl_CooperativeMatrixLayoutRowMajor);
+                    acc[rt][ct] = coopMatMulAdd(frag_a, frag_b, acc[rt][ct]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Stage the accumulator tile, then copy only the in-range elements.
+    [[unroll]] for (int rt = 0; rt < 4; ++rt) {
+        [[unroll]] for (int ct = 0; ct < 4; ++ct) {
+            if (uint(ct) < col_tiles) {
+                coopMatStore(acc[rt][ct], sOut,
+                             rt * CM * SOP + int(col_base) + ct * CM, SOP,
+                             gl_CooperativeMatrixLayoutRowMajor);
+            }
+        }
+    }
+
+    barrier();
+
+    for (uint idx = tid; idx < BM * BN; idx += 64u) {
+        const uint m = idx / BN;
+        const uint n = idx % BN;
+        const uint gm = block_y * BM + m;
+        const uint gn = block_x * BN + n;
+        if (gm < pc.M && gn < pc.N) {
+            dataC[baseC + gm * pc.strideC_m + gn * pc.strideC_n] = sOut[m * SOP + n];
+        }
+    }
+}

@@ -101,11 +101,11 @@ row-wise winner at all three sizes.
 
 ## 5. What this is not
 
-- **Not cooperative matrix.** Both target GPUs expose
-  `VK_KHR_cooperative_matrix` with 16×16×16 shapes (verified on the device), but
-  exploiting it requires fp16 operands in shared memory and a different
-  fragment layout. That is the next step, and it should roughly double the
-  compute roof.
+- **Not cooperative matrix (yet).** Both target GPUs expose
+  `VK_KHR_cooperative_matrix` with 16×16×16 f16→f32, and an implementation
+  exists (`shaders/matmul_coopmat.comp`). It is correct but **5× slower** than
+  the SIMT kernels, so it is opt-in only. See §7 for the measurement and the
+  diagnosis.
 - **Not fp16 yet.** `float16_arithmetic` and `storage_16bit` are reported by
   both cards and surfaced through `torch.vulkan.get_device_properties`, but the
   tensor dtype is still fp32-only.
@@ -127,3 +127,47 @@ VULTORCH_MATMUL_KERNEL=matmul_tiled   .venv/bin/python benchmarks/bench_dispatch
 Correctness of every variant, including ragged shapes, is pinned by
 `tests/test_kernel_selection.py`; capability reporting is pinned by the same
 file.
+
+## 7. Cooperative matrix: implemented, measured, not used (yet)
+
+`shaders/matmul_coopmat.comp` implements SGEMM on `VK_KHR_cooperative_matrix`:
+64×64 workgroup tile, 16×16×16 f16×f16→f32 fragments, fp32 accumulation, fp32
+operands narrowed to f16 while staging to shared memory. Both target devices
+expose that configuration, so it runs on both.
+
+It is numerically correct — max relative error 2.8e-4 against fp64, which is
+what f16 operands with f32 accumulation should give — but it is **much slower**:
+
+| shape | 64×64 SIMT | 128×128 SIMT | coopmat |
+|---|---|---|---|
+| 512³ | 3.01 | 1.51 | **1.05** |
+| 1024³ | 9.47 | 6.39 | **2.32** |
+| 2048³ | 13.72 | 15.55 | **2.93** |
+
+### Why it lost
+
+1. **One subgroup per workgroup.** 64 invocations stage a 64×16 A slab and a
+   16×64 B slab every K-step — 16 elements per lane — then do 16 cooperative
+   multiplies. The load loop is latency-bound and there is not enough
+   parallelism to hide it.
+2. **No double buffering.** Staging and compute are serialised by a barrier on
+   every K-step, so the memory latency is fully exposed.
+3. **fp32 operands in global memory.** The narrowing to f16 happens after the
+   bytes have already been paid for, so the roofline did not move: still
+   AI = 32 FLOP/byte at best.
+
+The first two are implementation problems; the third is structural and needs an
+fp16 tensor dtype, not a kernel change.
+
+### What would fix it
+
+- 128–256 invocations per workgroup (multiple subgroups cooperating on a
+  128×128 tile) — restores load parallelism and raises reuse to AI ≈ 64.
+- Double-buffered staging.
+- fp16 storage so the global traffic halves; without this, cooperative matrix
+  cannot exceed the same bandwidth roof as the SIMT kernels.
+
+Until it beats the SIMT kernels it stays opt-in
+(`VULTORCH_MATMUL_KERNEL=matmul_coopmat`), excluded from automatic selection so
+it neither wastes autotune time nor silently changes numerics. Correctness is
+still pinned by `tests/test_kernel_selection.py`.

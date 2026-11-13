@@ -88,3 +88,41 @@ def test_autograd_through_tuned_matmul(monkeypatch):
     assert x.grad is not None
     assert np.isfinite(x.grad.numpy()).all()
     assert layer.weight.grad is not None
+
+
+def _has_fp16_coopmat() -> bool:
+    if torch.vulkan.device_count() == 0:
+        return False
+    return bool(torch.vulkan.get_device_properties(0)["capabilities"]["fp16_coopmat_16x16"])
+
+
+@pytest.mark.skipif(not _has_fp16_coopmat(), reason="requires 16x16x16 f16 cooperative matrix")
+@pytest.mark.parametrize("shape", [(64, 64, 64), (129, 200, 97), (256, 512, 384)])
+def test_coopmat_variant_matches_reference(shape, monkeypatch):
+    """The cooperative-matrix kernel is opt-in, but must stay correct.
+
+    Operands are narrowed to f16 with f32 accumulation, so the expected error
+    grows like sqrt(K) times the f16 epsilon. The tolerance below is derived
+    from that, not tuned until the test passed; a structurally wrong kernel
+    produces errors orders of magnitude larger.
+    """
+    monkeypatch.setenv("VULTORCH_MATMUL_KERNEL", "matmul_coopmat")
+    rows, inner, cols = shape
+
+    a_np, b_np = _rand((rows, inner), 11), _rand((inner, cols), 12)
+    a = torch.tensor(a_np, device="vk:0")
+    b = torch.tensor(b_np, device="vk:0")
+
+    atol = 5e-3 * np.sqrt(inner)
+    np.testing.assert_allclose((a @ b).numpy(), a_np @ b_np, rtol=1e-2, atol=atol)
+
+
+@pytest.mark.skipif(not _has_fp16_coopmat(), reason="requires 16x16x16 f16 cooperative matrix")
+def test_coopmat_is_not_selected_automatically(monkeypatch):
+    """A variant that loses the measurement must not be picked on its own."""
+    monkeypatch.delenv("VULTORCH_MATMUL_KERNEL", raising=False)
+    a = torch.tensor(_rand((128, 128), 13), device="vk:0")
+    b = torch.tensor(_rand((128, 128), 14), device="vk:0")
+    # If the coopmat kernel were auto-selected the result would carry f16 error;
+    # the automatic path must stay on the fp32 SIMT kernels.
+    np.testing.assert_allclose((a @ b).numpy(), a.numpy() @ b.numpy(), rtol=1e-4, atol=1e-4)
