@@ -19,10 +19,10 @@ CMakeFiles/
 *.a
 
 # --- Generated SPIR-V ---
-# TODO(phase-0): once the shader build step lands, .spv are generated at build
-# time and this rule takes effect. Until then the checked-in .spv are the only
-# way to run the backend.
-# shaders/*.spv
+# Compiled at build time from shaders/*.comp (see CMakeLists.txt). Never commit
+# them: a stale .spv is a silent performance and correctness bug.
+shaders/*.spv
+vultorch/shaders/
 
 # --- Vendored dependencies (fetched, not committed) ---
 third_party/vulkan-headers/

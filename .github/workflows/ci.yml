@@ -1,0 +1,64 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: zero-warning gate
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        # mesa-vulkan-drivers provides lavapipe, a CPU Vulkan device, so the
+        # vk:* tests actually run on a headless runner.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake \
+            libvulkan-dev vulkan-tools mesa-vulkan-drivers glslang-tools
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Create virtualenv
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install --upgrade pip
+          .venv/bin/pip install numpy pytest pybind11
+
+      - name: Fetch Vulkan headers
+        run: ./scripts/fetch_deps.sh
+
+      - name: Report the Vulkan device the tests will use
+        run: vulkaninfo --summary || true
+
+      - name: Zero-warning gate
+        run: ./scripts/check.sh
+
+      - name: Build a wheel
+        run: .venv/bin/pip wheel . --no-deps -w dist
+
+      - name: Install the wheel outside the source tree and run it
+        run: |
+          python -m venv /tmp/wheeltest
+          /tmp/wheeltest/bin/pip install dist/*.whl numpy
+          cd /tmp
+          /tmp/wheeltest/bin/python -c "
+          import numpy as np
+          import vultorch as torch
+          print('version:', torch.__version__)
+          x = torch.tensor(np.array([1.0, 2.0, 3.0], np.float32), requires_grad=True)
+          (x * x).sum().backward()
+          print('grad:', x.grad.numpy())
+          print('devices:', torch.vulkan.device_count())
+          "

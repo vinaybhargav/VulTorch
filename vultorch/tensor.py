@@ -10,8 +10,28 @@ import os
 from . import _vultorch_backend as backend
 from .autograd import is_grad_enabled, Node, backward
 
-# Set default shader directory
-backend.set_shader_directory(os.path.join(os.path.dirname(os.path.dirname(__file__)), "shaders"))
+# Shader lookup.
+#
+# Installed layout:   <site-packages>/vultorch/shaders/*.spv
+# In-place checkout:  vultorch/shaders/*.spv (copied by the CMake dev target),
+#                     falling back to <repo>/shaders for an unbuilt tree.
+def _resolve_shader_directory() -> str:
+    override = os.environ.get("VULTORCH_SHADER_DIR")
+    if override:
+        return override
+
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, "shaders"),
+        os.path.join(os.path.dirname(here), "shaders"),
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidates[0]
+
+
+backend.set_shader_directory(_resolve_shader_directory())
 
 class Device:
     def __init__(self, type_or_str: Union[str, 'Device']):

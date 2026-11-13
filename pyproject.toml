@@ -1,21 +1,41 @@
 [build-system]
-requires = ["setuptools>=61.0", "wheel"]
-build-backend = "setuptools.build_meta"
+requires = ["scikit-build-core>=0.10", "pybind11>=2.11"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "vultorch"
 version = "0.1.0"
-description = "High-Performance Pure Vulkan Deep Learning Framework"
+description = "Vendor-agnostic deep learning on pure Vulkan compute"
 readme = "README.md"
 authors = [{ name = "Vinay B" }]
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.9"
 dependencies = [
     "numpy>=1.20"
 ]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
 
-[tool.setuptools.packages.find]
-where = ["."]
-include = ["vultorch*"]
+[tool.scikit-build]
+# The wheel layout is defined solely by CMakeLists.txt install() rules. Copying
+# the source package would also sweep up the in-place development artifacts
+# (.so / .spv) that the dev build places in vultorch/, and scikit-build-core's
+# wheel.exclude applies to CMake-installed files too, so it cannot be used to
+# separate the two.
+wheel.packages = []
+build-dir = "build/{wheel_tag}"
+cmake.version = ">=3.18"
+
+[tool.scikit-build.cmake.define]
+VULTORCH_DEV_COPY_ARTIFACTS = "OFF"
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

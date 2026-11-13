@@ -71,6 +71,29 @@ output = parallel_model(large_batch_x)
 
 ## 🛠 Development
 
+### Build from source
+
+Requirements: a C++20 compiler, CMake ≥ 3.18, the Vulkan loader (`libvulkan-dev`),
+and `glslangValidator` (`glslang-tools` on Debian/Ubuntu) — the compute shaders
+are compiled to SPIR-V as part of the build, never checked in.
+
+```bash
+scripts/fetch_deps.sh                 # Vulkan-Headers (not vendored in git)
+
+# In-place build: artifacts are copied into vultorch/ so `import vultorch`
+# works from the checkout.
+cmake -S . -B build -DPython_EXECUTABLE=$(which python3)
+cmake --build build
+
+# Distributable wheel (CMake's install() rules define its entire contents)
+pip wheel . --no-deps -w dist
+```
+
+Installing the wheel puts `_vultorch_backend` and `shaders/*.spv` next to the
+Python package, so no environment variables or shader paths are needed.
+
+### Zero-warning gate
+
 VulTorch holds itself to a **zero-warning** standard across C++, GLSL and Python.
 A single command enforces it:
 
