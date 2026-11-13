@@ -5,8 +5,26 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Warnings
+#
+# Our sources must compile clean. Third-party headers are included as SYSTEM so
+# their warnings never mask ours. Set -DVULTORCH_WERROR=ON (CI) to make any
+# warning a build failure.
+option(VULTORCH_WERROR "Treat compiler warnings as errors" OFF)
+if(MSVC)
+    add_compile_options(/W4 /permissive-)
+    if(VULTORCH_WERROR)
+        add_compile_options(/WX)
+    endif()
+else()
+    add_compile_options(-Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor -Wcast-qual)
+    if(VULTORCH_WERROR)
+        add_compile_options(-Werror)
+    endif()
+endif()
+
 # Vulkan Headers and Library
-include_directories(third_party/vulkan-headers/include)
+include_directories(SYSTEM third_party/vulkan-headers/include)
 include_directories(src)
 
 find_library(VULKAN_LIB vulkan PATHS /usr/lib /usr/local/lib)
@@ -30,7 +48,7 @@ execute_process(
 # Parse include dirs
 string(REPLACE "-I" "" PYBIND11_INCLUDES_CLEAN "${PYBIND11_INCLUDES}")
 separate_arguments(PYBIND11_INCLUDES_LIST UNIX_COMMAND "${PYBIND11_INCLUDES_CLEAN}")
-include_directories(${PYBIND11_INCLUDES_LIST})
+include_directories(SYSTEM ${PYBIND11_INCLUDES_LIST})
 
 set(SOURCES
     src/runtime/vk_context.cpp

@@ -1,5 +1,5 @@
 CXX ?= g++
-CXXFLAGS = -std=c++17 -O3 -march=native -mavx2 -mfma -fopenmp -Wall -Wextra
+CXXFLAGS = -std=c++17 -O3 -march=native -mavx2 -mfma -fopenmp -Wall -Wextra -Werror
 
 TARGET = ../bin/vultorch-codec
 

@@ -134,10 +134,10 @@ VulkanDeviceContext::~VulkanDeviceContext() {
     }
 }
 
-uint32_t VulkanDeviceContext::find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties) const {
+uint32_t VulkanDeviceContext::find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags required_flags) const {
     for (uint32_t i = 0; i < memory_properties.memoryTypeCount; i++) {
         if ((type_filter & (1 << i)) &&
-            (memory_properties.memoryTypes[i].propertyFlags & properties) == properties) {
+            (memory_properties.memoryTypes[i].propertyFlags & required_flags) == required_flags) {
             return i;
         }
     }

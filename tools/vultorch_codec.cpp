@@ -84,6 +84,12 @@ static inline float gelu_act(float x) {
 
 class NeuralCompressorEngine {
 public:
+    // Forward() uses fixed-size stack buffers; these are their capacities and
+    // the contract the loader validates against.
+    static constexpr uint32_t kMaxContextLen = 256;
+    static constexpr uint32_t kMaxEmbedDim = 512;
+    static constexpr uint32_t kMaxHiddenDim = 1024;
+
     uint32_t context_len = 32;
     uint32_t embed_dim = 512;
     uint32_t hidden_dim = 1024;
@@ -106,27 +112,54 @@ public:
         file.read(magic, 4);
         if (std::memcmp(magic, "VTC1", 4) != 0) return false;
 
-        uint32_t version, ctx_l, emb_d, hid_d, voc_s, total_p;
+        // The container is big-endian regardless of host byte order.
         auto read_u32 = [&]() {
-            uint32_t val;
+            uint32_t val = 0;
             file.read(reinterpret_cast<char*>(&val), 4);
             return __builtin_bswap32(val);
         };
         auto read_f32 = [&]() {
-            uint32_t val;
+            uint32_t val = 0;
             file.read(reinterpret_cast<char*>(&val), 4);
             val = __builtin_bswap32(val);
-            float f;
+            float f = 0.0f;
             std::memcpy(&f, &val, 4);
             return f;
         };
 
-        version = read_u32();
-        context_len = read_u32();
-        embed_dim = read_u32();
-        hidden_dim = read_u32();
-        vocab_size = read_u32();
-        total_p = read_u32();
+        const uint32_t version = read_u32();
+        const uint32_t ctx_l = read_u32();
+        const uint32_t emb_d = read_u32();
+        const uint32_t hid_d = read_u32();
+        const uint32_t voc_s = read_u32();
+        const uint32_t declared_params = read_u32();
+
+        // Validate before trusting: forward() writes into fixed-size buffers,
+        // so a mismatched header would silently overflow the stack.
+        if (version != 1) {
+            std::cerr << "Unsupported model version: " << version << "\n";
+            return false;
+        }
+        if (ctx_l == 0 || ctx_l > kMaxContextLen ||
+            emb_d == 0 || emb_d > kMaxEmbedDim ||
+            hid_d == 0 || hid_d > kMaxHiddenDim) {
+            std::cerr << "Model dimensions out of supported range: ctx=" << ctx_l
+                      << " emb=" << emb_d << " hid=" << hid_d << "\n";
+            return false;
+        }
+        if (voc_s != 256) {
+            std::cerr << "Only a 256-symbol byte vocabulary is supported, got " << voc_s << "\n";
+            return false;
+        }
+        if (declared_params == 0) {
+            std::cerr << "Model header declares zero parameters\n";
+            return false;
+        }
+
+        context_len = ctx_l;
+        embed_dim = emb_d;
+        hidden_dim = hid_d;
+        vocab_size = voc_s;
 
         // 1. Embeddings
         embed_weight.resize(vocab_size * embed_dim);
@@ -177,22 +210,22 @@ public:
         }
 
         // Layer 1
-        alignas(32) float h1[512];
+        alignas(32) float h1[kMaxEmbedDim];
         fc1.forward(flat.data(), h1);
         ln1.forward(h1);
-        for (int i = 0; i < 512; ++i) h1[i] = gelu_act(h1[i]);
+        for (uint32_t i = 0; i < fc1.out_features; ++i) h1[i] = gelu_act(h1[i]);
 
         // Layer 2
-        alignas(32) float h2[1024];
+        alignas(32) float h2[kMaxHiddenDim];
         fc2.forward(h1, h2);
         ln2.forward(h2);
-        for (int i = 0; i < 1024; ++i) h2[i] = gelu_act(h2[i]);
+        for (uint32_t i = 0; i < fc2.out_features; ++i) h2[i] = gelu_act(h2[i]);
 
         // Layer 3
-        alignas(32) float h3[512];
+        alignas(32) float h3[kMaxEmbedDim];
         fc3.forward(h2, h3);
         ln3.forward(h3);
-        for (int i = 0; i < 512; ++i) h3[i] = gelu_act(h3[i]);
+        for (uint32_t i = 0; i < fc3.out_features; ++i) h3[i] = gelu_act(h3[i]);
 
         // Output logits
         alignas(32) float logits[256];
@@ -200,15 +233,15 @@ public:
 
         // Softmax
         float max_l = logits[0];
-        for (int i = 1; i < 256; ++i) if (logits[i] > max_l) max_l = logits[i];
+        for (uint32_t i = 1; i < vocab_size; ++i) if (logits[i] > max_l) max_l = logits[i];
 
         float sum_exp = 0.0f;
-        for (int i = 0; i < 256; ++i) {
+        for (uint32_t i = 0; i < vocab_size; ++i) {
             probs[i] = std::exp(logits[i] - max_l);
             sum_exp += probs[i];
         }
         float inv_sum = 1.0f / sum_exp;
-        for (int i = 0; i < 256; ++i) probs[i] *= inv_sum;
+        for (uint32_t i = 0; i < vocab_size; ++i) probs[i] *= inv_sum;
     }
 };
 

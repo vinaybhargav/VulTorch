@@ -66,3 +66,33 @@ print(f"Loss: {loss.item():.4f}")
 parallel_model = nn.DataParallel(model, device_ids=['vk:0', 'vk:1'])
 output = parallel_model(large_batch_x)
 ```
+
+---
+
+## 🛠 Development
+
+VulTorch holds itself to a **zero-warning** standard across C++, GLSL and Python.
+A single command enforces it:
+
+```bash
+scripts/check.sh
+```
+
+It does four things, and fails on the first warning:
+
+| Step | Enforcement |
+|------|-------------|
+| C++ backend | `-Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor -Wcast-qual -Werror` |
+| Codec CLI | `-Wall -Wextra -Werror` |
+| Compute shaders | every `shaders/*.comp` recompiled with `glslangValidator`; any diagnostic is fatal |
+| Python | `compileall` and `pytest` run with `-W error` (`filterwarnings = error`) |
+
+Gradients are verified numerically against central differences, so a kernel
+whose backward pass disagrees with finite differences fails the build:
+
+```python
+import numpy as np, vultorch as torch
+
+torch.gradcheck(lambda t: (t.tanh() ** 2).sum(),
+                np.array([-0.5, 0.3, 1.2], np.float32), device="vk:0")
+```

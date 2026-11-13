@@ -49,7 +49,7 @@ public:
     VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev);
     ~VulkanDeviceContext();
 
-    uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags properties) const;
+    uint32_t find_memory_type(uint32_t type_filter, VkMemoryPropertyFlags required_flags) const;
     VkCommandBuffer begin_single_time_commands();
     void end_single_time_commands(VkCommandBuffer command_buffer);
     void wait_idle();
