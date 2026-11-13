@@ -26,6 +26,18 @@ PYBIND11_MODULE(_vultorch_backend, m) {
         d["total_memory"] = info.total_memory;
         d["is_discrete"] = info.is_discrete;
         d["has_cooperative_matrix"] = info.has_cooperative_matrix;
+        d["vendor_id"] = info.vendor_id;
+        d["device_id"] = info.device_id;
+
+        py::dict caps;
+        caps["subgroup_size"] = info.capabilities.subgroup_size;
+        caps["max_workgroup_invocations"] = info.capabilities.max_workgroup_invocations;
+        caps["max_shared_memory_bytes"] = info.capabilities.max_shared_memory_bytes;
+        caps["float16_arithmetic"] = info.capabilities.float16_arithmetic;
+        caps["storage_16bit"] = info.capabilities.storage_16bit;
+        caps["subgroup_basic"] = info.capabilities.subgroup_basic;
+        caps["subgroup_arithmetic"] = info.capabilities.subgroup_arithmetic;
+        d["capabilities"] = caps;
 
         py::list configs;
         for (const auto& c : info.cooperative_matrix_configs) {

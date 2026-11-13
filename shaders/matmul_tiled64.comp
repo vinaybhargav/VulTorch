@@ -1,0 +1,133 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// 64x64 register-blocked SGEMM.
+//
+// The 128x128 variant reached 13 TFLOPS at 3072^3 but only ~3.4 TFLOPS at
+// 1024^3: 64 accumulator registers per lane cap occupancy at ~2 waves/SIMD, and
+// a 128-wide tile yields too few workgroups for the batch/feature sizes that
+// training actually uses (a 512x1024x2048 Linear gives 4x16 = 64 workgroups on
+// a 96-CU device).
+//
+// This variant trades arithmetic intensity (AI = 16 vs 32 FLOP/byte) for
+// occupancy: 16 accumulators per lane, ~8 KiB shared instead of ~17 KiB, and
+// 4x more workgroups. Which one wins depends on the shape *and* the device, so
+// the selection is measured at runtime rather than hardcoded
+// (see select_matmul_shader in src/tensor.cpp).
+
+#define TM 64
+#define TN 64
+#define TK 16
+#define THREADS 256
+#define PAD 1
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer BufferA {
+    float dataA[];
+};
+
+layout(std430, binding = 1) readonly buffer BufferB {
+    float dataB[];
+};
+
+layout(std430, binding = 2) writeonly buffer BufferC {
+    float dataC[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+    uint batch_count;
+    uint strideA_b;
+    uint strideA_m;
+    uint strideA_k;
+    uint strideB_b;
+    uint strideB_k;
+    uint strideB_n;
+    uint strideC_b;
+    uint strideC_m;
+    uint strideC_n;
+} pc;
+
+shared float sA[TK][TM + PAD];
+shared float sB[TK][TN + PAD];
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x;
+    const uint ty = gl_LocalInvocationID.y;
+    const uint tid = ty * 16u + tx;
+
+    const uint block_y = gl_WorkGroupID.y;
+    const uint block_x = gl_WorkGroupID.x;
+    const uint batch = gl_WorkGroupID.z;
+
+    const uint row0 = block_y * TM + ty * 4u;
+    const uint col0 = block_x * TN + tx * 4u;
+
+    float acc[4][4];
+    [[unroll]] for (uint i = 0; i < 4u; ++i) {
+        [[unroll]] for (uint j = 0; j < 4u; ++j) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    const uint baseA = batch * pc.strideA_b;
+    const uint baseB = batch * pc.strideB_b;
+    const uint baseC = batch * pc.strideC_b;
+
+    const uint num_k_tiles = (pc.K + TK - 1u) / TK;
+
+    for (uint tile = 0; tile < num_k_tiles; ++tile) {
+        const uint k_base = tile * TK;
+
+        for (uint idx = tid; idx < TM * TK; idx += THREADS) {
+            uint m = idx / TK;
+            uint k = idx % TK;
+            uint gm = block_y * TM + m;
+            uint gk = k_base + k;
+            sA[k][m] = (gm < pc.M && gk < pc.K)
+                           ? dataA[baseA + gm * pc.strideA_m + gk * pc.strideA_k]
+                           : 0.0;
+        }
+
+        for (uint idx = tid; idx < TK * TN; idx += THREADS) {
+            uint k = idx / TN;
+            uint n = idx % TN;
+            uint gk = k_base + k;
+            uint gn = block_x * TN + n;
+            sB[k][n] = (gk < pc.K && gn < pc.N)
+                           ? dataB[baseB + gk * pc.strideB_k + gn * pc.strideB_n]
+                           : 0.0;
+        }
+
+        barrier();
+
+        [[unroll]] for (uint k = 0; k < TK; ++k) {
+            float a[4];
+            float b[4];
+            [[unroll]] for (uint i = 0; i < 4u; ++i) a[i] = sA[k][ty * 4u + i];
+            [[unroll]] for (uint j = 0; j < 4u; ++j) b[j] = sB[k][tx * 4u + j];
+
+            [[unroll]] for (uint i = 0; i < 4u; ++i) {
+                [[unroll]] for (uint j = 0; j < 4u; ++j) {
+                    acc[i][j] = fma(a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    [[unroll]] for (uint i = 0; i < 4u; ++i) {
+        uint gm = row0 + i;
+        if (gm >= pc.M) continue;
+        [[unroll]] for (uint j = 0; j < 4u; ++j) {
+            uint gn = col0 + j;
+            if (gn >= pc.N) continue;
+            dataC[baseC + gm * pc.strideC_m + gn * pc.strideC_n] = acc[i][j];
+        }
+    }
+}

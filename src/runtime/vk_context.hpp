@@ -23,16 +23,31 @@ struct CooperativeMatrixConfig {
     uint32_t scope;
 };
 
+// What a device can actually do. Kernel selection filters on this: a variant
+// is only ever considered if the device reports it can run it.
+struct DeviceCapabilities {
+    uint32_t subgroup_size = 0;
+    uint32_t max_workgroup_invocations = 0;
+    uint32_t max_shared_memory_bytes = 0;
+    bool float16_arithmetic = false;
+    bool storage_16bit = false;
+    bool subgroup_basic = false;
+    bool subgroup_arithmetic = false;
+};
+
 struct DeviceInfo {
     uint32_t id;
     std::string name;
     std::string vendor;
+    uint32_t vendor_id = 0;
+    uint32_t device_id = 0;
     uint32_t api_major;
     uint32_t api_minor;
     VkDeviceSize total_memory;
     bool is_discrete;
     bool has_cooperative_matrix = false;
     std::vector<CooperativeMatrixConfig> cooperative_matrix_configs;
+    DeviceCapabilities capabilities;
 };
 
 // A descriptor set cannot be freed until the batch that references it has
@@ -62,6 +77,7 @@ public:
     VkCommandPool command_pool = VK_NULL_HANDLE;
     VkPhysicalDeviceProperties properties{};
     VkPhysicalDeviceMemoryProperties memory_properties{};
+    DeviceCapabilities capabilities;
     bool has_cooperative_matrix = false;
     std::vector<CooperativeMatrixConfig> cooperative_matrix_configs;
 

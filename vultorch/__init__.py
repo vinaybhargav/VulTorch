@@ -129,6 +129,11 @@ class _VulkanInfo:
         return _backend.get_device_info(device_id)
 
     @staticmethod
+    def get_all_devices() -> list:
+        """Properties (including capabilities) for every detected device."""
+        return _backend.get_all_devices()
+
+    @staticmethod
     def synchronize(device_id: int = 0):
         _backend.synchronize(device_id)
 

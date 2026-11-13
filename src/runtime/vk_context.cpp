@@ -10,6 +10,46 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
     vkGetPhysicalDeviceProperties(physical_device, &properties);
     vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
 
+    // Capabilities consulted by kernel selection: a variant is only considered
+    // when the device reports it can run it.
+    //
+    // Subgroup data is a *property* struct and must be chained to
+    // vkGetPhysicalDeviceProperties2; chaining it to the features query leaves
+    // it silently zero-initialised.
+    {
+        VkPhysicalDeviceSubgroupProperties subgroup{};
+        subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
+
+        VkPhysicalDeviceProperties2 properties2{};
+        properties2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
+        properties2.pNext = &subgroup;
+
+        vkGetPhysicalDeviceProperties2(physical_device, &properties2);
+
+        VkPhysicalDeviceShaderFloat16Int8Features float16{};
+        float16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+
+        VkPhysicalDevice16BitStorageFeatures storage_16bit{};
+        storage_16bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+        storage_16bit.pNext = &float16;
+
+        VkPhysicalDeviceFeatures2 features2{};
+        features2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        features2.pNext = &storage_16bit;
+
+        vkGetPhysicalDeviceFeatures2(physical_device, &features2);
+
+        capabilities.subgroup_size = subgroup.subgroupSize;
+        capabilities.max_workgroup_invocations = properties.limits.maxComputeWorkGroupInvocations;
+        capabilities.max_shared_memory_bytes = properties.limits.maxComputeSharedMemorySize;
+        capabilities.float16_arithmetic = float16.shaderFloat16 == VK_TRUE;
+        capabilities.storage_16bit = storage_16bit.storageBuffer16BitAccess == VK_TRUE;
+        capabilities.subgroup_basic =
+            (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0;
+        capabilities.subgroup_arithmetic =
+            (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+    }
+
     // Find compute queue family
     uint32_t queue_family_count = 0;
     vkGetPhysicalDeviceQueueFamilyProperties(physical_device, &queue_family_count, nullptr);
@@ -452,6 +492,8 @@ DeviceInfo VulkanManager::get_device_info(uint32_t device_id) {
     info.id = device_id;
     info.name = props.deviceName;
     info.vendor = vendor;
+    info.vendor_id = props.vendorID;
+    info.device_id = props.deviceID;
     info.api_major = VK_API_VERSION_MAJOR(props.apiVersion);
     info.api_minor = VK_API_VERSION_MINOR(props.apiVersion);
     info.total_memory = total_vram;
@@ -461,6 +503,7 @@ DeviceInfo VulkanManager::get_device_info(uint32_t device_id) {
     auto dev = get_device(device_id);
     info.has_cooperative_matrix = dev->has_cooperative_matrix;
     info.cooperative_matrix_configs = dev->cooperative_matrix_configs;
+    info.capabilities = dev->capabilities;
 
     return info;
 }

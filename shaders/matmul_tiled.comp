@@ -1,0 +1,135 @@
+#version 450
+
+#extension GL_EXT_control_flow_attributes : enable
+
+// 128x128 register-blocked SGEMM.
+//
+// Why these numbers (see docs/kernels/gemm.md for the full derivation):
+//   compute:bandwidth ratio on this class of GPU is ~64 FLOP/byte, so a tile
+//   needs AI = 2*TM*TN / ((TM+TN)*4) >= ~32 to escape the bandwidth roof,
+//   which the 32x32 tile could not reach (AI = 8). 128x128 gives AI = 32 with
+//   fp32 operands, and 64 with fp16 storage later.
+//
+// Layout: each 16x16 workgroup computes a 128x128 tile; every thread owns an
+// 8x8 register block, so K-loop work is shared 128 times per loaded element.
+
+#define TM 128
+#define TN 128
+#define TK 16
+#define THREADS 256
+#define PAD 1
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(std430, binding = 0) readonly buffer BufferA {
+    float dataA[];
+};
+
+layout(std430, binding = 1) readonly buffer BufferB {
+    float dataB[];
+};
+
+layout(std430, binding = 2) writeonly buffer BufferC {
+    float dataC[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint M;
+    uint N;
+    uint K;
+    uint batch_count;
+    uint strideA_b;
+    uint strideA_m;
+    uint strideA_k;
+    uint strideB_b;
+    uint strideB_k;
+    uint strideB_n;
+    uint strideC_b;
+    uint strideC_m;
+    uint strideC_n;
+} pc;
+
+// Padded to keep the strided column access conflict-free.
+shared float sA[TK][TM + PAD];
+shared float sB[TK][TN + PAD];
+
+void main() {
+    const uint tx = gl_LocalInvocationID.x;
+    const uint ty = gl_LocalInvocationID.y;
+    const uint tid = ty * 16u + tx;
+
+    const uint block_y = gl_WorkGroupID.y; // rows of A / C
+    const uint block_x = gl_WorkGroupID.x; // cols of B / C
+    const uint batch = gl_WorkGroupID.z;
+
+    const uint row0 = block_y * TM + ty * 8u;
+    const uint col0 = block_x * TN + tx * 8u;
+
+    float acc[8][8];
+    [[unroll]] for (uint i = 0; i < 8u; ++i) {
+        [[unroll]] for (uint j = 0; j < 8u; ++j) {
+            acc[i][j] = 0.0;
+        }
+    }
+
+    const uint baseA = batch * pc.strideA_b;
+    const uint baseB = batch * pc.strideB_b;
+    const uint baseC = batch * pc.strideC_b;
+
+    const uint num_k_tiles = (pc.K + TK - 1u) / TK;
+
+    for (uint tile = 0; tile < num_k_tiles; ++tile) {
+        const uint k_base = tile * TK;
+
+        // Cooperative load of a 128 x 16 slab of A.
+        for (uint idx = tid; idx < TM * TK; idx += THREADS) {
+            uint m = idx / TK;
+            uint k = idx % TK;
+            uint gm = block_y * TM + m;
+            uint gk = k_base + k;
+            sA[k][m] = (gm < pc.M && gk < pc.K)
+                           ? dataA[baseA + gm * pc.strideA_m + gk * pc.strideA_k]
+                           : 0.0;
+        }
+
+        // Cooperative load of a 16 x 128 slab of B.
+        for (uint idx = tid; idx < TK * TN; idx += THREADS) {
+            uint k = idx / TN;
+            uint n = idx % TN;
+            uint gk = k_base + k;
+            uint gn = block_x * TN + n;
+            sB[k][n] = (gk < pc.K && gn < pc.N)
+                           ? dataB[baseB + gk * pc.strideB_k + gn * pc.strideB_n]
+                           : 0.0;
+        }
+
+        barrier();
+
+        // Outer-product accumulation from shared memory.
+        [[unroll]] for (uint k = 0; k < TK; ++k) {
+            float a[8];
+            float b[8];
+            [[unroll]] for (uint i = 0; i < 8u; ++i) a[i] = sA[k][ty * 8u + i];
+            [[unroll]] for (uint j = 0; j < 8u; ++j) b[j] = sB[k][tx * 8u + j];
+
+            [[unroll]] for (uint i = 0; i < 8u; ++i) {
+                [[unroll]] for (uint j = 0; j < 8u; ++j) {
+                    acc[i][j] = fma(a[i], b[j], acc[i][j]);
+                }
+            }
+        }
+
+        barrier();
+    }
+
+    // Write the 8x8 register block.
+    [[unroll]] for (uint i = 0; i < 8u; ++i) {
+        uint gm = row0 + i;
+        if (gm >= pc.M) continue;
+        [[unroll]] for (uint j = 0; j < 8u; ++j) {
+            uint gn = col0 + j;
+            if (gn >= pc.N) continue;
+            dataC[baseC + gm * pc.strideC_m + gn * pc.strideC_n] = acc[i][j];
+        }
+    }
+}

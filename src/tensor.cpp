@@ -1,12 +1,147 @@
 #include "tensor.hpp"
 #include <numeric>
 #include <cmath>
+#include <cstdlib>
+#include <chrono>
+#include <array>
+#include <functional>
+#include <limits>
+#include <map>
+#include <mutex>
+#include <vector>
 #include <stdexcept>
 #include <algorithm>
 #include <iostream>
 
 namespace vultorch {
 namespace {
+
+// GEMM variants. Which one is fastest depends on the shape *and* the device
+// (tile reuse vs occupancy), so the choice is measured, not hardcoded.
+struct MatmulCandidate {
+    const char* shader;
+    uint32_t tile;
+    uint32_t shared_bytes;
+};
+
+constexpr MatmulCandidate kMatmulCandidates[] = {
+    // Purely register/shared-free baseline; always available.
+    {"matmul", 32u, 0u},
+    // TK * (TILE + PAD) * sizeof(float) * 2
+    {"matmul_tiled64", 64u, 16u * (64u + 1u) * 4u * 2u},
+    {"matmul_tiled", 128u, 16u * (128u + 1u) * 4u * 2u},
+};
+
+struct MatmulChoice {
+    const char* shader;
+    uint32_t tile;
+};
+
+using MatmulDispatch = std::function<void(const char*, uint32_t)>;
+// (device, M, N, K)
+using MatmulShapeKey = std::array<uint32_t, 4>;
+
+std::mutex g_matmul_choice_mutex;
+std::map<MatmulShapeKey, MatmulChoice> g_matmul_choice_cache;
+
+bool env_flag_enabled(const char* name, bool default_value) {
+    const char* value = std::getenv(name);
+    if (value == nullptr) return default_value;
+    const std::string text(value);
+    return !(text == "0" || text == "false" || text == "off");
+}
+
+// Picks the GEMM kernel for one shape.
+//
+// 1. Filter by what the device reports it can run (shared memory, workgroup
+//    size, tile fits the problem).
+// 2. Honour VULTORCH_MATMUL_KERNEL=<shader> for benchmarking a specific variant.
+// 3. Measure the survivors once and cache the winner per (device, M, N, K).
+//    Training reuses a handful of shapes, so this cost is paid a few times.
+// VULTORCH_AUTOTUNE=0 disables step 3 and takes the largest viable tile.
+MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, uint32_t K,
+                                  const MatmulDispatch& run) {
+    const auto dev = VulkanManager::instance_ref().get_device(device_id);
+    const DeviceCapabilities& caps = dev->capabilities;
+
+    // 1. Capability filter: only variants this device reports it can run.
+    std::vector<MatmulChoice> candidates;
+    for (const auto& candidate : kMatmulCandidates) {
+        if (candidate.shared_bytes > caps.max_shared_memory_bytes) continue;
+        if (caps.max_workgroup_invocations < 256u) continue;
+        candidates.push_back({candidate.shader, candidate.tile});
+    }
+    if (candidates.empty()) return {"matmul", 32u};
+
+    // 2. Explicit override, read every call so it can be changed at runtime
+    //    (benchmarks and tests). Not cached: an override must win over the
+    //    measurement cache.
+    const char* const forced = std::getenv("VULTORCH_MATMUL_KERNEL");
+    if (forced != nullptr) {
+        const std::string wanted(forced);
+        for (const auto& candidate : candidates) {
+            if (wanted == candidate.shader) return candidate;
+        }
+        if (wanted == "legacy") return {"matmul", 32u};
+    }
+
+    // 3. Tiny problems are launch-bound; tiling cannot pay for itself and an
+    //    autotune sweep would cost far more than the multiplication.
+    if (2ull * M * N * K < 1'000'000ull) return {"matmul", 32u};
+
+    if (candidates.size() == 1) return candidates.front();
+
+    // 4. Measured selection, cached per (device, shape). Training reuses a
+    //    handful of shapes, so this cost is paid a few times per process.
+    const MatmulShapeKey key{device_id, M, N, K};
+    {
+        std::lock_guard<std::mutex> lock(g_matmul_choice_mutex);
+        auto it = g_matmul_choice_cache.find(key);
+        if (it != g_matmul_choice_cache.end()) return it->second;
+    }
+
+    if (!env_flag_enabled("VULTORCH_AUTOTUNE", true)) return candidates.back();
+
+    MatmulChoice best = candidates.front();
+    double best_ms = 0.0;
+
+    for (const auto& candidate : candidates) {
+        // Fixed *time* budget of warmup: the first runs of a kernel happen at
+        // low clocks while the GPU ramps, and the operands are still cold. A
+        // count-based warmup would let power management decide the contest.
+        const auto warm_start = std::chrono::steady_clock::now();
+        int warm_iters = 0;
+        while (warm_iters < 128 &&
+               std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - warm_start)
+                       .count() < 20.0) {
+            run(candidate.shader, candidate.tile);
+            dev->synchronize();
+            ++warm_iters;
+        }
+
+        double candidate_ms = std::numeric_limits<double>::max();
+        for (int rep = 0; rep < 5; ++rep) {
+            const auto start = std::chrono::steady_clock::now();
+            run(candidate.shader, candidate.tile);
+            dev->synchronize();
+            const double ms = std::chrono::duration<double, std::milli>(
+                                  std::chrono::steady_clock::now() - start)
+                                  .count();
+            candidate_ms = std::min(candidate_ms, ms);
+        }
+
+        if (best_ms == 0.0 || candidate_ms < best_ms) {
+            best_ms = candidate_ms;
+            best = candidate;
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(g_matmul_choice_mutex);
+        g_matmul_choice_cache[key] = best;
+    }
+    return best;
+}
 
 // Single source of truth for elementwise op semantics. Both the CPU fallback
 // and the shader paths use the same op numbering (see
@@ -642,14 +777,18 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
         pc.strideC_m = static_cast<uint32_t>(N);
         pc.strideC_n = 1;
 
-        uint32_t group_x = (N + 31) / 32;
-        uint32_t group_y = (M + 31) / 32;
-        uint32_t group_z = static_cast<uint32_t>(batch_count);
+        auto run_variant = [&](const char* shader, uint32_t tile) {
+            const uint32_t group_x = (N + tile - 1u) / tile;
+            const uint32_t group_y = (M + tile - 1u) / tile;
+            VulkanPipelineManager::instance().dispatch(
+                device_id, shader,
+                {gpu_buffer, other->gpu_buffer, out->gpu_buffer},
+                &pc, sizeof(pc), group_x, group_y, static_cast<uint32_t>(batch_count));
+        };
 
-        VulkanPipelineManager::instance().dispatch(
-            device_id, "matmul",
-            {gpu_buffer, other->gpu_buffer, out->gpu_buffer},
-            &pc, sizeof(pc), group_x, group_y, group_z);
+        const MatmulChoice choice = select_matmul_shader(
+            static_cast<uint32_t>(device_id), M, N, K1, run_variant);
+        run_variant(choice.shader, choice.tile);
     } else {
         // CPU MatMul fallback
         const size_t batch_stride_b = b_broadcast ? 0 : static_cast<size_t>(K1) * N;
