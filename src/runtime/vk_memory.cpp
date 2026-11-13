@@ -6,14 +6,14 @@
 namespace vultorch {
 
 VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDeviceContext> ctx, VkDeviceSize size_bytes,
-                           VkBufferUsageFlags usage, VkMemoryPropertyFlags properties)
-    : device_ctx(ctx), size(size_bytes) {
+                           VkBufferUsageFlags buffer_usage, VkMemoryPropertyFlags memory_flags)
+    : device_ctx(ctx), size(size_bytes), usage(buffer_usage), memory_properties(memory_flags) {
     if (size == 0) size = 4; // Vulkan requires non-zero buffer sizes
 
     VkBufferCreateInfo buffer_info{};
     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
     buffer_info.size = size;
-    buffer_info.usage = usage;
+    buffer_info.usage = buffer_usage;
     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
     VkResult res = vkCreateBuffer(device_ctx->device, &buffer_info, nullptr, &buffer);
@@ -27,7 +27,7 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDeviceContext> ctx, VkDeviceSiz
     VkMemoryAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
     alloc_info.allocationSize = mem_reqs.size;
-    alloc_info.memoryTypeIndex = device_ctx->find_memory_type(mem_reqs.memoryTypeBits, properties);
+    alloc_info.memoryTypeIndex = device_ctx->find_memory_type(mem_reqs.memoryTypeBits, memory_flags);
 
     res = vkAllocateMemory(device_ctx->device, &alloc_info, nullptr, &memory);
     if (res != VK_SUCCESS) {
@@ -38,7 +38,7 @@ VulkanBuffer::VulkanBuffer(std::shared_ptr<VulkanDeviceContext> ctx, VkDeviceSiz
 
     vkBindBufferMemory(device_ctx->device, buffer, memory, 0);
 
-    is_host_visible = (properties & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
+    is_host_visible = (memory_flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) != 0;
 }
 
 VulkanBuffer::~VulkanBuffer() {
@@ -101,15 +101,102 @@ void VulkanBuffer::invalidate(VkDeviceSize offset, VkDeviceSize inv_size) {
 }
 
 VulkanMemoryManager& VulkanMemoryManager::instance() {
-    static VulkanMemoryManager mgr;
-    return mgr;
+    // Deliberately leaked: pooled buffers hold shared_ptr<VulkanDeviceContext>,
+    // and a static destructor could otherwise run after the Vulkan objects it
+    // owns. shutdown() provides deterministic cleanup instead.
+    static VulkanMemoryManager* mgr = new VulkanMemoryManager();
+    return *mgr;
+}
+
+VkDeviceSize VulkanMemoryManager::bucket_size(VkDeviceSize size_bytes) {
+    // 4 KiB granularity: repeated tensor shapes in a training loop reuse the
+    // same bucket, while waste stays bounded for large allocations.
+    constexpr VkDeviceSize kGranularity = 4096;
+    if (size_bytes == 0) return kGranularity;
+    return ((size_bytes + kGranularity - 1) / kGranularity) * kGranularity;
 }
 
 std::shared_ptr<VulkanBuffer> VulkanMemoryManager::allocate(uint32_t device_id, VkDeviceSize size_bytes,
                                                            VkBufferUsageFlags usage,
                                                            VkMemoryPropertyFlags properties) {
+    const VkDeviceSize bucket = bucket_size(size_bytes);
+    const PoolKey key{bucket, usage, properties};
+
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        auto dev_it = pools.find(device_id);
+        if (dev_it != pools.end()) {
+            auto list_it = dev_it->second.free_lists.find(key);
+            if (list_it != dev_it->second.free_lists.end() && !list_it->second.empty()) {
+                std::unique_ptr<VulkanBuffer> recycled = std::move(list_it->second.back());
+                list_it->second.pop_back();
+                dev_it->second.free_bytes -= recycled->size;
+                live_allocations.fetch_add(1, std::memory_order_relaxed);
+                return std::shared_ptr<VulkanBuffer>(recycled.release(), [](VulkanBuffer* buffer) {
+                    VulkanMemoryManager::instance().recycle(buffer);
+                });
+            }
+        }
+    }
+
     auto dev = VulkanManager::instance_ref().get_device(device_id);
-    return std::make_shared<VulkanBuffer>(dev, size_bytes, usage, properties);
+    live_allocations.fetch_add(1, std::memory_order_relaxed);
+    return std::shared_ptr<VulkanBuffer>(new VulkanBuffer(dev, bucket, usage, properties),
+                                         [](VulkanBuffer* buffer) {
+                                             VulkanMemoryManager::instance().recycle(buffer);
+                                         });
+}
+
+void VulkanMemoryManager::recycle(VulkanBuffer* raw) {
+    // Adopt the buffer so every early return still destroys it.
+    std::unique_ptr<VulkanBuffer> owned(raw);
+    live_allocations.fetch_sub(1, std::memory_order_relaxed);
+
+    // Cap the cache per device so a transient large allocation cannot pin
+    // memory forever.
+    constexpr VkDeviceSize kFreeListBudget = 1024ull * 1024ull * 1024ull;
+
+    std::lock_guard<std::mutex> lock(pool_mutex);
+    if (shutting_down) return;
+
+    DevicePool& pool = pools[raw->device_ctx->device_id];
+    if (pool.free_bytes + raw->size > kFreeListBudget) return;
+
+    const PoolKey key{raw->size, raw->usage, raw->memory_properties};
+    pool.free_bytes += raw->size;
+    pool.free_lists[key].push_back(std::move(owned));
+}
+
+size_t VulkanMemoryManager::pooled_buffer_count() const {
+    std::lock_guard<std::mutex> lock(pool_mutex);
+    size_t count = 0;
+    for (const auto& device_entry : pools) {
+        for (const auto& list_entry : device_entry.second.free_lists) {
+            count += list_entry.second.size();
+        }
+    }
+    return count;
+}
+
+void VulkanMemoryManager::shutdown() {
+    std::vector<std::unique_ptr<VulkanBuffer>> doomed;
+    {
+        std::lock_guard<std::mutex> lock(pool_mutex);
+        shutting_down = true;
+        for (auto& device_entry : pools) {
+            for (auto& list_entry : device_entry.second.free_lists) {
+                for (auto& buffer : list_entry.second) {
+                    doomed.push_back(std::move(buffer));
+                }
+                list_entry.second.clear();
+            }
+            device_entry.second.free_lists.clear();
+            device_entry.second.free_bytes = 0;
+        }
+        pools.clear();
+    }
+    // Destroy outside the lock: vkDestroyBuffer may block.
+    doomed.clear();
 }
 
 std::shared_ptr<VulkanBuffer> VulkanMemoryManager::create_staging_buffer(uint32_t device_id, VkDeviceSize size_bytes) {
@@ -126,13 +213,15 @@ void VulkanMemoryManager::copy_host_to_device(uint32_t device_id, const void* ho
     std::memcpy(mapped, host_ptr, size_bytes);
     staging->flush();
 
-    VkCommandBuffer cmd = dev->begin_single_time_commands();
-    VkBufferCopy copy_region{};
-    copy_region.srcOffset = 0;
-    copy_region.dstOffset = 0;
-    copy_region.size = size_bytes;
-    vkCmdCopyBuffer(cmd, staging->buffer, dst_buffer->buffer, 1, &copy_region);
-    dev->end_single_time_commands(cmd);
+    const VkBuffer staging_handle = staging->buffer;
+    const VkBuffer dst_handle = dst_buffer->buffer;
+    dev->submit_transfer([&](VkCommandBuffer cmd) {
+        VkBufferCopy copy_region{};
+        copy_region.srcOffset = 0;
+        copy_region.dstOffset = 0;
+        copy_region.size = size_bytes;
+        vkCmdCopyBuffer(cmd, staging_handle, dst_handle, 1, &copy_region);
+    });
 }
 
 void VulkanMemoryManager::copy_device_to_host(uint32_t device_id, std::shared_ptr<VulkanBuffer> src_buffer,
@@ -140,13 +229,15 @@ void VulkanMemoryManager::copy_device_to_host(uint32_t device_id, std::shared_pt
     auto dev = VulkanManager::instance_ref().get_device(device_id);
     auto staging = create_staging_buffer(device_id, size_bytes);
 
-    VkCommandBuffer cmd = dev->begin_single_time_commands();
-    VkBufferCopy copy_region{};
-    copy_region.srcOffset = 0;
-    copy_region.dstOffset = 0;
-    copy_region.size = size_bytes;
-    vkCmdCopyBuffer(cmd, src_buffer->buffer, staging->buffer, 1, &copy_region);
-    dev->end_single_time_commands(cmd);
+    const VkBuffer src_handle = src_buffer->buffer;
+    const VkBuffer staging_handle = staging->buffer;
+    dev->submit_transfer([&](VkCommandBuffer cmd) {
+        VkBufferCopy copy_region{};
+        copy_region.srcOffset = 0;
+        copy_region.dstOffset = 0;
+        copy_region.size = size_bytes;
+        vkCmdCopyBuffer(cmd, src_handle, staging_handle, 1, &copy_region);
+    });
 
     void* mapped = staging->map();
     staging->invalidate();
@@ -156,13 +247,16 @@ void VulkanMemoryManager::copy_device_to_host(uint32_t device_id, std::shared_pt
 void VulkanMemoryManager::copy_buffer_to_buffer(uint32_t device_id, std::shared_ptr<VulkanBuffer> src,
                                                 std::shared_ptr<VulkanBuffer> dst, VkDeviceSize size_bytes) {
     auto dev = VulkanManager::instance_ref().get_device(device_id);
-    VkCommandBuffer cmd = dev->begin_single_time_commands();
-    VkBufferCopy copy_region{};
-    copy_region.srcOffset = 0;
-    copy_region.dstOffset = 0;
-    copy_region.size = size_bytes;
-    vkCmdCopyBuffer(cmd, src->buffer, dst->buffer, 1, &copy_region);
-    dev->end_single_time_commands(cmd);
+
+    const VkBuffer src_handle = src->buffer;
+    const VkBuffer dst_handle = dst->buffer;
+    dev->submit_transfer([&](VkCommandBuffer cmd) {
+        VkBufferCopy copy_region{};
+        copy_region.srcOffset = 0;
+        copy_region.dstOffset = 0;
+        copy_region.size = size_bytes;
+        vkCmdCopyBuffer(cmd, src_handle, dst_handle, 1, &copy_region);
+    });
 }
 
 void VulkanMemoryManager::copy_cross_device(uint32_t src_device_id, std::shared_ptr<VulkanBuffer> src_buffer,

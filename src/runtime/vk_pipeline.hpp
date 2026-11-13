@@ -24,7 +24,9 @@ struct PipelineRecord {
 class VulkanPipelineManager {
 private:
     std::string shader_dir;
-    std::mutex pipeline_mutex;
+    // Guards the pipeline cache only. Submission is synchronised per device by
+    // VulkanDeviceContext::submit_mutex, so two devices can run concurrently.
+    std::mutex cache_mutex;
     // Map: device_id -> (shader_name -> PipelineRecord)
     std::unordered_map<uint32_t, std::unordered_map<std::string, PipelineRecord>> cache;
 
@@ -32,6 +34,10 @@ private:
     ~VulkanPipelineManager();
 
     std::vector<uint32_t> read_spirv_file(const std::string& filepath);
+
+    VkDescriptorSet allocate_descriptor_set(const std::shared_ptr<VulkanDeviceContext>& dev,
+                                            PipelineRecord& record,
+                                            const std::string& shader_name);
 
 public:
     void clear();

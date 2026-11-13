@@ -24,7 +24,8 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake \
-            libvulkan-dev vulkan-tools mesa-vulkan-drivers glslang-tools
+            libvulkan-dev vulkan-tools mesa-vulkan-drivers glslang-tools \
+            vulkan-validationlayers
 
       - uses: actions/setup-python@v5
         with:
@@ -44,6 +45,24 @@ jobs:
 
       - name: Zero-warning gate
         run: ./scripts/check.sh
+
+      - name: Vulkan validation layer
+        # Catches descriptor-set lifetime bugs, missing barriers, and invalid
+        # command-buffer reuse, none of which show up as wrong numbers.
+        run: |
+          set +e
+          VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation \
+            .venv/bin/python -m pytest tests/test_execution_engine.py tests/test_multi_gpu.py -q \
+            2> /tmp/validation.log
+          status=$?
+          set -e
+          if grep -qE "VUID-|Validation Error" /tmp/validation.log; then
+            echo "validation layer reported errors:"
+            grep -E "VUID-|Validation Error" /tmp/validation.log | sort -u | head -40
+            exit 1
+          fi
+          echo "validation layer: clean"
+          exit $status
 
       - name: Build a wheel
         run: .venv/bin/pip wheel . --no-deps -w dist

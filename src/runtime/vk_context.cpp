@@ -120,11 +120,49 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
     if (res != VK_SUCCESS) {
         throw std::runtime_error("Failed to create Vulkan command pool on device " + std::to_string(id));
     }
+
+    // Command buffers and fences are allocated once and recycled in a ring;
+    // creating them per dispatch was a large part of the per-op overhead.
+    slots.resize(kSlotCount);
+    std::vector<VkCommandBuffer> ring_cmds(kSlotCount);
+    VkCommandBufferAllocateInfo cmd_alloc{};
+    cmd_alloc.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+    cmd_alloc.commandPool = command_pool;
+    cmd_alloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cmd_alloc.commandBufferCount = kSlotCount;
+    res = vkAllocateCommandBuffers(device, &cmd_alloc, ring_cmds.data());
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("vkAllocateCommandBuffers failed on device " + std::to_string(id));
+    }
+
+    VkFenceCreateInfo fence_info{};
+    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+    for (uint32_t i = 0; i < kSlotCount; ++i) {
+        slots[i].cmd = ring_cmds[i];
+        res = vkCreateFence(device, &fence_info, nullptr, &slots[i].fence);
+        if (res != VK_SUCCESS) {
+            throw std::runtime_error("vkCreateFence failed on device " + std::to_string(id));
+        }
+    }
+    res = vkCreateFence(device, &fence_info, nullptr, &transfer_fence);
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("vkCreateFence (transfer) failed on device " + std::to_string(id));
+    }
 }
 
 VulkanDeviceContext::~VulkanDeviceContext() {
     if (device != VK_NULL_HANDLE) {
         vkDeviceWaitIdle(device);
+        for (auto& slot : slots) {
+            if (slot.fence != VK_NULL_HANDLE) {
+                vkDestroyFence(device, slot.fence, nullptr);
+                slot.fence = VK_NULL_HANDLE;
+            }
+        }
+        if (transfer_fence != VK_NULL_HANDLE) {
+            vkDestroyFence(device, transfer_fence, nullptr);
+            transfer_fence = VK_NULL_HANDLE;
+        }
         if (command_pool != VK_NULL_HANDLE) {
             vkDestroyCommandPool(device, command_pool, nullptr);
             command_pool = VK_NULL_HANDLE;
@@ -144,48 +182,192 @@ uint32_t VulkanDeviceContext::find_memory_type(uint32_t type_filter, VkMemoryPro
     throw std::runtime_error("Failed to find suitable Vulkan memory type!");
 }
 
-VkCommandBuffer VulkanDeviceContext::begin_single_time_commands() {
+// ---------------------------------------------------------------------------
+// Batched execution
+//
+// Every dispatch is recorded into an open command buffer instead of being
+// submitted and waited on immediately. Submission happens when a batch fills,
+// when something needs results, or on an explicit synchronize(). Because the
+// device has a single compute queue, submissions complete in FIFO order, so
+// waiting on the newest fence also proves that all older work has finished.
+// ---------------------------------------------------------------------------
+
+namespace {
+// Kept as a named constant so the header and implementation cannot drift.
+constexpr size_t kMaxPendingDescSets = VulkanDeviceContext::kMaxPendingDescSets;
+} // namespace
+
+void VulkanDeviceContext::add_compute_barrier(VkCommandBuffer cmd) {
+    VkMemoryBarrier mem_barrier{};
+    mem_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mem_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    mem_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT |
+                                VK_ACCESS_TRANSFER_READ_BIT;
+
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT |
+                             VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+}
+
+void VulkanDeviceContext::open_batch_locked() {
+    if (open_slot >= 0) return;
+
+    Slot& slot = slots[next_slot];
+    if (slot.in_use) {
+        // Reusing a slot: wait for its previous submission to drain.
+        vkWaitForFences(device, 1, &slot.fence, VK_TRUE, UINT64_MAX);
+        slot.in_use = false;
+    }
+
+    // The fence is unsignalled at this point, so resetting is safe.
+    vkResetFences(device, 1, &slot.fence);
+
+    VkResult res = vkResetCommandBuffer(slot.cmd, 0);
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("vkResetCommandBuffer failed on device " + std::to_string(device_id));
+    }
+
+    VkCommandBufferBeginInfo begin_info{};
+    begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    res = vkBeginCommandBuffer(slot.cmd, &begin_info);
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("vkBeginCommandBuffer failed on device " + std::to_string(device_id));
+    }
+
+    open_slot = static_cast<int32_t>(next_slot);
+    next_slot = (next_slot + 1) % kSlotCount;
+    ops_in_batch = 0;
+}
+
+void VulkanDeviceContext::flush_locked() {
+    if (open_slot < 0) return;
+
+    Slot& slot = slots[static_cast<size_t>(open_slot)];
+
+    VkResult res = vkEndCommandBuffer(slot.cmd);
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("vkEndCommandBuffer failed on device " + std::to_string(device_id));
+    }
+
+    VkSubmitInfo submit_info{};
+    submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    submit_info.commandBufferCount = 1;
+    submit_info.pCommandBuffers = &slot.cmd;
+
+    res = vkQueueSubmit(compute_queue, 1, &submit_info, slot.fence);
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("vkQueueSubmit failed on device " + std::to_string(device_id));
+    }
+
+    slot.in_use = true;
+    last_submitted_slot = open_slot;
+    open_slot = -1;
+    ops_in_batch = 0;
+    batches_submitted.fetch_add(1, std::memory_order_relaxed);
+}
+
+void VulkanDeviceContext::synchronize_locked() {
+    flush_locked();
+
+    if (last_submitted_slot >= 0) {
+        Slot& slot = slots[static_cast<size_t>(last_submitted_slot)];
+        vkWaitForFences(device, 1, &slot.fence, VK_TRUE, UINT64_MAX);
+        // FIFO on a single queue: every earlier submission has completed too.
+        for (auto& s : slots) {
+            s.in_use = false;
+        }
+        last_submitted_slot = -1;
+    }
+
+    for (const auto& descriptor : pending_descriptors) {
+        if (descriptor.set != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(device, descriptor.pool, 1, &descriptor.set);
+        }
+    }
+    pending_descriptors.clear();
+}
+
+void VulkanDeviceContext::flush() {
+    std::lock_guard<std::mutex> lock(submit_mutex);
+    flush_locked();
+}
+
+void VulkanDeviceContext::synchronize() {
+    std::lock_guard<std::mutex> lock(submit_mutex);
+    synchronize_locked();
+}
+
+void VulkanDeviceContext::submit_transfer(const std::function<void(VkCommandBuffer)>& record) {
+    std::lock_guard<std::mutex> lock(submit_mutex);
+
+    // Pending compute writes must be ordered ahead of the copy.
+    flush_locked();
+
     VkCommandBufferAllocateInfo alloc_info{};
     alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
     alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
     alloc_info.commandPool = command_pool;
     alloc_info.commandBufferCount = 1;
 
-    VkCommandBuffer cmd;
-    vkAllocateCommandBuffers(device, &alloc_info, &cmd);
+    VkCommandBuffer cmd = VK_NULL_HANDLE;
+    VkResult res = vkAllocateCommandBuffers(device, &alloc_info, &cmd);
+    if (res != VK_SUCCESS) {
+        throw std::runtime_error("vkAllocateCommandBuffers (transfer) failed on device " +
+                                 std::to_string(device_id));
+    }
 
     VkCommandBufferBeginInfo begin_info{};
     begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     begin_info.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-
     vkBeginCommandBuffer(cmd, &begin_info);
-    return cmd;
-}
 
-void VulkanDeviceContext::end_single_time_commands(VkCommandBuffer cmd) {
-    vkEndCommandBuffer(cmd);
+    record(cmd);
+
+    VkMemoryBarrier mem_barrier{};
+    mem_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
+    mem_barrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    mem_barrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT | VK_ACCESS_SHADER_READ_BIT;
+    vkCmdPipelineBarrier(cmd,
+                         VK_PIPELINE_STAGE_TRANSFER_BIT,
+                         VK_PIPELINE_STAGE_HOST_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+
+    if (vkEndCommandBuffer(cmd) != VK_SUCCESS) {
+        vkFreeCommandBuffers(device, command_pool, 1, &cmd);
+        throw std::runtime_error("vkEndCommandBuffer (transfer) failed on device " +
+                                 std::to_string(device_id));
+    }
 
     VkSubmitInfo submit_info{};
     submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
     submit_info.commandBufferCount = 1;
     submit_info.pCommandBuffers = &cmd;
 
-    VkFence fence;
-    VkFenceCreateInfo fence_info{};
-    fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-    vkCreateFence(device, &fence_info, nullptr, &fence);
-
-    vkQueueSubmit(compute_queue, 1, &submit_info, fence);
-    vkWaitForFences(device, 1, &fence, VK_TRUE, UINT64_MAX);
-
-    vkDestroyFence(device, fence, nullptr);
-    vkFreeCommandBuffers(device, command_pool, 1, &cmd);
-}
-
-void VulkanDeviceContext::wait_idle() {
-    if (device != VK_NULL_HANDLE) {
-        vkDeviceWaitIdle(device);
+    vkResetFences(device, 1, &transfer_fence);
+    if (vkQueueSubmit(compute_queue, 1, &submit_info, transfer_fence) != VK_SUCCESS) {
+        vkFreeCommandBuffers(device, command_pool, 1, &cmd);
+        throw std::runtime_error("vkQueueSubmit (transfer) failed on device " +
+                                 std::to_string(device_id));
     }
+    vkWaitForFences(device, 1, &transfer_fence, VK_TRUE, UINT64_MAX);
+
+    // This wait also covers the batch flushed above, so reclamation is safe.
+    for (auto& s : slots) {
+        s.in_use = false;
+    }
+    last_submitted_slot = -1;
+
+    for (const auto& descriptor : pending_descriptors) {
+        if (descriptor.set != VK_NULL_HANDLE) {
+            vkFreeDescriptorSets(device, descriptor.pool, 1, &descriptor.set);
+        }
+    }
+    pending_descriptors.clear();
+
+    vkFreeCommandBuffers(device, command_pool, 1, &cmd);
 }
 
 VulkanManager::VulkanManager() {
@@ -217,7 +399,14 @@ VulkanManager::VulkanManager() {
 }
 
 VulkanManager::~VulkanManager() {
-    // Destroy pipelines before destroying logical devices
+    // Order matters: drain the queues, release pooled buffers, then destroy the
+    // resources that depend on the logical devices.
+    for (auto& dev : active_devices) {
+        if (dev) {
+            dev->synchronize();
+        }
+    }
+    VulkanMemoryManager::instance().shutdown();
     VulkanPipelineManager::instance().clear();
     active_devices.clear();
     if (instance != VK_NULL_HANDLE) {
@@ -301,10 +490,27 @@ void VulkanManager::synchronize_device(uint32_t device_id) {
 }
 
 void VulkanManager::synchronize_all() {
-    std::lock_guard<std::mutex> lock(manager_mutex);
-    for (size_t i = 0; i < active_devices.size(); ++i) {
-        if (active_devices[i]) {
-            active_devices[i]->wait_idle();
+    // Snapshot under the manager lock, then synchronize without holding it:
+    // a dispatch takes manager_mutex (to fetch the device) before submit_mutex,
+    // so holding manager_mutex while waiting on submit_mutex would invert the
+    // order and risk a deadlock.
+    std::vector<std::shared_ptr<VulkanDeviceContext>> devices;
+    {
+        std::lock_guard<std::mutex> lock(manager_mutex);
+        devices = active_devices;
+    }
+
+    // Submit everywhere first, then wait everywhere. Waiting device-by-device
+    // would submit device N only after device N-1 drained, serialising work
+    // that could have run concurrently.
+    for (auto& dev : devices) {
+        if (dev) {
+            dev->flush();
+        }
+    }
+    for (auto& dev : devices) {
+        if (dev) {
+            dev->synchronize();
         }
     }
 }
