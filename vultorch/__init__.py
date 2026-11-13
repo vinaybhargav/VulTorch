@@ -7,6 +7,7 @@ from typing import Tuple, List, Union, Optional
 
 from .tensor import Tensor, Device
 from .autograd import no_grad, is_grad_enabled, backward
+from .testing import gradcheck
 from . import nn
 from . import optim
 from . import utils

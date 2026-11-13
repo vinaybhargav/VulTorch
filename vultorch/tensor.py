@@ -51,7 +51,12 @@ class Device:
     def __eq__(self, other):
         if isinstance(other, str):
             other = Device(other)
+        if not isinstance(other, Device):
+            return NotImplemented
         return self.type == other.type and self.index == other.index
+
+    def __hash__(self):
+        return hash((self.type, self.index))
 
 class Tensor:
     def __init__(self, data, device: Union[str, Device] = "vk", requires_grad: bool = False):
@@ -435,7 +440,33 @@ class Tensor:
     def max(self, dim: Optional[int] = None, keepdim: bool = False) -> 'Tensor':
         native_dim = -999999 if dim is None else dim
         native_out = self._native.reduce_max(native_dim, keepdim)
-        return Tensor(native_out, device=self.device, requires_grad=False)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor(native_out, device=self.device, requires_grad=req_grad)
+
+        if req_grad:
+            out.is_leaf = False
+            src_shape = self.shape
+            norm_dim = None if dim is None else (dim if dim >= 0 else dim + self.ndim)
+
+            def max_backward(g: 'Tensor'):
+                # Route the gradient to the first maximal element of each group,
+                # matching torch.max(dim=...) semantics. Zeros elsewhere.
+                x = self.numpy()
+                if norm_dim is None:
+                    sel = np.array([int(np.argmax(x))], dtype=np.int64)
+                else:
+                    flat_map = np.arange(int(self.numel), dtype=np.int64).reshape(src_shape)
+                    am = np.argmax(x, axis=norm_dim)
+                    sel = np.take_along_axis(
+                        flat_map, np.expand_dims(am, norm_dim), axis=norm_dim
+                    ).reshape(-1)
+
+                base = np.zeros(int(self.numel), dtype=np.float32)
+                np.add.at(base, sel.reshape(-1), np.asarray(g.numpy()).reshape(-1))
+                return Tensor(base.reshape(src_shape), device=self.device)
+
+            out.grad_fn = Node("MaxBackward", max_backward, [self])
+        return out
 
     # ------------------------------------------------------------------------
     # Shape Transformations
@@ -524,7 +555,27 @@ class Tensor:
 
     def __getitem__(self, idx) -> 'Tensor':
         arr = self.numpy()[idx]
-        return Tensor(arr, device=self.device, requires_grad=False)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor(arr, device=self.device, requires_grad=req_grad)
+
+        if req_grad:
+            out.is_leaf = False
+            src_shape = self.shape
+            numel = int(self.numel)
+
+            def getitem_backward(g: 'Tensor'):
+                # Scatter the upstream gradient back into a dense buffer. The
+                # flat index map reproduces exactly the selection made in the
+                # forward pass, so advanced indexing (array/mask) and repeated
+                # indices are handled without special-casing.
+                base = np.zeros(numel, dtype=np.float32)
+                flat_map = np.arange(numel, dtype=np.int64).reshape(src_shape)
+                sel = flat_map[idx]
+                np.add.at(base, sel.reshape(-1), np.asarray(g.numpy()).reshape(-1))
+                return Tensor(base.reshape(src_shape), device=self.device)
+
+            out.grad_fn = Node("GetItemBackward", getitem_backward, [self])
+        return out
 
     def __setitem__(self, idx, val):
         arr = self.numpy()

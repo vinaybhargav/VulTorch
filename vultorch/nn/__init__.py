@@ -296,21 +296,63 @@ class LayerNorm(Module):
             self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:
+        if x.ndim < len(self.normalized_shape):
+            raise ValueError(
+                f"LayerNorm expected at least {len(self.normalized_shape)} dims, got {x.ndim}"
+            )
+
         g_native = self.weight._native if self.weight is not None else None
         b_native = self.bias._native if self.bias is not None else None
         native_out = x._native.layernorm(g_native, b_native, self.eps)
-        out = Tensor(native_out, device=x.device, requires_grad=x.requires_grad)
-        if is_grad_enabled() and x.requires_grad:
-            out.is_leaf = False
-            # Standard autodiff for layernorm
-            mean = x.mean(dim=-1, keepdim=True)
-            var = ((x - mean) ** 2).mean(dim=-1, keepdim=True)
-            x_norm = (x - mean) / (var + self.eps).sqrt()
-            if self.weight is not None:
-                res = x_norm * self.weight + self.bias
-            else:
-                res = x_norm
-            return res
+
+        req_grad = (
+            x.requires_grad
+            or (self.weight is not None and self.weight.requires_grad)
+            or (self.bias is not None and self.bias.requires_grad)
+        ) and is_grad_enabled()
+
+        out = Tensor(native_out, device=x.device, requires_grad=req_grad)
+        if not req_grad:
+            return out
+
+        out.is_leaf = False
+        ndim_norm = len(self.normalized_shape)
+        dims = tuple(range(x.ndim - ndim_norm, x.ndim))
+        outer_dims = tuple(range(0, x.ndim - ndim_norm))
+        D = 1
+        for d in self.normalized_shape:
+            D *= d
+        eps = self.eps
+        weight, bias = self.weight, self.bias
+
+        def layernorm_backward(g: Tensor):
+            # Analytic backward. Statistics are recomputed here rather than
+            # cached, so the forward pass stays a single dispatch.
+            mean = x.mean(dim=dims, keepdim=True)
+            var = ((x - mean) ** 2).mean(dim=dims, keepdim=True)
+            std = (var + eps).sqrt()
+            xhat = (x - mean) / std
+
+            gy = g * weight if weight is not None else g
+            sum_gy = gy.sum(dim=dims, keepdim=True)
+            sum_gy_xhat = (gy * xhat).sum(dim=dims, keepdim=True)
+
+            inv_d = 1.0 / D
+            dx = (gy - sum_gy * inv_d - xhat * sum_gy_xhat * inv_d) / std
+
+            grads = [dx if x.requires_grad else None]
+            if weight is not None:
+                grads.append(((g * xhat).sum(dim=outer_dims)) if weight.requires_grad else None)
+            if bias is not None:
+                grads.append((g.sum(dim=outer_dims)) if bias.requires_grad else None)
+            return tuple(grads)
+
+        inputs = [x]
+        if self.weight is not None:
+            inputs.append(self.weight)
+        if self.bias is not None:
+            inputs.append(self.bias)
+        out.grad_fn = Node("LayerNormBackward", layernorm_backward, inputs)
         return out
 
 class Dropout(Module):

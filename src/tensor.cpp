@@ -6,6 +6,104 @@
 #include <iostream>
 
 namespace vultorch {
+namespace {
+
+// Single source of truth for elementwise op semantics. Both the CPU fallback
+// and the shader paths use the same op numbering (see
+// shaders/elementwise_binary_broadcast.comp).
+inline float apply_binary_op(uint32_t op, float a, float b) {
+    switch (op) {
+        case 0: return a + b;
+        case 1: return a - b;
+        case 2: return a * b;
+        case 3: return a / b;
+        case 4: return std::pow(a, b);
+        case 5: return std::max(a, b);
+        case 6: return std::min(a, b);
+        case 7: return (a > b) ? 1.0f : 0.0f;
+        case 8: return (a < b) ? 1.0f : 0.0f;
+        case 9: return (a == b) ? 1.0f : 0.0f;
+        default:
+            throw std::runtime_error("Unsupported binary op_type: " + std::to_string(op));
+    }
+}
+
+// Same op numbering as shaders/elementwise_unary_scalar.comp. Anything missing
+// here silently degrades to identity, which is how `gelu`/`silu` used to be a
+// no-op on the CPU backend while working on the GPU.
+inline float apply_unary_op(uint32_t op, float x, float p1, float p2) {
+    constexpr float kSqrt2OverPi = 0.7978845608f;
+    constexpr float kGeluCoeff = 0.044715f;
+
+    switch (op) {
+        case 0: return -x;
+        case 1: return std::exp(x);
+        case 2: return std::log(x);
+        case 3: return std::sqrt(x);
+        case 4: return 1.0f / std::sqrt(x);
+        case 5: return std::abs(x);
+        case 6: return std::sin(x);
+        case 7: return std::cos(x);
+        case 8: return std::tanh(x);
+        case 9: return 1.0f / (1.0f + std::exp(-x));
+        case 10: return std::max(x, 0.0f);
+        case 11: {
+            const float inner = kSqrt2OverPi * (x + kGeluCoeff * x * x * x);
+            return 0.5f * x * (1.0f + std::tanh(inner));
+        }
+        case 12: return x / (1.0f + std::exp(-x));
+        case 13: return std::min(std::max(x, p1), p2);
+        case 14: return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f);
+        case 15: return x * p1 + p2;
+        default:
+            throw std::runtime_error("Unsupported unary op_type: " + std::to_string(op));
+    }
+}
+
+// Broadcasting plan shared by the CPU fallback and the GPU broadcast kernel.
+// Dimensions are right-aligned; a broadcast dimension gets a stride of 0 so
+// the same plan can be used for index arithmetic and for push constants.
+struct BroadcastPlan {
+    std::vector<int64_t> out_shape;
+    std::vector<int64_t> strides_a;
+    std::vector<int64_t> strides_b;
+};
+
+BroadcastPlan make_broadcast_plan(const std::vector<int64_t>& a_shape,
+                                  const std::vector<int64_t>& a_strides,
+                                  const std::vector<int64_t>& b_shape,
+                                  const std::vector<int64_t>& b_strides) {
+    const size_t max_ndim = std::max(a_shape.size(), b_shape.size());
+    if (max_ndim > 6) {
+        throw std::runtime_error("Broadcasting supports up to 6 dimensions");
+    }
+
+    BroadcastPlan plan;
+    plan.out_shape.assign(max_ndim, 1);
+    plan.strides_a.assign(max_ndim, 0);
+    plan.strides_b.assign(max_ndim, 0);
+
+    for (size_t k = 0; k < max_ndim; ++k) {
+        const int ai = static_cast<int>(a_shape.size()) - 1 - static_cast<int>(k);
+        const int bi = static_cast<int>(b_shape.size()) - 1 - static_cast<int>(k);
+        const size_t oi = max_ndim - 1 - k;
+
+        const int64_t dim_a = (ai >= 0) ? a_shape[ai] : 1;
+        const int64_t dim_b = (bi >= 0) ? b_shape[bi] : 1;
+
+        if (dim_a != dim_b && dim_a != 1 && dim_b != 1) {
+            throw std::runtime_error("Cannot broadcast shapes: incompatible dimension " +
+                                     std::to_string(dim_a) + " vs " + std::to_string(dim_b));
+        }
+
+        plan.out_shape[oi] = std::max(dim_a, dim_b);
+        if (ai >= 0 && dim_a > 1) plan.strides_a[oi] = a_strides[ai];
+        if (bi >= 0 && dim_b > 1) plan.strides_b[oi] = b_strides[bi];
+    }
+    return plan;
+}
+
+} // namespace
 
 NativeTensor::NativeTensor(const std::vector<int64_t>& s, int dev_id)
     : device_id(dev_id), shape(s) {
@@ -122,20 +220,30 @@ std::shared_ptr<NativeTensor> NativeTensor::binary_op(uint32_t op_type, std::sha
     }
 
     if (device_id == -1) {
-        // CPU fallback
-        auto out = std::make_shared<NativeTensor>(shape, -1);
-        for (size_t i = 0; i < numel; ++i) {
-            float a = cpu_data[i];
-            float b = other->cpu_data[i];
-            switch (op_type) {
-                case 0: out->cpu_data[i] = a + b; break;
-                case 1: out->cpu_data[i] = a - b; break;
-                case 2: out->cpu_data[i] = a * b; break;
-                case 3: out->cpu_data[i] = a / b; break;
-                case 4: out->cpu_data[i] = std::pow(a, b); break;
-                case 5: out->cpu_data[i] = std::max(a, b); break;
-                case 6: out->cpu_data[i] = std::min(a, b); break;
-                default: out->cpu_data[i] = a + b; break;
+        // CPU fallback. Uses the same broadcast plan as the GPU path so the two
+        // backends cannot disagree (previously this indexed `other` with the
+        // output linear index and read out of bounds on broadcast shapes).
+        const BroadcastPlan plan = make_broadcast_plan(shape, strides, other->shape, other->strides);
+        auto out = std::make_shared<NativeTensor>(plan.out_shape, -1);
+
+        const size_t ndim = plan.out_shape.size();
+        std::vector<int64_t> coord(ndim, 0);
+        int64_t ia = 0;
+        int64_t ib = 0;
+
+        for (size_t n = 0; n < out->numel; ++n) {
+            out->cpu_data[n] = apply_binary_op(op_type, cpu_data[ia], other->cpu_data[ib]);
+
+            // Odometer increment, last dimension fastest.
+            for (int d = static_cast<int>(ndim) - 1; d >= 0; --d) {
+                ia += plan.strides_a[d];
+                ib += plan.strides_b[d];
+                if (++coord[d] < plan.out_shape[d]) {
+                    break;
+                }
+                ia -= plan.strides_a[d] * plan.out_shape[d];
+                ib -= plan.strides_b[d] * plan.out_shape[d];
+                coord[d] = 0;
             }
         }
         return out;
@@ -188,30 +296,10 @@ std::shared_ptr<NativeTensor> NativeTensor::binary_op(uint32_t op_type, std::sha
         }
         return out;
     } else {
-        // Multi-dimensional Broadcasting
-        size_t max_ndim = std::max(shape.size(), other->shape.size());
-        if (max_ndim > 6) throw std::runtime_error("Broadcasting supports up to 6 dimensions");
-
-        std::vector<int64_t> out_shape(max_ndim);
-        std::vector<uint32_t> strideA_expanded(6, 0);
-        std::vector<uint32_t> strideB_expanded(6, 0);
-
-        for (int i = 0; i < static_cast<int>(max_ndim); ++i) {
-            int a_idx = static_cast<int>(shape.size()) - 1 - i;
-            int b_idx = static_cast<int>(other->shape.size()) - 1 - i;
-            int out_idx = static_cast<int>(max_ndim) - 1 - i;
-
-            int64_t dim_a = (a_idx >= 0) ? shape[a_idx] : 1;
-            int64_t dim_b = (b_idx >= 0) ? other->shape[b_idx] : 1;
-
-            if (dim_a != dim_b && dim_a != 1 && dim_b != 1) {
-                throw std::runtime_error("Cannot broadcast shapes!");
-            }
-            out_shape[out_idx] = std::max(dim_a, dim_b);
-
-            if (a_idx >= 0 && dim_a > 1) strideA_expanded[out_idx] = static_cast<uint32_t>(strides[a_idx]);
-            if (b_idx >= 0 && dim_b > 1) strideB_expanded[out_idx] = static_cast<uint32_t>(other->strides[b_idx]);
-        }
+        // Multi-dimensional broadcasting, driven by the shared plan.
+        const BroadcastPlan plan = make_broadcast_plan(shape, strides, other->shape, other->strides);
+        const std::vector<int64_t>& out_shape = plan.out_shape;
+        const size_t max_ndim = out_shape.size();
 
         auto out = std::make_shared<NativeTensor>(out_shape, device_id);
 
@@ -231,10 +319,13 @@ std::shared_ptr<NativeTensor> NativeTensor::binary_op(uint32_t op_type, std::sha
         pc.ndim = static_cast<uint32_t>(max_ndim);
         pc.is_b_scalar = 0;
 
+        if (max_ndim > 6) {
+            throw std::runtime_error("Broadcasting supports up to 6 dimensions");
+        }
         for (size_t i = 0; i < max_ndim; ++i) {
             pc.shape[i] = static_cast<uint32_t>(out_shape[i]);
-            pc.strideA[i] = strideA_expanded[i];
-            pc.strideB[i] = strideB_expanded[i];
+            pc.strideA[i] = static_cast<uint32_t>(plan.strides_a[i]);
+            pc.strideB[i] = static_cast<uint32_t>(plan.strides_b[i]);
         }
 
         uint32_t groups = (static_cast<uint32_t>(out->numel) + 255) / 256;
@@ -253,13 +344,7 @@ std::shared_ptr<NativeTensor> NativeTensor::binary_op_scalar(uint32_t op_type, f
         for (size_t i = 0; i < numel; ++i) {
             float a = reverse ? scalar_val : cpu_data[i];
             float b = reverse ? cpu_data[i] : scalar_val;
-            switch (op_type) {
-                case 0: out->cpu_data[i] = a + b; break;
-                case 1: out->cpu_data[i] = a - b; break;
-                case 2: out->cpu_data[i] = a * b; break;
-                case 3: out->cpu_data[i] = a / b; break;
-                default: out->cpu_data[i] = a + b; break;
-            }
+            out->cpu_data[i] = apply_binary_op(op_type, a, b);
         }
         return out;
     }
@@ -332,18 +417,7 @@ std::shared_ptr<NativeTensor> NativeTensor::unary_op(uint32_t op_type, float p1,
     if (device_id == -1) {
         auto out = std::make_shared<NativeTensor>(shape, -1);
         for (size_t i = 0; i < numel; ++i) {
-            float x = cpu_data[i];
-            switch (op_type) {
-                case 0: out->cpu_data[i] = -x; break;
-                case 1: out->cpu_data[i] = std::exp(x); break;
-                case 2: out->cpu_data[i] = std::log(x); break;
-                case 3: out->cpu_data[i] = std::sqrt(x); break;
-                case 8: out->cpu_data[i] = std::tanh(x); break;
-                case 9: out->cpu_data[i] = 1.0f / (1.0f + std::exp(-x)); break;
-                case 10: out->cpu_data[i] = std::max(x, 0.0f); break;
-                case 15: out->cpu_data[i] = x * p1 + p2; break;
-                default: out->cpu_data[i] = x; break;
-            }
+            out->cpu_data[i] = apply_unary_op(op_type, cpu_data[i], p1, p2);
         }
         return out;
     }
@@ -393,6 +467,9 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
     if (shape.size() < 2 || other->shape.size() < 2) {
         throw std::runtime_error("Matmul requires at least 2-dimensional tensors");
     }
+    if (!is_contiguous() || !other->is_contiguous()) {
+        throw std::runtime_error("Matmul requires contiguous tensors");
+    }
 
     uint32_t M = static_cast<uint32_t>(shape[shape.size() - 2]);
     uint32_t K1 = static_cast<uint32_t>(shape[shape.size() - 1]);
@@ -401,6 +478,23 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
 
     if (K1 != K2) {
         throw std::runtime_error("Inner dimensions must match for matmul: " + std::to_string(K1) + " vs " + std::to_string(K2));
+    }
+
+    // Batch handling: B may either be unbatched (shared across every batch item,
+    // the `Linear`-on-3D case) or have exactly the same leading dimensions. Any
+    // other combination used to produce a wrong output shape and read past the
+    // end of B, so it is rejected explicitly until general broadcasting lands.
+    const bool b_broadcast = (other->shape.size() == 2);
+    if (!b_broadcast) {
+        if (shape.size() != other->shape.size()) {
+            throw std::runtime_error("Matmul batch rank mismatch: " + std::to_string(shape.size()) +
+                                     " vs " + std::to_string(other->shape.size()));
+        }
+        for (size_t i = 0; i + 2 < shape.size(); ++i) {
+            if (shape[i] != other->shape[i]) {
+                throw std::runtime_error("Matmul batch dimensions must match (general batch broadcasting is not implemented)");
+            }
+        }
     }
 
     // Calculate batch count
@@ -437,7 +531,7 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
         pc.strideA_b = static_cast<uint32_t>(M * K1);
         pc.strideA_m = static_cast<uint32_t>(K1);
         pc.strideA_k = 1;
-        pc.strideB_b = static_cast<uint32_t>(K1 * N);
+        pc.strideB_b = b_broadcast ? 0u : static_cast<uint32_t>(K1 * N);
         pc.strideB_k = static_cast<uint32_t>(N);
         pc.strideB_n = 1;
         pc.strideC_b = static_cast<uint32_t>(M * N);
@@ -454,9 +548,10 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
             &pc, sizeof(pc), group_x, group_y, group_z);
     } else {
         // CPU MatMul fallback
+        const size_t batch_stride_b = b_broadcast ? 0 : static_cast<size_t>(K1) * N;
         for (size_t b = 0; b < batch_count; ++b) {
             size_t offA = b * M * K1;
-            size_t offB = b * K1 * N;
+            size_t offB = b * batch_stride_b;
             size_t offC = b * M * N;
 
             for (uint32_t m = 0; m < M; ++m) {
@@ -625,13 +720,22 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_max(int64_t dim, bool keepdim
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::softmax(int64_t dim, bool is_log) {
-    if (dim < 0) dim += shape.size();
-    uint32_t cols = static_cast<uint32_t>(shape.back());
-    uint32_t rows = static_cast<uint32_t>(numel / cols);
+    if (shape.empty()) {
+        throw std::runtime_error("softmax requires a tensor with at least 1 dimension");
+    }
+    if (dim < 0) dim += static_cast<int64_t>(shape.size());
+    if (dim < 0 || dim >= static_cast<int64_t>(shape.size())) {
+        throw std::runtime_error("softmax: dim " + std::to_string(dim) + " out of range for rank " +
+                                 std::to_string(shape.size()));
+    }
 
     auto out = std::make_shared<NativeTensor>(shape, device_id);
+    const bool last_dim = (dim == static_cast<int64_t>(shape.size()) - 1);
 
-    if (device_id >= 0 && dim == static_cast<int64_t>(shape.size()) - 1) {
+    if (device_id >= 0 && last_dim) {
+        uint32_t cols = static_cast<uint32_t>(shape.back());
+        uint32_t rows = static_cast<uint32_t>(numel / cols);
+
         struct {
             uint32_t num_rows;
             uint32_t cols;
@@ -642,25 +746,47 @@ std::shared_ptr<NativeTensor> NativeTensor::softmax(int64_t dim, bool is_log) {
             device_id, "softmax",
             {gpu_buffer, out->gpu_buffer},
             &pc, sizeof(pc), 1, rows, 1);
-    } else {
-        // CPU fallback for arbitrary dimension
-        auto cpu_t = to_device(-1);
-        auto out_cpu = std::make_shared<NativeTensor>(shape, -1);
-        for (uint32_t r = 0; r < rows; ++r) {
+        return out;
+    }
+
+    // Dimension-aware path for any axis (and for CPU tensors). The storage is
+    // contiguous, so consecutive elements of one reduction group are `inner`
+    // apart. Kept simple and obviously correct; the fast kernel above only
+    // covers the last axis.
+    auto cpu_in = (device_id >= 0) ? to_device(-1) : shared_from_this();
+    auto cpu_out = std::make_shared<NativeTensor>(shape, -1);
+
+    int64_t inner = 1;
+    for (size_t i = static_cast<size_t>(dim) + 1; i < shape.size(); ++i) {
+        inner *= shape[i];
+    }
+    const int64_t dim_size = shape[dim];
+    const int64_t outer = static_cast<int64_t>(numel) / (dim_size * inner);
+
+    for (int64_t o = 0; o < outer; ++o) {
+        for (int64_t i = 0; i < inner; ++i) {
+            const int64_t base = o * dim_size * inner + i;
+
             float m = -1e30f;
-            for (uint32_t c = 0; c < cols; ++c) m = std::max(m, cpu_t->cpu_data[r * cols + c]);
+            for (int64_t d = 0; d < dim_size; ++d) {
+                m = std::max(m, cpu_in->cpu_data[base + d * inner]);
+            }
+
             float s = 0.0f;
-            for (uint32_t c = 0; c < cols; ++c) s += std::exp(cpu_t->cpu_data[r * cols + c] - m);
-            float inv_s = 1.0f / s;
-            float log_s = std::log(s);
-            for (uint32_t c = 0; c < cols; ++c) {
-                float val = cpu_t->cpu_data[r * cols + c];
-                out_cpu->cpu_data[r * cols + c] = is_log ? ((val - m) - log_s) : (std::exp(val - m) * inv_s);
+            for (int64_t d = 0; d < dim_size; ++d) {
+                s += std::exp(cpu_in->cpu_data[base + d * inner] - m);
+            }
+
+            const float log_s = std::log(s);
+            const float inv_s = 1.0f / s;
+            for (int64_t d = 0; d < dim_size; ++d) {
+                const float v = cpu_in->cpu_data[base + d * inner] - m;
+                cpu_out->cpu_data[base + d * inner] = is_log ? (v - log_s) : (std::exp(v) * inv_s);
             }
         }
-        return out_cpu->to_device(device_id);
     }
-    return out;
+
+    return (device_id >= 0) ? cpu_out->to_device(device_id) : cpu_out;
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::conv2d(std::shared_ptr<NativeTensor> weight,
@@ -808,6 +934,33 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d_backward_input(std::shared_pt
             device_id, "conv2d_backward_input",
             {gpu_buffer, weight->gpu_buffer, grad_in->gpu_buffer},
             &pc, sizeof(pc), gx, gy, gz);
+    } else {
+        // CPU fallback. Previously this branch was missing entirely and the
+        // function returned an all-zero gradient without raising.
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t oc = 0; oc < C_out; ++oc) {
+                for (uint32_t oh = 0; oh < H_out; ++oh) {
+                    for (uint32_t ow = 0; ow < W_out; ++ow) {
+                        const float g = cpu_data[((n * C_out + oc) * H_out + oh) * W_out + ow];
+                        const int in_h_base = static_cast<int>(oh * stride_h) - static_cast<int>(pad_h);
+                        const int in_w_base = static_cast<int>(ow * stride_w) - static_cast<int>(pad_w);
+
+                        for (uint32_t ic = 0; ic < C_in; ++ic) {
+                            for (uint32_t kh = 0; kh < kH; ++kh) {
+                                const int ih = in_h_base + static_cast<int>(kh);
+                                if (ih < 0 || ih >= static_cast<int>(H_in)) continue;
+                                for (uint32_t kw = 0; kw < kW; ++kw) {
+                                    const int iw = in_w_base + static_cast<int>(kw);
+                                    if (iw < 0 || iw >= static_cast<int>(W_in)) continue;
+                                    const float w = weight->cpu_data[((oc * C_in + ic) * kH + kh) * kW + kw];
+                                    grad_in->cpu_data[((n * C_in + ic) * H_in + ih) * W_in + iw] += g * w;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     return grad_in;
 }
@@ -859,6 +1012,32 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d_backward_weight(std::shared_p
             device_id, "conv2d_backward_weight",
             {gpu_buffer, input->gpu_buffer, grad_weight->gpu_buffer},
             &pc, sizeof(pc), total_pairs, 1, 1);
+    } else {
+        // CPU fallback: dL/dweight for a 4D NCHW convolution.
+        for (uint32_t n = 0; n < N; ++n) {
+            for (uint32_t oc = 0; oc < C_out; ++oc) {
+                for (uint32_t oh = 0; oh < H_out; ++oh) {
+                    for (uint32_t ow = 0; ow < W_out; ++ow) {
+                        const float g = cpu_data[((n * C_out + oc) * H_out + oh) * W_out + ow];
+                        const int in_h_base = static_cast<int>(oh * stride_h) - static_cast<int>(pad_h);
+                        const int in_w_base = static_cast<int>(ow * stride_w) - static_cast<int>(pad_w);
+
+                        for (uint32_t ic = 0; ic < C_in; ++ic) {
+                            for (uint32_t kh = 0; kh < kH; ++kh) {
+                                const int ih = in_h_base + static_cast<int>(kh);
+                                if (ih < 0 || ih >= static_cast<int>(H_in)) continue;
+                                for (uint32_t kw = 0; kw < kW; ++kw) {
+                                    const int iw = in_w_base + static_cast<int>(kw);
+                                    if (iw < 0 || iw >= static_cast<int>(W_in)) continue;
+                                    const float x = input->cpu_data[((n * C_in + ic) * H_in + ih) * W_in + iw];
+                                    grad_weight->cpu_data[((oc * C_in + ic) * kH + kh) * kW + kw] += g * x;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     return grad_weight;
 }
