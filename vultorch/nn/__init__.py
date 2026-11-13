@@ -449,30 +449,43 @@ class CrossEntropyLoss(Module):
         self.reduction = reduction
 
     def forward(self, pred: Tensor, target: Tensor) -> Tensor:
-        log_probs = pred.log_softmax(dim=-1)
-        # target can be integer class indices or one-hot probabilities
+        # Integer class indices take the fused path; anything else is treated as
+        # a (soft) target distribution.
         if target.ndim == 1 or (target.ndim == 2 and target.shape[-1] == 1):
-            indices = target.numpy().astype(int).flatten()
-            N = pred.shape[0]
-            log_p_np = log_probs.numpy()
-            nll = -log_p_np[np.arange(N), indices]
+            return self._index_target_loss(pred, target)
 
-            loss_val = np.mean(nll) if self.reduction == "mean" else np.sum(nll)
-            out = Tensor(np.array([loss_val], dtype=np.float32), device=pred.device, requires_grad=pred.requires_grad)
+        nll = -(target * pred.log_softmax(dim=-1)).sum(dim=-1)
+        return nll.mean() if self.reduction == "mean" else nll.sum()
 
-            if is_grad_enabled() and pred.requires_grad:
-                out.is_leaf = False
-                probs_np = pred.softmax(dim=-1).numpy()
-                probs_np[np.arange(N), indices] -= 1.0
-                if self.reduction == "mean":
-                    probs_np /= N
-                grad_pred = Tensor(probs_np, device=pred.device)
-                out.grad_fn = Node("CrossEntropyBackward", lambda g: g * grad_pred, [pred])
-            return out
-        else:
-            # One-hot target
-            nll = -(target * log_probs).sum(dim=-1)
-            return nll.mean() if self.reduction == "mean" else nll.sum()
+    def _index_target_loss(self, pred: Tensor, target: Tensor) -> Tensor:
+        if pred.ndim != 2:
+            raise ValueError(f"CrossEntropyLoss expects 2-D logits, got shape {pred.shape}")
+
+        rows = pred.shape[0]
+        indices = target.reshape((rows,))
+
+        req_grad = pred.requires_grad and is_grad_enabled()
+        per_row = Tensor(
+            pred._native.cross_entropy_per_row(indices._native),
+            device=pred.device,
+            requires_grad=req_grad,
+        )
+
+        if req_grad:
+            per_row.is_leaf = False
+            pred_native = pred._native
+            indices_native = indices._native
+            device = pred.device
+
+            def ce_backward(g: Tensor):
+                # The kernel produces the unscaled (softmax - onehot) gradient;
+                # the reduction scaling (1/N for mean) reaches us through g.
+                grad = Tensor(pred_native.cross_entropy_grad(indices_native), device=device)
+                return grad * g.reshape((rows, 1))
+
+            per_row.grad_fn = Node("CrossEntropyBackward", ce_backward, [pred])
+
+        return per_row.mean() if self.reduction == "mean" else per_row.sum()
 
 # ----------------------------------------------------------------------------
 # Multi-GPU DataParallel

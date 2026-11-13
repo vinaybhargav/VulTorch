@@ -1,0 +1,98 @@
+#version 450
+
+// Fused softmax cross-entropy for a 2-D logits tensor [rows, cols] with one
+// integer class index per row (stored as float; exact well past any vocabulary
+// size we care about).
+//
+// mode 0: per-row loss   out[row]      = logsumexp(logits[row]) - logits[row][target]
+// mode 1: gradient       out[row][col] = softmax(logits[row])[col] - onehot(col == target)
+//
+// The gradient is deliberately unscaled: the caller applies the reduction
+// scaling (1/N for mean) through the autograd graph, so this kernel is shared
+// by every reduction mode.
+
+layout(local_size_x = 128) in;
+
+layout(std430, binding = 0) readonly buffer BufferLogits {
+    float logits[];
+};
+
+layout(std430, binding = 1) readonly buffer BufferTargets {
+    float targets[];
+};
+
+layout(std430, binding = 2) writeonly buffer BufferOut {
+    float dataOut[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint rows;
+    uint cols;
+    uint mode;
+} pc;
+
+shared float s_reduce[128];
+
+float block_max(float value, uint tid) {
+    s_reduce[tid] = value;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            s_reduce[tid] = max(s_reduce[tid], s_reduce[tid + stride]);
+        }
+        barrier();
+    }
+    float result = s_reduce[0];
+    barrier();
+    return result;
+}
+
+float block_sum(float value, uint tid) {
+    s_reduce[tid] = value;
+    barrier();
+    for (uint stride = 64u; stride > 0u; stride >>= 1u) {
+        if (tid < stride) {
+            s_reduce[tid] += s_reduce[tid + stride];
+        }
+        barrier();
+    }
+    float result = s_reduce[0];
+    barrier();
+    return result;
+}
+
+void main() {
+    uint row = gl_WorkGroupID.x;
+    if (row >= pc.rows) return;
+
+    uint tid = gl_LocalInvocationID.x;
+    uint base = row * pc.cols;
+    uint target = uint(targets[row]);
+
+    float local_max = -3.402823466e+38;
+    for (uint j = tid; j < pc.cols; j += 128u) {
+        local_max = max(local_max, logits[base + j]);
+    }
+    float row_max = block_max(local_max, tid);
+
+    float local_sum = 0.0;
+    for (uint j = tid; j < pc.cols; j += 128u) {
+        local_sum += exp(logits[base + j] - row_max);
+    }
+    float row_sum = block_sum(local_sum, tid);
+
+    if (pc.mode == 0u) {
+        if (tid == 0u) {
+            float target_logit = logits[base + target];
+            dataOut[row] = (row_max + log(row_sum)) - target_logit;
+        }
+        return;
+    }
+
+    float inv_sum = 1.0 / row_sum;
+    for (uint j = tid; j < pc.cols; j += 128u) {
+        float probability = exp(logits[base + j] - row_max) * inv_sum;
+        float onehot = (j == target) ? 1.0 : 0.0;
+        dataOut[base + j] = probability - onehot;
+    }
+}

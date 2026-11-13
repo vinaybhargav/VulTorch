@@ -94,6 +94,9 @@ PYBIND11_MODULE(_vultorch_backend, m) {
             self->copy_from_host(arr.data(), std::min(self->numel, static_cast<size_t>(arr.size())));
         })
         .def("clone", &NativeTensor::clone)
+        .def("strided_copy", &NativeTensor::strided_copy, py::arg("out_shape"), py::arg("src_strides"))
+        .def("reshape_view", &NativeTensor::reshape_view, py::arg("new_shape"))
+        .def("copy_from_native", &NativeTensor::copy_from_native, py::arg("src"))
         .def("fill_", &NativeTensor::fill_, py::arg("val"))
         .def("zero_", &NativeTensor::zero_)
         .def("binary_op", &NativeTensor::binary_op, py::arg("op_type"), py::arg("other"))
@@ -104,6 +107,8 @@ PYBIND11_MODULE(_vultorch_backend, m) {
         .def("reduce_mean", &NativeTensor::reduce_mean, py::arg("dim") = -1, py::arg("keepdim") = false)
         .def("reduce_max", &NativeTensor::reduce_max, py::arg("dim") = -1, py::arg("keepdim") = false)
         .def("softmax", &NativeTensor::softmax, py::arg("dim") = -1, py::arg("is_log") = false)
+        .def("cross_entropy_per_row", &NativeTensor::cross_entropy_per_row, py::arg("targets"))
+        .def("cross_entropy_grad", &NativeTensor::cross_entropy_grad, py::arg("targets"))
         .def("conv2d", &NativeTensor::conv2d, py::arg("weight"), py::arg("bias") = nullptr,
              py::arg("stride_h") = 1, py::arg("stride_w") = 1, py::arg("pad_h") = 0, py::arg("pad_w") = 0)
         .def("conv2d_backward_input", &NativeTensor::conv2d_backward_input, py::arg("weight"),

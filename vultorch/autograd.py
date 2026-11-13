@@ -4,23 +4,28 @@ Dynamic reverse-mode automatic differentiation DAG.
 """
 
 from typing import List, Tuple, Callable, Optional, Set
+import threading
 
-_GRAD_ENABLED = True
+# Thread-local rather than global: a no_grad() entered on one thread (for
+# example the optimizer step) must not disable tracking in a DataParallel
+# worker computing its forward pass on another thread.
+_state = threading.local()
+
+
+def is_grad_enabled() -> bool:
+    return getattr(_state, "enabled", True)
+
 
 class no_grad:
-    """Context manager that disables gradient calculation."""
+    """Context manager that disables gradient calculation in this thread."""
     def __enter__(self):
-        global _GRAD_ENABLED
-        self.prev = _GRAD_ENABLED
-        _GRAD_ENABLED = False
+        self.prev = is_grad_enabled()
+        _state.enabled = False
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        global _GRAD_ENABLED
-        _GRAD_ENABLED = self.prev
-
-def is_grad_enabled() -> bool:
-    return _GRAD_ENABLED
+        _state.enabled = self.prev
+        return False
 
 class Context:
     """Context for saving forward tensors for the backward pass."""

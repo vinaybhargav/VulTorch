@@ -145,8 +145,10 @@ class Tensor:
         return self.to("cpu")
 
     def detach(self) -> 'Tensor':
-        out = Tensor(self._native.clone(), device=self.device, requires_grad=False)
+        # Shares storage: no copy, no host round trip.
+        out = Tensor(self._native.reshape_view(list(self.shape)), device=self.device, requires_grad=False)
         out.is_leaf = True
+        out.grad_fn = None
         return out
 
     def __deepcopy__(self, memo):
@@ -161,7 +163,11 @@ class Tensor:
 
     def copy_(self, src: Union['Tensor', np.ndarray]):
         if isinstance(src, Tensor):
-            self._native.copy_from_numpy(src.numpy())
+            if src.device == self.device:
+                # Device-to-device: no host round trip.
+                self._native.copy_from_native(src._native)
+            else:
+                self._native.copy_from_numpy(src.numpy())
         elif isinstance(src, np.ndarray):
             self._native.copy_from_numpy(src)
         else:
@@ -509,9 +515,11 @@ class Tensor:
             resolved_shape[infer_idx] = self.numel // known_prod
             new_shape = tuple(resolved_shape)
 
-        arr = self.numpy().reshape(new_shape)
-        out = Tensor(arr, device=self.device, requires_grad=self.requires_grad)
-        if is_grad_enabled() and self.requires_grad:
+        # Shares storage: no copy and no host round trip.
+        native = self._native.reshape_view(list(new_shape))
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor(native, device=self.device, requires_grad=req_grad)
+        if req_grad:
             out.is_leaf = False
             orig_shape = self.shape
             out.grad_fn = Node("ReshapeBackward", lambda g: g.reshape(orig_shape), [self])
@@ -521,11 +529,27 @@ class Tensor:
         return self.reshape(*new_shape)
 
     def transpose(self, dim0: int, dim1: int) -> 'Tensor':
-        arr = np.swapaxes(self.numpy(), dim0, dim1)
-        out = Tensor(arr, device=self.device, requires_grad=self.requires_grad)
-        if is_grad_enabled() and self.requires_grad:
+        ndim = self.ndim
+        d0 = dim0 if dim0 >= 0 else dim0 + ndim
+        d1 = dim1 if dim1 >= 0 else dim1 + ndim
+        if not (0 <= d0 < ndim and 0 <= d1 < ndim):
+            raise IndexError(f"transpose dims ({dim0}, {dim1}) out of range for ndim={ndim}")
+
+        perm = list(range(ndim))
+        perm[d0], perm[d1] = perm[d1], perm[d0]
+
+        shape, strides = self.shape, self.strides
+        new_shape = [shape[p] for p in perm]
+        src_strides = [strides[p] for p in perm]
+
+        # Materialised on the device. A lazy strided view would avoid the copy,
+        # but every kernel currently assumes contiguous inputs.
+        native = self._native.strided_copy(new_shape, src_strides)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor(native, device=self.device, requires_grad=req_grad)
+        if req_grad:
             out.is_leaf = False
-            out.grad_fn = Node("TransposeBackward", lambda g: g.transpose(dim0, dim1), [self])
+            out.grad_fn = Node("TransposeBackward", lambda g: g.transpose(d0, d1), [self])
         return out
 
     def t(self) -> 'Tensor':
@@ -534,36 +558,77 @@ class Tensor:
         return self.transpose(0, 1)
 
     def unsqueeze(self, dim: int) -> 'Tensor':
-        arr = np.expand_dims(self.numpy(), axis=dim)
-        out = Tensor(arr, device=self.device, requires_grad=self.requires_grad)
-        if is_grad_enabled() and self.requires_grad:
+        ndim = self.ndim + 1
+        d = dim if dim >= 0 else dim + ndim
+        if not (0 <= d < ndim):
+            raise IndexError(f"unsqueeze dim {dim} out of range for ndim={ndim}")
+        new_shape = list(self.shape)
+        new_shape.insert(d, 1)
+
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor(self._native.reshape_view(new_shape), device=self.device, requires_grad=req_grad)
+        if req_grad:
             out.is_leaf = False
-            out.grad_fn = Node("UnsqueezeBackward", lambda g: g.squeeze(dim), [self])
+            orig_shape = self.shape
+            out.grad_fn = Node("UnsqueezeBackward", lambda g: g.reshape(orig_shape), [self])
         return out
 
     def squeeze(self, dim: Optional[int] = None) -> 'Tensor':
-        arr = np.squeeze(self.numpy(), axis=dim)
-        out = Tensor(arr, device=self.device, requires_grad=self.requires_grad)
-        if is_grad_enabled() and self.requires_grad:
+        if dim is None:
+            new_shape = tuple(s for s in self.shape if s != 1)
+        else:
+            d = dim if dim >= 0 else dim + self.ndim
+            if not (0 <= d < self.ndim):
+                raise IndexError(f"squeeze dim {dim} out of range for ndim={self.ndim}")
+            new_shape = tuple(s for i, s in enumerate(self.shape) if not (i == d and s == 1))
+        if not new_shape:
+            new_shape = (1,)
+
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor(self._native.reshape_view(list(new_shape)), device=self.device, requires_grad=req_grad)
+        if req_grad:
             out.is_leaf = False
             orig_shape = self.shape
             out.grad_fn = Node("SqueezeBackward", lambda g: g.reshape(orig_shape), [self])
         return out
 
     def flatten(self, start_dim: int = 0, end_dim: int = -1) -> 'Tensor':
-        if end_dim < 0: end_dim += self.ndim
+        if end_dim < 0:
+            end_dim += self.ndim
         new_shape = self.shape[:start_dim] + (-1,) + self.shape[end_dim + 1:]
         return self.reshape(new_shape)
 
     def expand(self, *target_shape) -> 'Tensor':
         if len(target_shape) == 1 and isinstance(target_shape[0], (list, tuple)):
             target_shape = tuple(target_shape[0])
-        arr = np.broadcast_to(self.numpy(), target_shape)
-        out = Tensor(arr, device=self.device, requires_grad=self.requires_grad)
-        if is_grad_enabled() and self.requires_grad:
+        if len(target_shape) < self.ndim:
+            raise ValueError(
+                f"expand: {len(target_shape)} dims given for a {self.ndim}-dim tensor"
+            )
+
+        # Right-align the source against the target.
+        pad = len(target_shape) - self.ndim
+        src_shape = (1,) * pad + self.shape
+        src_strides = (0,) * pad + self.strides
+
+        new_strides = []
+        for size, want, stride in zip(src_shape, target_shape, src_strides):
+            if size == want:
+                new_strides.append(stride)
+            elif size == 1:
+                new_strides.append(0)  # broadcast axis
+            else:
+                raise ValueError(
+                    f"expand: cannot expand dim of size {size} to {want}"
+                )
+
+        native = self._native.strided_copy(list(target_shape), new_strides)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor(native, device=self.device, requires_grad=req_grad)
+        if req_grad:
             out.is_leaf = False
-            orig_shape = self.shape
-            out.grad_fn = Node("ExpandBackward", lambda g: g.sum(tuple(range(g.ndim - len(orig_shape)))).reshape(orig_shape), [self])
+            # The engine reduces the broadcast gradient back to self.shape.
+            out.grad_fn = Node("ExpandBackward", lambda g: g, [self])
         return out
 
     def contiguous(self) -> 'Tensor':

@@ -124,6 +124,110 @@ std::shared_ptr<NativeTensor> NativeTensor::create(const std::vector<int64_t>& s
     return std::make_shared<NativeTensor>(shape, dev_id);
 }
 
+// Metadata-only construction: shape/strides are set, no storage is allocated.
+// The caller is responsible for attaching a buffer.
+NativeTensor::NativeTensor(const std::vector<int64_t>& s, int dev_id, MetadataOnly)
+    : device_id(dev_id), shape(s) {
+    numel = 1;
+    for (auto d : shape) {
+        numel *= static_cast<size_t>(d);
+    }
+    compute_default_strides();
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::strided_copy(const std::vector<int64_t>& out_shape,
+                                                         const std::vector<int64_t>& src_strides) const {
+    if (out_shape.size() != src_strides.size()) {
+        throw std::runtime_error("strided_copy: shape and stride rank mismatch");
+    }
+    if (out_shape.size() > 6) {
+        throw std::runtime_error("strided_copy supports up to 6 dimensions");
+    }
+
+    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+
+    if (device_id >= 0) {
+        uint32_t ndim = static_cast<uint32_t>(out_shape.size());
+        struct {
+            uint32_t total_elements;
+            uint32_t ndim;
+            uint32_t shape[6];
+            uint32_t src_stride[6];
+        } pc{};
+        pc.total_elements = static_cast<uint32_t>(out->numel);
+        pc.ndim = ndim;
+        for (uint32_t i = 0; i < ndim; ++i) {
+            pc.shape[i] = static_cast<uint32_t>(out_shape[i]);
+            if (src_strides[i] < 0) {
+                throw std::runtime_error("strided_copy: negative strides are not supported");
+            }
+            pc.src_stride[i] = static_cast<uint32_t>(src_strides[i]);
+        }
+
+        uint32_t groups = (static_cast<uint32_t>(out->numel) + 255) / 256;
+        VulkanPipelineManager::instance().dispatch(
+            device_id, "copy_strided",
+            {gpu_buffer, out->gpu_buffer},
+            &pc, sizeof(pc), groups);
+        return out;
+    }
+
+    // CPU fallback.
+    const size_t ndim = out_shape.size();
+    std::vector<int64_t> coord(ndim, 0);
+    int64_t src_idx = 0;
+    for (size_t n = 0; n < out->numel; ++n) {
+        out->cpu_data[n] = cpu_data[src_idx];
+        for (int d = static_cast<int>(ndim) - 1; d >= 0; --d) {
+            src_idx += src_strides[d];
+            if (++coord[d] < out_shape[d]) {
+                break;
+            }
+            src_idx -= src_strides[d] * out_shape[d];
+            coord[d] = 0;
+        }
+    }
+    return out;
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::reshape_view(const std::vector<int64_t>& new_shape) const {
+    if (!is_contiguous()) {
+        throw std::runtime_error("reshape_view requires a contiguous tensor");
+    }
+
+    size_t new_numel = 1;
+    for (auto d : new_shape) {
+        new_numel *= static_cast<size_t>(d);
+    }
+    if (new_numel != numel) {
+        throw std::runtime_error("reshape_view: element count mismatch");
+    }
+
+    auto view = std::make_shared<NativeTensor>(new_shape, device_id, MetadataOnly{});
+    // GPU: share the buffer (no copy). CPU: the CPU path stores data in a
+    // std::vector, so sharing is expressed as a copy.
+    view->gpu_buffer = gpu_buffer;
+    view->cpu_data = cpu_data;
+    return view;
+}
+
+void NativeTensor::copy_from_native(const std::shared_ptr<NativeTensor>& src) {
+    if (src.get() == this) return;
+    if (src->numel != numel) {
+        throw std::runtime_error("copy_from_native: element count mismatch");
+    }
+    if (src->device_id != device_id) {
+        throw std::runtime_error("copy_from_native requires both tensors on the same device");
+    }
+
+    if (device_id >= 0) {
+        VulkanMemoryManager::instance().copy_buffer_to_buffer(
+            device_id, src->gpu_buffer, gpu_buffer, numel * sizeof(float));
+    } else {
+        std::copy(src->cpu_data.begin(), src->cpu_data.begin() + numel, cpu_data.begin());
+    }
+}
+
 std::shared_ptr<NativeTensor> NativeTensor::from_float_array(const float* data, const std::vector<int64_t>& shape, int dev_id) {
     auto tensor = std::make_shared<NativeTensor>(shape, dev_id);
     tensor->copy_from_host(data, tensor->numel);
@@ -627,8 +731,31 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_sum(int64_t dim, bool keepdim
         return out;
     }
 
-    // General reduction on CPU (handles arbitrary dimensions without infinite recursion)
-    auto cpu_in = (device_id >= 0) ? to_device(-1) : shared_from_this();
+    // General reduction on GPU: contiguous tensor viewed as [outer, dim, inner].
+    if (device_id >= 0) {
+        uint32_t outer = 1;
+        uint32_t inner = 1;
+        for (int64_t i = 0; i < dim; ++i) outer *= static_cast<uint32_t>(shape[static_cast<size_t>(i)]);
+        for (size_t i = static_cast<size_t>(dim) + 1; i < shape.size(); ++i) {
+            inner *= static_cast<uint32_t>(shape[i]);
+        }
+
+        struct {
+            uint32_t outer;
+            uint32_t dim_size;
+            uint32_t inner;
+            uint32_t op_type;
+        } pc{outer, static_cast<uint32_t>(shape[static_cast<size_t>(dim)]), inner, 0u};
+
+        VulkanPipelineManager::instance().dispatch(
+            device_id, "reduction_generic",
+            {gpu_buffer, out->gpu_buffer},
+            &pc, sizeof(pc), outer * inner);
+        return out;
+    }
+
+    // CPU fallback.
+    auto cpu_in = shared_from_this();
     auto cpu_out = std::make_shared<NativeTensor>(out_shape, -1);
     cpu_out->zero_();
 
@@ -646,9 +773,6 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_sum(int64_t dim, bool keepdim
         cpu_out->cpu_data[target_idx] += cpu_in->cpu_data[i];
     }
 
-    if (device_id >= 0) {
-        return cpu_out->to_device(device_id);
-    }
     return cpu_out;
 }
 
@@ -695,7 +819,33 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_max(int64_t dim, bool keepdim
     }
     if (out_shape.empty()) out_shape.push_back(1);
 
-    auto cpu_in = (device_id >= 0) ? to_device(-1) : shared_from_this();
+    // General reduction on GPU: contiguous tensor viewed as [outer, dim, inner].
+    if (device_id >= 0) {
+        uint32_t outer = 1;
+        uint32_t inner = 1;
+        for (int64_t i = 0; i < dim; ++i) outer *= static_cast<uint32_t>(shape[static_cast<size_t>(i)]);
+        for (size_t i = static_cast<size_t>(dim) + 1; i < shape.size(); ++i) {
+            inner *= static_cast<uint32_t>(shape[i]);
+        }
+
+        auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+
+        struct {
+            uint32_t outer;
+            uint32_t dim_size;
+            uint32_t inner;
+            uint32_t op_type;
+        } pc{outer, static_cast<uint32_t>(shape[static_cast<size_t>(dim)]), inner, 1u};
+
+        VulkanPipelineManager::instance().dispatch(
+            device_id, "reduction_generic",
+            {gpu_buffer, out->gpu_buffer},
+            &pc, sizeof(pc), outer * inner);
+        return out;
+    }
+
+    // CPU fallback.
+    auto cpu_in = shared_from_this();
     auto cpu_out = std::make_shared<NativeTensor>(out_shape, -1);
     cpu_out->fill_(-1e30f);
 
@@ -713,9 +863,6 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_max(int64_t dim, bool keepdim
         cpu_out->cpu_data[target_idx] = std::max(cpu_out->cpu_data[target_idx], cpu_in->cpu_data[i]);
     }
 
-    if (device_id >= 0) {
-        return cpu_out->to_device(device_id);
-    }
     return cpu_out;
 }
 
@@ -787,6 +934,106 @@ std::shared_ptr<NativeTensor> NativeTensor::softmax(int64_t dim, bool is_log) {
     }
 
     return (device_id >= 0) ? cpu_out->to_device(device_id) : cpu_out;
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_per_row(
+    const std::shared_ptr<NativeTensor>& targets) const {
+    if (shape.size() != 2) {
+        throw std::runtime_error("cross_entropy requires a 2-D logits tensor [rows, cols]");
+    }
+    if (!targets || targets->numel != static_cast<size_t>(shape[0])) {
+        throw std::runtime_error("cross_entropy: expected exactly one target per row");
+    }
+    if (targets->device_id != device_id) {
+        throw std::runtime_error("cross_entropy: targets must be on the same device as logits");
+    }
+
+    const uint32_t rows = static_cast<uint32_t>(shape[0]);
+    const uint32_t cols = static_cast<uint32_t>(shape[1]);
+    auto out = std::make_shared<NativeTensor>(
+        std::vector<int64_t>{static_cast<int64_t>(rows)}, device_id);
+
+    if (device_id >= 0) {
+        struct {
+            uint32_t rows;
+            uint32_t cols;
+            uint32_t mode; // 0 = per-row loss
+        } pc{rows, cols, 0u};
+
+        VulkanPipelineManager::instance().dispatch(
+            device_id, "softmax_cross_entropy",
+            {gpu_buffer, targets->gpu_buffer, out->gpu_buffer},
+            &pc, sizeof(pc), rows);
+        return out;
+    }
+
+    for (uint32_t r = 0; r < rows; ++r) {
+        const float* row = &cpu_data[static_cast<size_t>(r) * cols];
+        const int64_t target = static_cast<int64_t>(targets->cpu_data[r]);
+        if (target < 0 || target >= static_cast<int64_t>(cols)) {
+            throw std::runtime_error("cross_entropy: target index out of range");
+        }
+
+        float m = -1e30f;
+        for (uint32_t c = 0; c < cols; ++c) m = std::max(m, row[c]);
+        float s = 0.0f;
+        for (uint32_t c = 0; c < cols; ++c) s += std::exp(row[c] - m);
+
+        out->cpu_data[r] = (m + std::log(s)) - row[target];
+    }
+    return out;
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_grad(
+    const std::shared_ptr<NativeTensor>& targets) const {
+    if (shape.size() != 2) {
+        throw std::runtime_error("cross_entropy requires a 2-D logits tensor [rows, cols]");
+    }
+    if (!targets || targets->numel != static_cast<size_t>(shape[0])) {
+        throw std::runtime_error("cross_entropy: expected exactly one target per row");
+    }
+    if (targets->device_id != device_id) {
+        throw std::runtime_error("cross_entropy: targets must be on the same device as logits");
+    }
+
+    const uint32_t rows = static_cast<uint32_t>(shape[0]);
+    const uint32_t cols = static_cast<uint32_t>(shape[1]);
+    auto out = std::make_shared<NativeTensor>(shape, device_id);
+
+    if (device_id >= 0) {
+        struct {
+            uint32_t rows;
+            uint32_t cols;
+            uint32_t mode; // 1 = gradient
+        } pc{rows, cols, 1u};
+
+        VulkanPipelineManager::instance().dispatch(
+            device_id, "softmax_cross_entropy",
+            {gpu_buffer, targets->gpu_buffer, out->gpu_buffer},
+            &pc, sizeof(pc), rows);
+        return out;
+    }
+
+    for (uint32_t r = 0; r < rows; ++r) {
+        const float* row = &cpu_data[static_cast<size_t>(r) * cols];
+        const int64_t target = static_cast<int64_t>(targets->cpu_data[r]);
+        if (target < 0 || target >= static_cast<int64_t>(cols)) {
+            throw std::runtime_error("cross_entropy: target index out of range");
+        }
+
+        float m = -1e30f;
+        for (uint32_t c = 0; c < cols; ++c) m = std::max(m, row[c]);
+        float s = 0.0f;
+        for (uint32_t c = 0; c < cols; ++c) s += std::exp(row[c] - m);
+        const float inv_s = 1.0f / s;
+
+        for (uint32_t c = 0; c < cols; ++c) {
+            const float probability = std::exp(row[c] - m) * inv_s;
+            const float onehot = (static_cast<int64_t>(c) == target) ? 1.0f : 0.0f;
+            out->cpu_data[static_cast<size_t>(r) * cols + c] = probability - onehot;
+        }
+    }
+    return out;
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::conv2d(std::shared_ptr<NativeTensor> weight,

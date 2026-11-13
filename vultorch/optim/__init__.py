@@ -6,6 +6,7 @@ import math
 from typing import List, Dict, Any, Iterable
 import vultorch
 from ..tensor import Tensor
+from ..autograd import no_grad
 
 class Optimizer:
     def __init__(self, params: Iterable[Tensor], defaults: Dict[str, Any]):
@@ -26,6 +27,11 @@ class Optimizer:
                     p.grad = None
 
     def step(self):
+        # Parameter updates are not differentiable and must not extend the graph.
+        with no_grad():
+            self._step_impl()
+
+    def _step_impl(self):
         raise NotImplementedError
 
 class SGD(Optimizer):
@@ -34,7 +40,7 @@ class SGD(Optimizer):
         defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov)
         super().__init__(params, defaults)
 
-    def step(self):
+    def _step_impl(self):
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
@@ -64,8 +70,7 @@ class SGD(Optimizer):
                         d_p = buf
 
                 # In-place parameter update: p = p - lr * d_p
-                new_val = (p - d_p * lr).numpy()
-                p._native.copy_from_numpy(new_val)
+                p.copy_(p - d_p * lr)
 
 class Adam(Optimizer):
     def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
@@ -73,7 +78,7 @@ class Adam(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
-    def step(self):
+    def _step_impl(self):
         for group in self.param_groups:
             lr = group["lr"]
             beta1, beta2 = group["betas"]
@@ -113,8 +118,7 @@ class Adam(Optimizer):
                 denom = (exp_avg_sq / bias_correction2).sqrt() + eps
 
                 update = exp_avg / denom * step_size
-                new_val = (p - update).numpy()
-                p._native.copy_from_numpy(new_val)
+                p.copy_(p - update)
 
 class AdamW(Optimizer):
     def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
@@ -122,7 +126,7 @@ class AdamW(Optimizer):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
-    def step(self):
+    def _step_impl(self):
         for group in self.param_groups:
             lr = group["lr"]
             beta1, beta2 = group["betas"]
@@ -161,5 +165,4 @@ class AdamW(Optimizer):
                 denom = (exp_avg_sq / bias_correction2).sqrt() + eps
 
                 update = exp_avg / denom * step_size
-                new_val = (p_decayed - update).numpy()
-                p._native.copy_from_numpy(new_val)
+                p.copy_(p_decayed - update)

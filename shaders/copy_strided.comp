@@ -1,0 +1,42 @@
+#version 450
+
+// Materialises an arbitrarily strided view into a contiguous output buffer.
+//
+// One kernel covers transpose/permute, expand (source stride 0 on broadcast
+// axes), and any other layout change that cannot be expressed by reshaping.
+// The source is described as a shape in *output* coordinate order plus the
+// corresponding source strides, so no index arithmetic is needed host-side.
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer BufferIn {
+    float dataIn[];
+};
+
+layout(std430, binding = 1) writeonly buffer BufferOut {
+    float dataOut[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint total_elements;
+    uint ndim;
+    uint shape[6];
+    uint src_stride[6];
+} pc;
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.total_elements) return;
+
+    uint remaining = idx;
+    uint src_idx = 0u;
+
+    for (int d = int(pc.ndim) - 1; d >= 0; --d) {
+        uint dim = pc.shape[d];
+        uint coord = remaining % dim;
+        remaining /= dim;
+        src_idx += coord * pc.src_stride[d];
+    }
+
+    dataOut[idx] = dataIn[src_idx];
+}
