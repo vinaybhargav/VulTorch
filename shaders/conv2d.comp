@@ -1,0 +1,81 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(std430, binding = 0) readonly buffer BufferInput {
+    float dataIn[];
+};
+
+layout(std430, binding = 1) readonly buffer BufferWeight {
+    float dataWeight[];
+};
+
+layout(std430, binding = 2) readonly buffer BufferBias {
+    float dataBias[];
+};
+
+layout(std430, binding = 3) writeonly buffer BufferOutput {
+    float dataOut[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint C_in;
+    uint H_in;
+    uint W_in;
+    uint C_out;
+    uint H_out;
+    uint W_out;
+    uint kH;
+    uint kW;
+    uint stride_h;
+    uint stride_w;
+    uint pad_h;
+    uint pad_w;
+    uint has_bias;
+} pc;
+
+void main() {
+    uint ow = gl_GlobalInvocationID.x;
+    uint oh = gl_GlobalInvocationID.y;
+    uint oc = gl_GlobalInvocationID.z;
+    uint n = gl_WorkGroupID.z / ((pc.C_out + 3u) / 4u); // batch index
+    uint real_oc = (gl_WorkGroupID.z % ((pc.C_out + 3u) / 4u)) * 4u + gl_LocalInvocationID.z;
+
+    if (ow >= pc.W_out || oh >= pc.H_out || real_oc >= pc.C_out || n >= pc.N) return;
+
+    float acc = (pc.has_bias != 0u) ? dataBias[real_oc] : 0.0;
+
+    int in_h_base = int(oh * pc.stride_h) - int(pc.pad_h);
+    int in_w_base = int(ow * pc.stride_w) - int(pc.pad_w);
+
+    uint in_batch_offset = n * pc.C_in * pc.H_in * pc.W_in;
+    uint w_out_offset = real_oc * pc.C_in * pc.kH * pc.kW;
+
+    for (uint ic = 0; ic < pc.C_in; ++ic) {
+        uint in_ch_offset = in_batch_offset + ic * pc.H_in * pc.W_in;
+        uint w_ch_offset = w_out_offset + ic * pc.kH * pc.kW;
+
+        for (uint kh = 0; kh < pc.kH; ++kh) {
+            int in_h = in_h_base + int(kh);
+            if (in_h >= 0 && in_h < int(pc.H_in)) {
+                uint in_row_offset = in_ch_offset + uint(in_h) * pc.W_in;
+                uint w_row_offset = w_ch_offset + kh * pc.kW;
+
+                [[unroll]]
+                for (uint kw = 0; kw < pc.kW; ++kw) {
+                    int in_w = in_w_base + int(kw);
+                    if (in_w >= 0 && in_w < int(pc.W_in)) {
+                        acc += dataIn[in_row_offset + uint(in_w)] * dataWeight[w_row_offset + kw];
+                    }
+                }
+            }
+        }
+    }
+
+    uint out_idx = n * (pc.C_out * pc.H_out * pc.W_out) +
+                   real_oc * (pc.H_out * pc.W_out) +
+                   oh * pc.W_out + ow;
+    dataOut[out_idx] = acc;
+}

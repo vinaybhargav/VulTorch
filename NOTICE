@@ -1,0 +1,24 @@
+VulTorch
+Copyright 2025-2026 The VulTorch Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+--------------------------------------------------------------------------
+Third-party code
+--------------------------------------------------------------------------
+This repository contains no third-party source code.
+
+Dependencies that are fetched, not committed:
+  * Vulkan-Headers (Apache-2.0) ......... third_party/vulkan-headers/
+  * pybind11 (BSD-3-Clause) ............. build dependency
+  * NumPy (BSD-3-Clause) ................ runtime dependency
+
+Benchmark baselines (NOT distributed, NOT linked, NOT derived from):
+  * ggml / llama.cpp Vulkan backend (MIT) ... benchmarks/upstream/ggml/
+  * ncnn Vulkan backend (BSD-3-Clause) ...... benchmarks/upstream/ncnn/
+  * CLBlast (Apache-2.0) .................... benchmarks/upstream/clblast/
+
+These are cloned and built out-of-tree solely to produce reference throughput
+numbers on identical hardware and shapes. No code from them is copied into,
+linked against, or shipped with VulTorch. Their results are published as
+comparison baselines with attribution, per docs/kernels/DERIVATION.md.

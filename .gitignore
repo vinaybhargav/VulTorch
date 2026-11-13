@@ -1,0 +1,49 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.so
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- C++ / CMake ---
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+*.o
+*.a
+
+# --- Generated SPIR-V ---
+# TODO(phase-0): once the shader build step lands, .spv are generated at build
+# time and this rule takes effect. Until then the checked-in .spv are the only
+# way to run the backend.
+# shaders/*.spv
+
+# --- Vendored dependencies (fetched, not committed) ---
+third_party/vulkan-headers/
+third_party/gsl/
+
+# --- Third-party benchmark tools (licenses differ: cmix is GPL-3) ---
+# Never distributed with Vultorch. Fetched on demand by benchmarks/fetch_tools.sh.
+benchmarks/tools/
+bin/
+models/
+*.bin
+
+# --- Large / generated data ---
+benchmarks/data/enwik8*
+benchmarks/data/*.cmix
+benchmarks/data/*.vtc
+benchmarks/data/*.lzma
+benchmarks/data/*.zip
+*.core
+core
+
+# --- Local scratch ---
+benchmark_doc.txt
+benchmark_doc.txt.vt

@@ -1,0 +1,83 @@
+			  The DRI3 Extension
+			     Version 1.4
+			      2021-11-30
+
+			    Keith Packard
+			  keithp@keithp.com
+			  Intel Corporation
+
+			    Daniel Stone
+		       daniels@collabora.com
+			     Collabora
+
+
+1. Introduction
+
+The DRI3 extension provides mechanisms to translate between direct
+rendered buffers and X pixmaps. When combined with the Present extension,
+a complete direct rendering solution for hardware-accelerated devices
+such as GPUs is provided.
+
+The direct rendered buffers are passed across the protocol via
+standard POSIX file descriptor passing mechanisms. On Linux, these
+buffers are DMA-BUF objects.
+
+DRI3 also includes a mechanism to translate between Linux Futexes
+and X Sync extension Fences. This provides a synchronization mechanism
+which can be used to serialize access to shared render buffers.
+
+1.1. Acknowledgments
+
+Eric Anholt <eric@anholt.net>
+Dave Airlie <airlied@redhat.com>
+Kristian Høgsberg <krh@bitplanet.net>
+James Jones <jajones@nvidia.com>
+Arthur Huillet <arthur.huillet@free.fr>
+Louis-Francis Ratté-Boulianne <lfrb@collabora.com>
+Austin Shafer <ashafer@nvidia.com>
+
+			     ❄ ❄ ❄  ❄  ❄ ❄ ❄
+
+2. Data Types
+
+The DRI3 extension uses the RandR extension Provider data type to
+select among multiple GPUs on a single screen and the Sync extension
+fence object to provide graphics object synchronization.
+
+			     ❄ ❄ ❄  ❄  ❄ ❄ ❄
+
+4. Errors
+
+DRI3 defines no errors.
+
+			     ❄ ❄ ❄  ❄  ❄ ❄ ❄
+
+5. Events
+
+DRI3 defines no events.
+
+			     ❄ ❄ ❄  ❄  ❄ ❄ ❄
+
+6. Protocol Types
+
+SYNCOBJ { XID }
+
+			     ❄ ❄ ❄  ❄  ❄ ❄ ❄
+
+7. Extension Initialization
+
+The name of this extension is "DRI3"
+
+┌───
+    DRI3QueryVersion
+	client-major-version:	CARD32
+	client-minor-version:	CARD32
+      ▶
+	major-version:		CARD32
+	minor-version:		CARD32
+└───
+
+	The client sends the highest supported version to the server
+	and the server sends the highest version it supports, but no
+	higher than the requested version. Major versions changes can
+	introduce 

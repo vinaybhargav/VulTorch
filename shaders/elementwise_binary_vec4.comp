@@ -1,0 +1,55 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 256) in;
+
+layout(std430, binding = 0) readonly buffer BufferA {
+    vec4 dataA[];
+};
+
+layout(std430, binding = 1) readonly buffer BufferB {
+    vec4 dataB[];
+};
+
+layout(std430, binding = 2) writeonly buffer BufferC {
+    vec4 dataC[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint num_vec4;   // Total number of vec4 elements
+    uint op_type;    // 0: Add, 1: Sub, 2: Mul, 3: Div, 4: Pow, 5: Max, 6: Min, 7: GT, 8: LT, 9: EQ
+    float scalar_b;  // If B is a single scalar
+    uint is_b_scalar;// 1 if B is scalar, 0 if B is array
+} pc;
+
+vec4 safe_pow(vec4 a, vec4 b) {
+    vec4 is_even = vec4(equal(mod(floor(abs(b)), 2.0), vec4(0.0)));
+    vec4 is_odd = vec4(equal(mod(floor(abs(b)), 2.0), vec4(1.0)));
+    vec4 p = pow(abs(a), b);
+    return mix(p, p * sign(a), is_odd);
+}
+
+vec4 apply_op(vec4 a, vec4 b, uint op) {
+    switch (op) {
+        case 0u: return a + b;
+        case 1u: return a - b;
+        case 2u: return a * b;
+        case 3u: return a / b;
+        case 4u: return safe_pow(a, b);
+        case 5u: return max(a, b);
+        case 6u: return min(a, b);
+        case 7u: return vec4(greaterThan(a, b));
+        case 8u: return vec4(lessThan(a, b));
+        case 9u: return vec4(equal(a, b));
+        default: return a + b;
+    }
+}
+
+void main() {
+    uint idx = gl_GlobalInvocationID.x;
+    if (idx >= pc.num_vec4) return;
+
+    vec4 a = dataA[idx];
+    vec4 b = (pc.is_b_scalar != 0u) ? vec4(pc.scalar_b) : dataB[idx];
+    dataC[idx] = apply_op(a, b, pc.op_type);
+}

@@ -1,0 +1,73 @@
+#version 450
+#extension GL_EXT_control_flow_attributes : enable
+
+layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
+
+layout(std430, binding = 0) readonly buffer BufferGradOut {
+    float gradOut[];
+};
+
+layout(std430, binding = 1) readonly buffer BufferWeight {
+    float weight[];
+};
+
+layout(std430, binding = 2) writeonly buffer BufferGradIn {
+    float gradIn[];
+};
+
+layout(push_constant) uniform PushConstants {
+    uint N;
+    uint C_in;
+    uint H_in;
+    uint W_in;
+    uint C_out;
+    uint H_out;
+    uint W_out;
+    uint kH;
+    uint kW;
+    uint stride_h;
+    uint stride_w;
+    uint pad_h;
+    uint pad_w;
+} pc;
+
+void main() {
+    uint iw = gl_GlobalInvocationID.x;
+    uint ih = gl_GlobalInvocationID.y;
+    uint ic_block = gl_WorkGroupID.z;
+    uint ic = (ic_block % ((pc.C_in + 3u) / 4u)) * 4u + gl_LocalInvocationID.z;
+    uint n = ic_block / ((pc.C_in + 3u) / 4u);
+
+    if (iw >= pc.W_in || ih >= pc.H_in || ic >= pc.C_in || n >= pc.N) return;
+
+    float acc = 0.0;
+
+    for (uint oc = 0; oc < pc.C_out; ++oc) {
+        uint grad_oc_offset = n * (pc.C_out * pc.H_out * pc.W_out) + oc * (pc.H_out * pc.W_out);
+        uint w_oc_offset = oc * (pc.C_in * pc.kH * pc.kW) + ic * (pc.kH * pc.kW);
+
+        for (uint kh = 0; kh < pc.kH; ++kh) {
+            int h_padded = int(ih) + int(pc.pad_h) - int(kh);
+            if (h_padded >= 0 && (h_padded % int(pc.stride_h)) == 0) {
+                int oh = h_padded / int(pc.stride_h);
+                if (oh >= 0 && oh < int(pc.H_out)) {
+                    uint grad_row_offset = grad_oc_offset + uint(oh) * pc.W_out;
+                    uint w_row_offset = w_oc_offset + kh * pc.kW;
+
+                    for (uint kw = 0; kw < pc.kW; ++kw) {
+                        int w_padded = int(iw) + int(pc.pad_w) - int(kw);
+                        if (w_padded >= 0 && (w_padded % int(pc.stride_w)) == 0) {
+                            int ow = w_padded / int(pc.stride_w);
+                            if (ow >= 0 && ow < int(pc.W_out)) {
+                                acc += gradOut[grad_row_offset + uint(ow)] * weight[w_row_offset + kw];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    uint in_idx = n * (pc.C_in * pc.H_in * pc.W_in) + ic * (pc.H_in * pc.W_in) + ih * pc.W_in + iw;
+    gradIn[in_idx] = acc;
+}

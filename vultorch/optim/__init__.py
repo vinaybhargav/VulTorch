@@ -1,0 +1,165 @@
+"""
+VulTorch Optimizers (vultorch.optim)
+"""
+
+import math
+from typing import List, Dict, Any, Iterable
+import vultorch
+from ..tensor import Tensor
+
+class Optimizer:
+    def __init__(self, params: Iterable[Tensor], defaults: Dict[str, Any]):
+        self.defaults = defaults
+        self.param_groups: List[Dict[str, Any]] = []
+
+        param_list = list(params)
+        if len(param_list) == 0:
+            raise ValueError("optimizer got an empty parameter list")
+
+        self.param_groups.append({"params": param_list, **defaults})
+        self.state: Dict[Tensor, Dict[str, Any]] = {}
+
+    def zero_grad(self):
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is not None:
+                    p.grad = None
+
+    def step(self):
+        raise NotImplementedError
+
+class SGD(Optimizer):
+    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
+                 momentum: float = 0.0, weight_decay: float = 0.0, nesterov: bool = False):
+        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            momentum = group["momentum"]
+            weight_decay = group["weight_decay"]
+            nesterov = group["nesterov"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                d_p = p.grad
+                if weight_decay != 0.0:
+                    d_p = d_p + p * weight_decay
+
+                if momentum != 0.0:
+                    param_state = self.state.setdefault(p, {})
+                    if "momentum_buffer" not in param_state:
+                        buf = param_state["momentum_buffer"] = d_p.clone()
+                    else:
+                        buf = param_state["momentum_buffer"]
+                        buf = buf * momentum + d_p
+                        param_state["momentum_buffer"] = buf
+
+                    if nesterov:
+                        d_p = d_p + buf * momentum
+                    else:
+                        d_p = buf
+
+                # In-place parameter update: p = p - lr * d_p
+                new_val = (p - d_p * lr).numpy()
+                p._native.copy_from_numpy(new_val)
+
+class Adam(Optimizer):
+    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
+                 betas: tuple = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.0):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                grad = p.grad
+                state = self.state.setdefault(p, {})
+
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = vultorch.zeros_like(p)
+                    state["exp_avg_sq"] = vultorch.zeros_like(p)
+
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                state["step"] += 1
+                step = state["step"]
+
+                if weight_decay != 0.0:
+                    grad = grad + p * weight_decay
+
+                # Decay the first and second moment running average coefficient
+                exp_avg = exp_avg * beta1 + grad * (1.0 - beta1)
+                exp_avg_sq = exp_avg_sq * beta2 + (grad * grad) * (1.0 - beta2)
+                state["exp_avg"] = exp_avg
+                state["exp_avg_sq"] = exp_avg_sq
+
+                bias_correction1 = 1.0 - beta1 ** step
+                bias_correction2 = 1.0 - beta2 ** step
+
+                step_size = lr / bias_correction1
+                denom = (exp_avg_sq / bias_correction2).sqrt() + eps
+
+                update = exp_avg / denom * step_size
+                new_val = (p - update).numpy()
+                p._native.copy_from_numpy(new_val)
+
+class AdamW(Optimizer):
+    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
+                 betas: tuple = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 1e-2):
+        defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
+        super().__init__(params, defaults)
+
+    def step(self):
+        for group in self.param_groups:
+            lr = group["lr"]
+            beta1, beta2 = group["betas"]
+            eps = group["eps"]
+            weight_decay = group["weight_decay"]
+
+            for p in group["params"]:
+                if p.grad is None:
+                    continue
+
+                # Decoupled weight decay
+                p_decayed = p * (1.0 - lr * weight_decay)
+
+                grad = p.grad
+                state = self.state.setdefault(p, {})
+
+                if len(state) == 0:
+                    state["step"] = 0
+                    state["exp_avg"] = vultorch.zeros_like(p)
+                    state["exp_avg_sq"] = vultorch.zeros_like(p)
+
+                exp_avg = state["exp_avg"]
+                exp_avg_sq = state["exp_avg_sq"]
+                state["step"] += 1
+                step = state["step"]
+
+                exp_avg = exp_avg * beta1 + grad * (1.0 - beta1)
+                exp_avg_sq = exp_avg_sq * beta2 + (grad * grad) * (1.0 - beta2)
+                state["exp_avg"] = exp_avg
+                state["exp_avg_sq"] = exp_avg_sq
+
+                bias_correction1 = 1.0 - beta1 ** step
+                bias_correction2 = 1.0 - beta2 ** step
+
+                step_size = lr / bias_correction1
+                denom = (exp_avg_sq / bias_correction2).sqrt() + eps
+
+                update = exp_avg / denom * step_size
+                new_val = (p_decayed - update).numpy()
+                p._native.copy_from_numpy(new_val)
