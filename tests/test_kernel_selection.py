@@ -37,22 +37,32 @@ def test_capabilities_are_consistent_with_device_count():
     assert len(torch.vulkan.get_all_devices()) == torch.vulkan.device_count()
 
 
-@pytest.mark.parametrize("shader", ["matmul", "matmul_tiled64", "matmul_tiled"])
+GEMM_VARIANTS = [
+    "matmul", "matmul_tiled64", "matmul_tiled",
+    # Slang generic SGEMM (shaders/gemm.slang)
+    "gemm_t32_k16_r2", "gemm_t64_k16_r4", "gemm_t64_k8_r4",
+    "gemm_t64_k16_r8", "gemm_t128_k8_r8", "gemm_t128_k16_r8",
+]
+
+
+@pytest.mark.parametrize("device", GPU_DEVICES)
+@pytest.mark.parametrize("shader", GEMM_VARIANTS)
 @pytest.mark.parametrize(
     "shape",
     [
         (64, 64, 64),        # exactly one 64 tile
         (129, 200, 97),      # ragged in every dimension
         (256, 512, 384),     # several tiles, K not a multiple of 16
+        (300, 7, 131),       # K smaller than one K step
     ],
 )
-def test_gemm_variant_matches_numpy(shader, shape, monkeypatch):
+def test_gemm_variant_matches_numpy(device, shader, shape, monkeypatch):
     monkeypatch.setenv("VULTORCH_MATMUL_KERNEL", shader)
     rows, inner, cols = shape
 
     a_np, b_np = _rand((rows, inner), 1), _rand((inner, cols), 2)
-    a = torch.tensor(a_np, device="vk:0")
-    b = torch.tensor(b_np, device="vk:0")
+    a = torch.tensor(a_np, device=device)
+    b = torch.tensor(b_np, device=device)
 
     np.testing.assert_allclose((a @ b).numpy(), a_np @ b_np, rtol=1e-3, atol=1e-3)
 
@@ -126,3 +136,12 @@ def test_coopmat_is_not_selected_automatically(monkeypatch):
     # If the coopmat kernel were auto-selected the result would carry f16 error;
     # the automatic path must stay on the fp32 SIMT kernels.
     np.testing.assert_allclose((a @ b).numpy(), a.numpy() @ b.numpy(), rtol=1e-4, atol=1e-4)
+
+
+@pytest.mark.parametrize("device", GPU_DEVICES)
+@pytest.mark.parametrize("shader", [v for v in GEMM_VARIANTS if v.startswith("gemm_")])
+def test_batched_gemm_variant_matches_numpy(device, shader, monkeypatch):
+    monkeypatch.setenv("VULTORCH_MATMUL_KERNEL", shader)
+    a_np, b_np = _rand((3, 70, 45), 3), _rand((3, 45, 150), 4)
+    out = torch.tensor(a_np, device=device) @ torch.tensor(b_np, device=device)
+    np.testing.assert_allclose(out.numpy(), a_np @ b_np, rtol=1e-3, atol=1e-3)

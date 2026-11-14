@@ -74,8 +74,10 @@ output = parallel_model(large_batch_x)
 ### Build from source
 
 Requirements: a C++20 compiler, CMake ≥ 3.18, the Vulkan loader (`libvulkan-dev`),
-and `glslangValidator` (`glslang-tools` on Debian/Ubuntu) — the compute shaders
-are compiled to SPIR-V as part of the build, never checked in.
+`glslangValidator` (`glslang-tools` on Debian/Ubuntu) and `slangc` (the Slang
+compiler: Arch AUR `shader-slang-bin`, or the LunarG Vulkan SDK) — the compute
+shaders (`.comp` GLSL and `.slang`) are compiled to SPIR-V as part of the build,
+never checked in.
 
 ```bash
 scripts/fetch_deps.sh                 # Vulkan-Headers (not vendored in git)

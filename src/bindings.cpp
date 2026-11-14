@@ -112,6 +112,10 @@ PYBIND11_MODULE(_vultorch_backend, m) {
         .def("copy_from_native", &NativeTensor::copy_from_native, py::arg("src"))
         .def("fill_", &NativeTensor::fill_, py::arg("val"))
         .def("zero_", &NativeTensor::zero_)
+        .def("is_contiguous", &NativeTensor::is_contiguous)
+        .def("adam_step_", &NativeTensor::adam_step_, py::arg("grad"), py::arg("exp_avg"),
+             py::arg("exp_avg_sq"), py::arg("lr"), py::arg("beta1"), py::arg("beta2"),
+             py::arg("eps"), py::arg("weight_decay"), py::arg("decoupled"), py::arg("step"))
         .def("binary_op", &NativeTensor::binary_op, py::arg("op_type"), py::arg("other"))
         .def("binary_op_scalar", &NativeTensor::binary_op_scalar, py::arg("op_type"), py::arg("scalar_val"), py::arg("reverse") = false)
         .def("unary_op", &NativeTensor::unary_op, py::arg("op_type"), py::arg("p1") = 0.0f, py::arg("p2") = 0.0f)

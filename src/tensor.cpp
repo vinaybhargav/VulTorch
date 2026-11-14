@@ -42,6 +42,14 @@ constexpr MatmulCandidate kMatmulCandidates[] = {
     // TK * (TILE + PAD) * sizeof(float) * 2
     {"matmul_tiled64", 64u, 16u * (64u + 1u) * 4u * 2u, 256u, MatmulRequirement::None, true},
     {"matmul_tiled", 128u, 16u * (128u + 1u) * 4u * 2u, 256u, MatmulRequirement::None, true},
+    // Slang generic SGEMM (shaders/gemm.slang): one source, one entry point per
+    // tile configuration. Shared bytes = 4 * BK * (2 * TILE + 1).
+    {"gemm_t32_k16_r2", 32u, 4u * 16u * (2u * 32u + 1u), 256u, MatmulRequirement::None, true},
+    {"gemm_t64_k16_r4", 64u, 4u * 16u * (2u * 64u + 1u), 256u, MatmulRequirement::None, true},
+    {"gemm_t64_k8_r4", 64u, 4u * 8u * (2u * 64u + 1u), 256u, MatmulRequirement::None, true},
+    {"gemm_t64_k16_r8", 64u, 4u * 16u * (2u * 64u + 1u), 64u, MatmulRequirement::None, true},
+    {"gemm_t128_k8_r8", 128u, 4u * 8u * (2u * 128u + 1u), 256u, MatmulRequirement::None, true},
+    {"gemm_t128_k16_r8", 128u, 4u * 16u * (2u * 128u + 1u), 256u, MatmulRequirement::None, true},
     // sA + sB (f16, padded) + output staging (f32, padded).
     // Measured 5x slower than matmul_tiled on the RX 7900 XTX (2.9 vs 15.6
     // TFLOPS at 2048^3): one subgroup per workgroup is too little parallelism
@@ -479,6 +487,73 @@ void NativeTensor::fill_(float val) {
 
 void NativeTensor::zero_() {
     fill_(0.0f);
+}
+
+void NativeTensor::adam_step_(const std::shared_ptr<NativeTensor>& grad,
+                              const std::shared_ptr<NativeTensor>& exp_avg,
+                              const std::shared_ptr<NativeTensor>& exp_avg_sq,
+                              float lr, float beta1, float beta2, float eps,
+                              float weight_decay, bool decoupled, int64_t step) {
+    for (const auto* t : {grad.get(), exp_avg.get(), exp_avg_sq.get()}) {
+        if (t->device_id != device_id) {
+            throw std::runtime_error("adam_step_: all tensors must be on the same device");
+        }
+        if (t->numel != numel) {
+            throw std::runtime_error("adam_step_: tensors must have the same number of elements");
+        }
+        if (!t->is_contiguous()) {
+            throw std::runtime_error("adam_step_: tensors must be contiguous");
+        }
+    }
+    if (!is_contiguous()) {
+        throw std::runtime_error("adam_step_: parameter must be contiguous");
+    }
+    if (step < 1) {
+        throw std::runtime_error("adam_step_: step must be >= 1");
+    }
+
+    // Bias corrections in double: beta^t underflows float precision for large t.
+    const float bias_c1 = static_cast<float>(1.0 - std::pow(static_cast<double>(beta1), static_cast<double>(step)));
+    const float bias_c2 = static_cast<float>(1.0 - std::pow(static_cast<double>(beta2), static_cast<double>(step)));
+
+    if (device_id < 0) {
+        for (size_t i = 0; i < static_cast<size_t>(numel); ++i) {
+            float p = cpu_data[i];
+            float g = grad->cpu_data[i];
+            if (decoupled) p *= 1.0f - lr * weight_decay;
+            else g += weight_decay * p;
+            const float m = beta1 * exp_avg->cpu_data[i] + (1.0f - beta1) * g;
+            const float v = beta2 * exp_avg_sq->cpu_data[i] + (1.0f - beta2) * g * g;
+            exp_avg->cpu_data[i] = m;
+            exp_avg_sq->cpu_data[i] = v;
+            cpu_data[i] = p - (lr / bias_c1) * m / (std::sqrt(v / bias_c2) + eps);
+        }
+        return;
+    }
+
+    const uint32_t total_groups = (static_cast<uint32_t>(numel) + 255u) / 256u;
+    // Keep each dispatch dimension well under the 65535 limit guaranteed by Vulkan.
+    const uint32_t groups_x = std::min<uint32_t>(total_groups, 32768u);
+    const uint32_t groups_y = (total_groups + groups_x - 1u) / groups_x;
+
+    struct {
+        uint32_t numel;
+        uint32_t groups_x;
+        float lr;
+        float beta1;
+        float beta2;
+        float eps;
+        float weight_decay;
+        uint32_t decoupled;
+        float bias_c1;
+        float bias_c2;
+    } pc{static_cast<uint32_t>(numel), groups_x, lr, beta1, beta2, eps,
+         weight_decay, decoupled ? 1u : 0u, bias_c1, bias_c2};
+
+    VulkanPipelineManager::instance().dispatch(
+        device_id, "adam_step",
+        {gpu_buffer, grad->gpu_buffer, exp_avg->gpu_buffer, exp_avg_sq->gpu_buffer},
+        &pc, sizeof(pc), groups_x, groups_y);
 }
 
 // ----------------------------------------------------------------------------

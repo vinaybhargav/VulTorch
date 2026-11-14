@@ -42,6 +42,15 @@ public:
     void fill_(float val);
     void zero_();
 
+    // Fused in-place Adam/AdamW update of this tensor (the parameter) using
+    // `grad` and the two moment tensors. One kernel launch, one read and one
+    // write per tensor, instead of a dozen elementwise passes.
+    void adam_step_(const std::shared_ptr<NativeTensor>& grad,
+                    const std::shared_ptr<NativeTensor>& exp_avg,
+                    const std::shared_ptr<NativeTensor>& exp_avg_sq,
+                    float lr, float beta1, float beta2, float eps,
+                    float weight_decay, bool decoupled, int64_t step);
+
     // Materialises a strided view into a new contiguous tensor. `src_strides`
     // are the source strides expressed in the output's coordinate order, which
     // makes transpose, permute and expand the same operation.

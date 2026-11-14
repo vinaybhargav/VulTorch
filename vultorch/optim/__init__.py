@@ -72,11 +72,33 @@ class SGD(Optimizer):
                 # In-place parameter update: p = p - lr * d_p
                 p.copy_(p - d_p * lr)
 
+
+def _fused_adam_update(p, state, group, decoupled):
+    """One-kernel Adam/AdamW update. Returns False if the fused path can't be used."""
+    grad = p.grad
+    if grad is None or grad._native is None or not p._native.is_contiguous() \
+            or not grad._native.is_contiguous():
+        return False
+    if len(state) == 0:
+        state["step"] = 0
+        state["exp_avg"] = vultorch.zeros_like(p)
+        state["exp_avg_sq"] = vultorch.zeros_like(p)
+    state["step"] += 1
+    beta1, beta2 = group["betas"]
+    p._native.adam_step_(
+        grad._native, state["exp_avg"]._native, state["exp_avg_sq"]._native,
+        group["lr"], beta1, beta2, group["eps"], group["weight_decay"],
+        decoupled, state["step"])
+    return True
+
+
 class Adam(Optimizer):
     def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
-                 betas: tuple = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.0):
+                 betas: tuple = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.0,
+                 fused: bool = True):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
+        self.fused = fused
 
     def _step_impl(self):
         for group in self.param_groups:
@@ -91,6 +113,9 @@ class Adam(Optimizer):
 
                 grad = p.grad
                 state = self.state.setdefault(p, {})
+
+                if self.fused and _fused_adam_update(p, state, group, decoupled=False):
+                    continue
 
                 if len(state) == 0:
                     state["step"] = 0
@@ -122,9 +147,11 @@ class Adam(Optimizer):
 
 class AdamW(Optimizer):
     def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
-                 betas: tuple = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 1e-2):
+                 betas: tuple = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 1e-2,
+                 fused: bool = True):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
+        self.fused = fused
 
     def _step_impl(self):
         for group in self.param_groups:
@@ -137,11 +164,14 @@ class AdamW(Optimizer):
                 if p.grad is None:
                     continue
 
+                state = self.state.setdefault(p, {})
+                if self.fused and _fused_adam_update(p, state, group, decoupled=True):
+                    continue
+
                 # Decoupled weight decay
                 p_decayed = p * (1.0 - lr * weight_decay)
 
                 grad = p.grad
-                state = self.state.setdefault(p, {})
 
                 if len(state) == 0:
                     state["step"] = 0

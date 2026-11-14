@@ -93,6 +93,44 @@ foreach(shader ${SHADER_SOURCES})
     list(APPEND SPV_OUTPUTS "${spv}")
 endforeach()
 
+# Slang kernels: one source file can hold many specialised entry points (e.g.
+# every GEMM tile configuration). Each "<file>:<entry>" pair below becomes
+# <entry>.spv, whose entry point slangc renames to "main" — the same contract
+# as the GLSL shaders, so the runtime does not care which language produced it.
+find_program(SLANGC NAMES slangc)
+if(NOT SLANGC)
+    message(FATAL_ERROR
+        "slangc not found. Install the Slang compiler (Arch AUR: shader-slang-bin,"
+        " or the LunarG Vulkan SDK) to build VulTorch from source.")
+endif()
+
+set(SLANG_KERNELS
+    gemm:gemm_t32_k16_r2
+    gemm:gemm_t64_k16_r4
+    gemm:gemm_t64_k8_r4
+    gemm:gemm_t64_k16_r8
+    gemm:gemm_t128_k8_r8
+    gemm:gemm_t128_k16_r8
+    adam:adam_step
+)
+
+foreach(kernel ${SLANG_KERNELS})
+    string(REPLACE ":" ";" parts "${kernel}")
+    list(GET parts 0 slang_file)
+    list(GET parts 1 entry)
+    set(src "${SHADER_SOURCE_DIR}/${slang_file}.slang")
+    set(spv "${SHADER_OUTPUT_DIR}/${entry}.spv")
+    add_custom_command(
+        OUTPUT "${spv}"
+        COMMAND "${CMAKE_COMMAND}" -E make_directory "${SHADER_OUTPUT_DIR}"
+        COMMAND "${SLANGC}" "${src}" -target spirv -profile spirv_1_5
+                -entry "${entry}" -O3 -o "${spv}"
+        DEPENDS "${src}"
+        COMMENT "Compiling Slang kernel ${slang_file}.slang:${entry}"
+        VERBATIM)
+    list(APPEND SPV_OUTPUTS "${spv}")
+endforeach()
+
 add_custom_target(vultorch_shaders ALL DEPENDS ${SPV_OUTPUTS})
 
 # ----------------------------------------------------------------------------
