@@ -252,15 +252,38 @@ constexpr size_t kMaxPendingDescSets = VulkanDeviceContext::kMaxPendingDescSets;
 void VulkanDeviceContext::add_compute_barrier(VkCommandBuffer cmd) {
     VkMemoryBarrier mem_barrier{};
     mem_barrier.sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER;
-    mem_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-    mem_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_HOST_READ_BIT |
-                                VK_ACCESS_TRANSFER_READ_BIT;
+    mem_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
+    mem_barrier.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT |
+                                VK_ACCESS_HOST_READ_BIT | VK_ACCESS_TRANSFER_READ_BIT |
+                                VK_ACCESS_TRANSFER_WRITE_BIT;
 
     vkCmdPipelineBarrier(cmd,
-                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                         VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_HOST_BIT |
                              VK_PIPELINE_STAGE_TRANSFER_BIT,
                          0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
+}
+
+void VulkanDeviceContext::record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize size_bytes) {
+    std::lock_guard<std::mutex> lock(submit_mutex);
+
+    open_batch_locked();
+    VkCommandBuffer cmd = slots[static_cast<size_t>(open_slot)].cmd;
+
+    VkBufferCopy copy_region{};
+    copy_region.srcOffset = 0;
+    copy_region.dstOffset = 0;
+    copy_region.size = size_bytes;
+    vkCmdCopyBuffer(cmd, src, dst, 1, &copy_region);
+
+    add_compute_barrier(cmd);
+
+    ++ops_in_batch;
+    dispatches_recorded.fetch_add(1, std::memory_order_relaxed);
+
+    if (ops_in_batch >= kMaxOpsPerBatch) {
+        flush_locked();
+    }
 }
 
 void VulkanDeviceContext::open_batch_locked() {

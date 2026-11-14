@@ -1,74 +1,59 @@
-#version 450
-
-#define WG_SIZE 256
-layout(local_size_x = WG_SIZE) in;
-
-layout(std430, binding = 0) readonly buffer BufferIn {
-    float dataIn[];
-};
-
-layout(std430, binding = 1) readonly buffer BufferGamma {
-    float gamma[];
-};
-
-layout(std430, binding = 2) readonly buffer BufferBeta {
-    float beta[];
-};
-
-layout(std430, binding = 3) writeonly buffer BufferOut {
-    float dataOut[];
-};
-
-layout(push_constant) uniform PushConstants {
+struct LayerNormParams {
     uint num_rows;
     uint cols;
     float eps;
     uint has_affine;
-} pc;
+};
 
-shared float s_mean[WG_SIZE];
-shared float s_var[WG_SIZE];
+[[vk::push_constant]] LayerNormParams pc;
 
-void main() {
-    uint row = gl_WorkGroupID.y;
+[[vk::binding(0, 0)]] StructuredBuffer<float> dataIn;
+[[vk::binding(1, 0)]] StructuredBuffer<float> gamma;
+[[vk::binding(2, 0)]] StructuredBuffer<float> beta;
+[[vk::binding(3, 0)]] RWStructuredBuffer<float> dataOut;
+
+static const uint WG_SIZE = 256u;
+static groupshared float s_mean[WG_SIZE];
+static groupshared float s_var[WG_SIZE];
+
+[shader("compute")] [numthreads(256, 1, 1)]
+void layernorm(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
+    uint row = gid.y;
     if (row >= pc.num_rows) return;
 
-    uint tid = gl_LocalInvocationID.x;
+    uint tid = lid.x;
     uint row_offset = row * pc.cols;
 
-    // Step 1: Compute mean
     float sum = 0.0;
     for (uint i = tid; i < pc.cols; i += WG_SIZE) {
         sum += dataIn[row_offset + i];
     }
     s_mean[tid] = sum;
-    barrier();
+    GroupMemoryBarrierWithGroupSync();
 
     for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
         if (tid < s) s_mean[tid] += s_mean[tid + s];
-        barrier();
+        GroupMemoryBarrierWithGroupSync();
     }
     float row_mean = s_mean[0] / float(pc.cols);
-    barrier();
+    GroupMemoryBarrierWithGroupSync();
 
-    // Step 2: Compute variance
     float var_sum = 0.0;
     for (uint i = tid; i < pc.cols; i += WG_SIZE) {
         float diff = dataIn[row_offset + i] - row_mean;
         var_sum += diff * diff;
     }
     s_var[tid] = var_sum;
-    barrier();
+    GroupMemoryBarrierWithGroupSync();
 
     for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
         if (tid < s) s_var[tid] += s_var[tid + s];
-        barrier();
+        GroupMemoryBarrierWithGroupSync();
     }
     float row_var = s_var[0] / float(pc.cols);
-    float inv_std = inversesqrt(row_var + pc.eps);
-    barrier();
+    float inv_std = rsqrt(row_var + pc.eps);
+    GroupMemoryBarrierWithGroupSync();
 
-    // Step 3: Normalize and write output
     for (uint i = tid; i < pc.cols; i += WG_SIZE) {
         float norm = (dataIn[row_offset + i] - row_mean) * inv_std;
         if (pc.has_affine != 0u) {

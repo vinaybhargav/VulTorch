@@ -154,6 +154,41 @@ def test_linear_accepts_3d_input():
     assert layer(x).shape == (2, 3, 5)
 
 
+def test_linear_fused_and_transposed_matmul_match_numpy():
+    x_np = _rand((33, 67), 91)
+    w_np = _rand((45, 67), 92)
+    b_np = _rand((45,), 93)
+    g_np = _rand((33, 45), 94)
+
+    expected_y = x_np @ w_np.T + b_np
+    expected_gx = g_np @ w_np
+    expected_gw = g_np.T @ x_np
+    expected_gb = g_np.sum(axis=0)
+
+    for dev in DEVICES:
+        layer = nn.Linear(67, 45, device=dev)
+        layer.weight.copy_(w_np)
+        layer.bias.copy_(b_np)
+        x = torch.tensor(x_np, device=dev, requires_grad=True)
+        g = torch.tensor(g_np, device=dev)
+
+        y = layer(x)
+        np.testing.assert_allclose(y.numpy(), expected_y, rtol=1e-4, atol=1e-4)
+
+        y.backward(g)
+        np.testing.assert_allclose(x.grad.numpy(), expected_gx, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(layer.weight.grad.numpy(), expected_gw, rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(layer.bias.grad.numpy(), expected_gb, rtol=1e-4, atol=1e-4)
+
+
+def test_strided_outer_reduction_matches_numpy():
+    x_np = _rand((65, 130), 95)
+    for dev in DEVICES:
+        x = torch.tensor(x_np, device=dev)
+        np.testing.assert_allclose(x.sum(dim=0).numpy(), x_np.sum(axis=0), rtol=1e-4, atol=1e-4)
+        np.testing.assert_allclose(x.max(dim=0).numpy(), x_np.max(axis=0), rtol=1e-4, atol=1e-4)
+
+
 def test_matmul_batch_mismatch_raises():
     a = torch.tensor(np.zeros((2, 3, 4), np.float32), device="cpu")
     b = torch.tensor(np.zeros((3, 4, 5), np.float32), device="cpu")

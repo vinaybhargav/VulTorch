@@ -59,50 +59,21 @@ endif()
 find_package(pybind11 CONFIG REQUIRED)
 
 # ----------------------------------------------------------------------------
-# Compute shaders: .comp -> .spv at build time
+# Compute shaders: .slang -> .spv at build time
 #
-# The SPIR-V is a build product, never a checked-in binary, so a shader fix
-# cannot silently fail to reach the binary.
-find_program(GLSLANG_VALIDATOR NAMES glslangValidator glslang)
-if(NOT GLSLANG_VALIDATOR)
-    message(FATAL_ERROR
-        "glslangValidator not found. Install it (Debian/Ubuntu: glslang-tools,"
-        " Arch: glslang, Fedora: glslang) to build VulTorch from source.")
-endif()
-
-set(SHADER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
-set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
-
-file(GLOB SHADER_SOURCES CONFIGURE_DEPENDS "${SHADER_SOURCE_DIR}/*.comp")
-if(NOT SHADER_SOURCES)
-    message(FATAL_ERROR "No compute shaders found in ${SHADER_SOURCE_DIR}")
-endif()
-
-set(SPV_OUTPUTS)
-foreach(shader ${SHADER_SOURCES})
-    get_filename_component(shader_name "${shader}" NAME_WE)
-    set(spv "${SHADER_OUTPUT_DIR}/${shader_name}.spv")
-
-    add_custom_command(
-        OUTPUT "${spv}"
-        COMMAND "${CMAKE_COMMAND}" -E make_directory "${SHADER_OUTPUT_DIR}"
-        COMMAND "${GLSLANG_VALIDATOR}" --target-env vulkan1.3 -V "${shader}" -o "${spv}"
-        DEPENDS "${shader}"
-        COMMENT "Compiling shader ${shader_name}.comp"
-        VERBATIM)
-    list(APPEND SPV_OUTPUTS "${spv}")
-endforeach()
-
-# Slang kernels: one source file can hold many specialised entry points (e.g.
-# every GEMM tile configuration). Each "<file>:<entry>" pair below becomes
-# <entry>.spv, whose entry point slangc renames to "main" — the same contract
-# as the GLSL shaders, so the runtime does not care which language produced it.
+# All compute shaders are authored in Slang. One source file can hold many
+# specialised entry points (e.g. every GEMM tile configuration). Each
+# "<file>:<entry>" pair below becomes <entry>.spv, whose entry point slangc
+# emits as "main" for the runtime.
 find_program(SLANGC NAMES slangc)
 if(NOT SLANGC)
     message(FATAL_ERROR
         "slangc not found. Install the Slang compiler (Arch AUR: shader-slang-bin,"
         " or the LunarG Vulkan SDK) to build VulTorch from source.")
 endif()
+
+set(SHADER_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/shaders")
+set(SHADER_OUTPUT_DIR "${CMAKE_CURRENT_BINARY_DIR}/shaders")
 
 set(SLANG_KERNELS
     gemm:gemm_t32_k16_r2
@@ -111,9 +82,30 @@ set(SLANG_KERNELS
     gemm:gemm_t64_k16_r8
     gemm:gemm_t128_k8_r8
     gemm:gemm_t128_k16_r8
+    gemm:matmul
+    gemm:matmul_tiled64
+    gemm:matmul_tiled
+    gemm:matmul_coopmat
     adam:adam_step
+    elementwise_unary_vec4:elementwise_unary_vec4
+    elementwise_unary_scalar:elementwise_unary_scalar
+    elementwise_binary_vec4:elementwise_binary_vec4
+    elementwise_binary_broadcast:elementwise_binary_broadcast
+    copy_strided:copy_strided
+    reduction:reduction
+    reduction_generic:reduction_generic
+    reduction_generic:reduction_strided
+    softmax:softmax
+    softmax_cross_entropy:softmax_cross_entropy
+    layernorm:layernorm
+    conv2d:conv2d
+    conv2d_backward:conv2d_backward_input
+    conv2d_backward:conv2d_backward_weight
+    maxpool2d:maxpool2d
+    maxpool2d_backward:maxpool2d_backward
 )
 
+set(SPV_OUTPUTS)
 foreach(kernel ${SLANG_KERNELS})
     string(REPLACE ":" ";" parts "${kernel}")
     list(GET parts 0 slang_file)
@@ -124,7 +116,7 @@ foreach(kernel ${SLANG_KERNELS})
         OUTPUT "${spv}"
         COMMAND "${CMAKE_COMMAND}" -E make_directory "${SHADER_OUTPUT_DIR}"
         COMMAND "${SLANGC}" "${src}" -target spirv -profile spirv_1_5
-                -entry "${entry}" -O3 -o "${spv}"
+                -Wno-41012 -Wno-41017 -entry "${entry}" -O3 -o "${spv}"
         DEPENDS "${src}"
         COMMENT "Compiling Slang kernel ${slang_file}.slang:${entry}"
         VERBATIM)

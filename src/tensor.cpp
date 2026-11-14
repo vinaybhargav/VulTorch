@@ -37,24 +37,19 @@ struct MatmulCandidate {
 };
 
 constexpr MatmulCandidate kMatmulCandidates[] = {
-    // Purely register/shared-free baseline; always available.
-    {"matmul", 32u, 0u, 256u, MatmulRequirement::None, true},
-    // TK * (TILE + PAD) * sizeof(float) * 2
-    {"matmul_tiled64", 64u, 16u * (64u + 1u) * 4u * 2u, 256u, MatmulRequirement::None, true},
-    {"matmul_tiled", 128u, 16u * (128u + 1u) * 4u * 2u, 256u, MatmulRequirement::None, true},
     // Slang generic SGEMM (shaders/gemm.slang): one source, one entry point per
-    // tile configuration. Shared bytes = 4 * BK * (2 * TILE + 1).
-    {"gemm_t32_k16_r2", 32u, 4u * 16u * (2u * 32u + 1u), 256u, MatmulRequirement::None, true},
-    {"gemm_t64_k16_r4", 64u, 4u * 16u * (2u * 64u + 1u), 256u, MatmulRequirement::None, true},
-    {"gemm_t64_k8_r4", 64u, 4u * 8u * (2u * 64u + 1u), 256u, MatmulRequirement::None, true},
-    {"gemm_t64_k16_r8", 64u, 4u * 16u * (2u * 64u + 1u), 64u, MatmulRequirement::None, true},
-    {"gemm_t128_k8_r8", 128u, 4u * 8u * (2u * 128u + 1u), 256u, MatmulRequirement::None, true},
-    {"gemm_t128_k16_r8", 128u, 4u * 16u * (2u * 128u + 1u), 256u, MatmulRequirement::None, true},
-    // sA + sB (f16, padded) + output staging (f32, padded).
-    // Measured 5x slower than matmul_tiled on the RX 7900 XTX (2.9 vs 15.6
-    // TFLOPS at 2048^3): one subgroup per workgroup is too little parallelism
-    // for the fp32->f16 staging loop. Kept selectable for further work; see
-    // docs/kernels/gemm.md.
+    // tile configuration. Shared bytes = 4 * BK * 2 * (TILE + 1).
+    {"gemm_t32_k16_r2", 32u, 4u * 16u * 2u * (32u + 1u), 256u, MatmulRequirement::None, false},
+    {"gemm_t64_k16_r4", 64u, 4u * 16u * 2u * (64u + 1u), 256u, MatmulRequirement::None, true},
+    {"gemm_t64_k8_r4", 64u, 4u * 8u * 2u * (64u + 1u), 256u, MatmulRequirement::None, false},
+    {"gemm_t64_k16_r8", 64u, 4u * 16u * 2u * (64u + 1u), 64u, MatmulRequirement::None, true},
+    {"gemm_t128_k8_r8", 128u, 4u * 8u * 2u * (128u + 1u), 256u, MatmulRequirement::None, true},
+    {"gemm_t128_k16_r8", 128u, 4u * 16u * 2u * (128u + 1u), 256u, MatmulRequirement::None, true},
+    // Legacy entry-point aliases kept selectable via VULTORCH_MATMUL_KERNEL.
+    {"matmul", 32u, 4u * 16u * 2u * (32u + 1u), 256u, MatmulRequirement::None, false},
+    {"matmul_tiled64", 64u, 4u * 16u * 2u * (64u + 1u), 256u, MatmulRequirement::None, false},
+    {"matmul_tiled", 128u, 4u * 16u * 2u * (128u + 1u), 256u, MatmulRequirement::None, false},
+    // Cooperative-matrix 16x16x16 f16 -> f32 variant in shaders/gemm.slang.
     {"matmul_coopmat", 64u,
      64u * 17u * 2u + 16u * 68u * 2u + 64u * 68u * 4u, 64u,
      MatmulRequirement::Fp16CoopMat, false},
@@ -66,8 +61,8 @@ struct MatmulChoice {
 };
 
 using MatmulDispatch = std::function<void(const char*, uint32_t)>;
-// (device, M, N, K)
-using MatmulShapeKey = std::array<uint32_t, 4>;
+// (device, M, N, K, trans_a, trans_b)
+using MatmulShapeKey = std::array<uint32_t, 6>;
 
 std::mutex g_matmul_choice_mutex;
 std::map<MatmulShapeKey, MatmulChoice> g_matmul_choice_cache;
@@ -84,11 +79,11 @@ bool env_flag_enabled(const char* name, bool default_value) {
 // 1. Filter by what the device reports it can run (shared memory, workgroup
 //    size, tile fits the problem).
 // 2. Honour VULTORCH_MATMUL_KERNEL=<shader> for benchmarking a specific variant.
-// 3. Measure the survivors once and cache the winner per (device, M, N, K).
+// 3. Measure the survivors once and cache the winner per (device, M, N, K, trans).
 //    Training reuses a handful of shapes, so this cost is paid a few times.
 // VULTORCH_AUTOTUNE=0 disables step 3 and takes the largest viable tile.
 MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, uint32_t K,
-                                  const MatmulDispatch& run) {
+                                  bool trans_a, bool trans_b, const MatmulDispatch& run) {
     const auto dev = VulkanManager::instance_ref().get_device(device_id);
     const DeviceCapabilities& caps = dev->capabilities;
 
@@ -99,8 +94,6 @@ MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, ui
         if (candidate.shared_bytes > caps.max_shared_memory_bytes) continue;
         if (candidate.workgroup_size > caps.max_workgroup_invocations) continue;
         if (candidate.requirement == MatmulRequirement::Fp16CoopMat) {
-            // The kernel splits 64 columns across gl_NumSubgroups, so each
-            // subgroup must own at least one 16-wide tile.
             if (!caps.fp16_coopmat_16x16) continue;
             if (caps.subgroup_size < 16u || caps.subgroup_size % 16u != 0u) continue;
             if (64u % caps.subgroup_size != 0u) continue;
@@ -110,7 +103,7 @@ MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, ui
             auto_candidates.push_back({candidate.shader, candidate.tile});
         }
     }
-    if (candidates.empty()) return {"matmul", 32u};
+    if (candidates.empty()) return {"gemm_t32_k16_r2", 32u};
 
     // 2. Explicit override, read every call so it can be changed at runtime
     //    (benchmarks and tests). Not cached: an override must win over the
@@ -126,14 +119,13 @@ MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, ui
 
     // 3. Tiny problems are launch-bound; tiling cannot pay for itself and an
     //    autotune sweep would cost far more than the multiplication.
-    if (2ull * M * N * K < 1'000'000ull) return {"matmul", 32u};
+    if (2ull * M * N * K < 1'000'000ull) return {"gemm_t32_k16_r2", 32u};
 
-    if (auto_candidates.empty()) return {"matmul", 32u};
+    if (auto_candidates.empty()) return {"gemm_t32_k16_r2", 32u};
     if (auto_candidates.size() == 1) return auto_candidates.front();
 
-    // 4. Measured selection, cached per (device, shape). Training reuses a
-    //    handful of shapes, so this cost is paid a few times per process.
-    const MatmulShapeKey key{device_id, M, N, K};
+    // 4. Measured selection, cached per (device, shape, trans).
+    const MatmulShapeKey key{device_id, M, N, K, trans_a ? 1u : 0u, trans_b ? 1u : 0u};
     {
         std::lock_guard<std::mutex> lock(g_matmul_choice_mutex);
         auto it = g_matmul_choice_cache.find(key);
@@ -147,26 +139,30 @@ MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, ui
 
     for (const auto& candidate : auto_candidates) {
         // Fixed *time* budget of warmup: the first runs of a kernel happen at
-        // low clocks while the GPU ramps, and the operands are still cold. A
-        // count-based warmup would let power management decide the contest.
+        // low clocks while the GPU ramps, and the operands are still cold.
         const auto warm_start = std::chrono::steady_clock::now();
         int warm_iters = 0;
-        while (warm_iters < 128 &&
+        while (warm_iters < 64 &&
                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - warm_start)
-                       .count() < 20.0) {
+                       .count() < 15.0) {
             run(candidate.shader, candidate.tile);
             dev->synchronize();
             ++warm_iters;
         }
 
         double candidate_ms = std::numeric_limits<double>::max();
-        for (int rep = 0; rep < 5; ++rep) {
+        for (int rep = 0; rep < 3; ++rep) {
             const auto start = std::chrono::steady_clock::now();
-            run(candidate.shader, candidate.tile);
+            // Batch 3 dispatches per synchronize() so host/OS scheduling jitter
+            // on a single short dispatch cannot skew the winner.
+            for (int sub = 0; sub < 3; ++sub) {
+                run(candidate.shader, candidate.tile);
+            }
             dev->synchronize();
             const double ms = std::chrono::duration<double, std::milli>(
                                   std::chrono::steady_clock::now() - start)
-                                  .count();
+                                  .count() /
+                              3.0;
             candidate_ms = std::min(candidate_ms, ms);
         }
 
@@ -805,7 +801,9 @@ std::shared_ptr<NativeTensor> NativeTensor::unary_op(uint32_t op_type, float p1,
     return out;
 }
 
-std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor> other) {
+std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor> other,
+                                                   bool trans_a, bool trans_b,
+                                                   std::shared_ptr<NativeTensor> bias) {
     if (device_id != other->device_id) {
         throw std::runtime_error("Matmul requires both tensors on the same device!");
     }
@@ -817,19 +815,31 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
         throw std::runtime_error("Matmul requires contiguous tensors");
     }
 
-    uint32_t M = static_cast<uint32_t>(shape[shape.size() - 2]);
-    uint32_t K1 = static_cast<uint32_t>(shape[shape.size() - 1]);
-    uint32_t K2 = static_cast<uint32_t>(other->shape[other->shape.size() - 2]);
-    uint32_t N = static_cast<uint32_t>(other->shape[other->shape.size() - 1]);
+    const int64_t a_rows = shape[shape.size() - 2];
+    const int64_t a_cols = shape[shape.size() - 1];
+    const int64_t b_rows = other->shape[other->shape.size() - 2];
+    const int64_t b_cols = other->shape[other->shape.size() - 1];
+
+    uint32_t M = static_cast<uint32_t>(trans_a ? a_cols : a_rows);
+    uint32_t K1 = static_cast<uint32_t>(trans_a ? a_rows : a_cols);
+    uint32_t K2 = static_cast<uint32_t>(trans_b ? b_cols : b_rows);
+    uint32_t N = static_cast<uint32_t>(trans_b ? b_rows : b_cols);
 
     if (K1 != K2) {
         throw std::runtime_error("Inner dimensions must match for matmul: " + std::to_string(K1) + " vs " + std::to_string(K2));
     }
 
+    if (bias != nullptr) {
+        if (bias->device_id != device_id) {
+            throw std::runtime_error("Matmul bias must be on the same device");
+        }
+        if (bias->numel != N || !bias->is_contiguous()) {
+            throw std::runtime_error("Matmul bias must be a contiguous tensor of length N");
+        }
+    }
+
     // Batch handling: B may either be unbatched (shared across every batch item,
-    // the `Linear`-on-3D case) or have exactly the same leading dimensions. Any
-    // other combination used to produce a wrong output shape and read past the
-    // end of B, so it is rejected explicitly until general broadcasting lands.
+    // the `Linear`-on-3D case) or have exactly the same leading dimensions.
     const bool b_broadcast = (other->shape.size() == 2);
     if (!b_broadcast) {
         if (shape.size() != other->shape.size()) {
@@ -850,8 +860,14 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
     }
 
     std::vector<int64_t> out_shape = shape;
+    out_shape[out_shape.size() - 2] = M;
     out_shape[out_shape.size() - 1] = N;
     auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+
+    const uint32_t strideA_m = trans_a ? 1u : K1;
+    const uint32_t strideA_k = trans_a ? M : 1u;
+    const uint32_t strideB_k = trans_b ? 1u : N;
+    const uint32_t strideB_n = trans_b ? K1 : 1u;
 
     if (device_id >= 0) {
         struct {
@@ -868,6 +884,7 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
             uint32_t strideC_b;
             uint32_t strideC_m;
             uint32_t strideC_n;
+            uint32_t has_bias;
         } pc{};
 
         pc.M = M;
@@ -875,26 +892,29 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
         pc.K = K1;
         pc.batch_count = static_cast<uint32_t>(batch_count);
         pc.strideA_b = static_cast<uint32_t>(M * K1);
-        pc.strideA_m = static_cast<uint32_t>(K1);
-        pc.strideA_k = 1;
+        pc.strideA_m = strideA_m;
+        pc.strideA_k = strideA_k;
         pc.strideB_b = b_broadcast ? 0u : static_cast<uint32_t>(K1 * N);
-        pc.strideB_k = static_cast<uint32_t>(N);
-        pc.strideB_n = 1;
+        pc.strideB_k = strideB_k;
+        pc.strideB_n = strideB_n;
         pc.strideC_b = static_cast<uint32_t>(M * N);
         pc.strideC_m = static_cast<uint32_t>(N);
         pc.strideC_n = 1;
+        pc.has_bias = (bias != nullptr) ? 1u : 0u;
+
+        std::shared_ptr<VulkanBuffer> bias_buf = bias ? bias->gpu_buffer : out->gpu_buffer;
 
         auto run_variant = [&](const char* shader, uint32_t tile) {
             const uint32_t group_x = (N + tile - 1u) / tile;
             const uint32_t group_y = (M + tile - 1u) / tile;
             VulkanPipelineManager::instance().dispatch(
                 device_id, shader,
-                {gpu_buffer, other->gpu_buffer, out->gpu_buffer},
+                {gpu_buffer, other->gpu_buffer, out->gpu_buffer, bias_buf},
                 &pc, sizeof(pc), group_x, group_y, static_cast<uint32_t>(batch_count));
         };
 
         const MatmulChoice choice = select_matmul_shader(
-            static_cast<uint32_t>(device_id), M, N, K1, run_variant);
+            static_cast<uint32_t>(device_id), M, N, K1, trans_a, trans_b, run_variant);
         run_variant(choice.shader, choice.tile);
     } else {
         // CPU MatMul fallback
@@ -906,9 +926,10 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
 
             for (uint32_t m = 0; m < M; ++m) {
                 for (uint32_t n = 0; n < N; ++n) {
-                    float sum = 0.0f;
+                    float sum = (bias != nullptr) ? bias->cpu_data[n] : 0.0f;
                     for (uint32_t k = 0; k < K1; ++k) {
-                        sum += cpu_data[offA + m * K1 + k] * other->cpu_data[offB + k * N + n];
+                        sum += cpu_data[offA + m * strideA_m + k * strideA_k] *
+                               other->cpu_data[offB + k * strideB_k + n * strideB_n];
                     }
                     out->cpu_data[offC + m * N + n] = sum;
                 }
@@ -993,10 +1014,17 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_sum(int64_t dim, bool keepdim
             uint32_t op_type;
         } pc{outer, static_cast<uint32_t>(shape[static_cast<size_t>(dim)]), inner, 0u};
 
-        VulkanPipelineManager::instance().dispatch(
-            device_id, "reduction_generic",
-            {gpu_buffer, out->gpu_buffer},
-            &pc, sizeof(pc), outer * inner);
+        if (inner >= 16u && outer <= 65535u) {
+            VulkanPipelineManager::instance().dispatch(
+                device_id, "reduction_strided",
+                {gpu_buffer, out->gpu_buffer},
+                &pc, sizeof(pc), (inner + 31u) / 32u, outer);
+        } else {
+            VulkanPipelineManager::instance().dispatch(
+                device_id, "reduction_generic",
+                {gpu_buffer, out->gpu_buffer},
+                &pc, sizeof(pc), outer * inner);
+        }
         return out;
     }
 
@@ -1083,10 +1111,17 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_max(int64_t dim, bool keepdim
             uint32_t op_type;
         } pc{outer, static_cast<uint32_t>(shape[static_cast<size_t>(dim)]), inner, 1u};
 
-        VulkanPipelineManager::instance().dispatch(
-            device_id, "reduction_generic",
-            {gpu_buffer, out->gpu_buffer},
-            &pc, sizeof(pc), outer * inner);
+        if (inner >= 16u && outer <= 65535u) {
+            VulkanPipelineManager::instance().dispatch(
+                device_id, "reduction_strided",
+                {gpu_buffer, out->gpu_buffer},
+                &pc, sizeof(pc), (inner + 31u) / 32u, outer);
+        } else {
+            VulkanPipelineManager::instance().dispatch(
+                device_id, "reduction_generic",
+                {gpu_buffer, out->gpu_buffer},
+                &pc, sizeof(pc), outer * inner);
+        }
         return out;
     }
 
@@ -1142,10 +1177,7 @@ std::shared_ptr<NativeTensor> NativeTensor::softmax(int64_t dim, bool is_log) {
         return out;
     }
 
-    // Dimension-aware path for any axis (and for CPU tensors). The storage is
-    // contiguous, so consecutive elements of one reduction group are `inner`
-    // apart. Kept simple and obviously correct; the fast kernel above only
-    // covers the last axis.
+    // Dimension-aware path for any axis (and for CPU tensors).
     auto cpu_in = (device_id >= 0) ? to_device(-1) : shared_from_this();
     auto cpu_out = std::make_shared<NativeTensor>(shape, -1);
 
@@ -1204,11 +1236,14 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_per_row(
             uint32_t rows;
             uint32_t cols;
             uint32_t mode; // 0 = per-row loss
-        } pc{rows, cols, 0u};
+            uint32_t has_grad_buf;
+            uint32_t g_is_scalar;
+            float scale;
+        } pc{rows, cols, 0u, 0u, 0u, 1.0f};
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "softmax_cross_entropy",
-            {gpu_buffer, targets->gpu_buffer, out->gpu_buffer},
+            {gpu_buffer, targets->gpu_buffer, out->gpu_buffer, out->gpu_buffer},
             &pc, sizeof(pc), rows);
         return out;
     }
@@ -1231,7 +1266,9 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_per_row(
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_grad(
-    const std::shared_ptr<NativeTensor>& targets) const {
+    const std::shared_ptr<NativeTensor>& targets,
+    const std::shared_ptr<NativeTensor>& grad_out,
+    float scale) const {
     if (shape.size() != 2) {
         throw std::runtime_error("cross_entropy requires a 2-D logits tensor [rows, cols]");
     }
@@ -1244,6 +1281,16 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_grad(
 
     const uint32_t rows = static_cast<uint32_t>(shape[0]);
     const uint32_t cols = static_cast<uint32_t>(shape[1]);
+
+    if (grad_out != nullptr) {
+        if (grad_out->device_id != device_id) {
+            throw std::runtime_error("cross_entropy_grad: grad_out must be on the same device");
+        }
+        if (grad_out->numel != 1 && grad_out->numel != rows) {
+            throw std::runtime_error("cross_entropy_grad: grad_out must have 1 or rows elements");
+        }
+    }
+
     auto out = std::make_shared<NativeTensor>(shape, device_id);
 
     if (device_id >= 0) {
@@ -1251,11 +1298,19 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_grad(
             uint32_t rows;
             uint32_t cols;
             uint32_t mode; // 1 = gradient
-        } pc{rows, cols, 1u};
+            uint32_t has_grad_buf;
+            uint32_t g_is_scalar;
+            float scale;
+        } pc{rows, cols, 1u,
+             (grad_out != nullptr) ? 1u : 0u,
+             (grad_out != nullptr && grad_out->numel == 1) ? 1u : 0u,
+             scale};
+
+        std::shared_ptr<VulkanBuffer> g_buf = grad_out ? grad_out->gpu_buffer : out->gpu_buffer;
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "softmax_cross_entropy",
-            {gpu_buffer, targets->gpu_buffer, out->gpu_buffer},
+            {gpu_buffer, targets->gpu_buffer, out->gpu_buffer, g_buf},
             &pc, sizeof(pc), rows);
         return out;
     }
@@ -1273,10 +1328,15 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_grad(
         for (uint32_t c = 0; c < cols; ++c) s += std::exp(row[c] - m);
         const float inv_s = 1.0f / s;
 
+        float row_scale = scale;
+        if (grad_out != nullptr) {
+            row_scale *= grad_out->cpu_data[(grad_out->numel == 1) ? 0 : r];
+        }
+
         for (uint32_t c = 0; c < cols; ++c) {
             const float probability = std::exp(row[c] - m) * inv_s;
             const float onehot = (static_cast<int64_t>(c) == target) ? 1.0f : 0.0f;
-            out->cpu_data[static_cast<size_t>(r) * cols + c] = probability - onehot;
+            out->cpu_data[static_cast<size_t>(r) * cols + c] = (probability - onehot) * row_scale;
         }
     }
     return out;

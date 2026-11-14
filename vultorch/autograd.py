@@ -76,6 +76,7 @@ def backward(root_tensor: 'Tensor', grad: Optional['Tensor'] = None):
 
         # Dictionary of accumulated gradients: Tensor -> Tensor
         grads = {root_tensor: grad}
+        used_leaf_natives = {id(grad._native)}
 
         for tensor in reversed(topo):
             if tensor not in grads or tensor.grad_fn is None:
@@ -102,7 +103,12 @@ def backward(root_tensor: 'Tensor', grad: Optional['Tensor'] = None):
 
                 if inp.is_leaf:
                     if inp.grad is None:
-                        inp.grad = g_in.clone()
+                        nid = id(g_in._native)
+                        if nid in used_leaf_natives or not g_in._native.is_contiguous():
+                            inp.grad = g_in.clone()
+                        else:
+                            used_leaf_natives.add(nid)
+                            inp.grad = g_in
                     else:
                         inp.grad = inp.grad + g_in
 

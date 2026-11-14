@@ -1,23 +1,16 @@
-#version 450
-
-#define WG_SIZE 256
-layout(local_size_x = WG_SIZE) in;
-
-layout(std430, binding = 0) readonly buffer BufferIn {
-    float dataIn[];
-};
-
-layout(std430, binding = 1) writeonly buffer BufferOut {
-    float dataOut[];
-};
-
-layout(push_constant) uniform PushConstants {
+struct ReductionParams {
     uint num_rows;
     uint cols;
     uint op_type; // 0: Sum, 1: Max, 2: Min
-} pc;
+};
 
-shared float s_data[WG_SIZE];
+[[vk::push_constant]] ReductionParams pc;
+
+[[vk::binding(0, 0)]] StructuredBuffer<float> dataIn;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> dataOut;
+
+static const uint WG_SIZE = 256u;
+static groupshared float s_data[WG_SIZE];
 
 float reduce_op(float a, float b, uint op) {
     if (op == 0u) return a + b;
@@ -33,28 +26,27 @@ float init_val(uint op) {
     return 0.0;
 }
 
-void main() {
-    uint row = gl_WorkGroupID.y;
+[shader("compute")] [numthreads(256, 1, 1)]
+void reduction(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
+    uint row = gid.y;
     if (row >= pc.num_rows) return;
 
-    uint tid = gl_LocalInvocationID.x;
+    uint tid = lid.x;
     uint row_offset = row * pc.cols;
 
-    // Strided accumulation within the workgroup
     float acc = init_val(pc.op_type);
     for (uint i = tid; i < pc.cols; i += WG_SIZE) {
         acc = reduce_op(acc, dataIn[row_offset + i], pc.op_type);
     }
 
     s_data[tid] = acc;
-    barrier();
+    GroupMemoryBarrierWithGroupSync();
 
-    // Parallel tree reduction in shared memory
     for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
         if (tid < s) {
             s_data[tid] = reduce_op(s_data[tid], s_data[tid + s], pc.op_type);
         }
-        barrier();
+        GroupMemoryBarrierWithGroupSync();
     }
 
     if (tid == 0u) {

@@ -1,25 +1,4 @@
-#version 450
-#extension GL_EXT_control_flow_attributes : enable
-
-layout(local_size_x = 8, local_size_y = 8, local_size_z = 4) in;
-
-layout(std430, binding = 0) readonly buffer BufferInput {
-    float dataIn[];
-};
-
-layout(std430, binding = 1) readonly buffer BufferWeight {
-    float dataWeight[];
-};
-
-layout(std430, binding = 2) readonly buffer BufferBias {
-    float dataBias[];
-};
-
-layout(std430, binding = 3) writeonly buffer BufferOutput {
-    float dataOut[];
-};
-
-layout(push_constant) uniform PushConstants {
+struct Conv2dParams {
     uint N;
     uint C_in;
     uint H_in;
@@ -34,14 +13,22 @@ layout(push_constant) uniform PushConstants {
     uint pad_h;
     uint pad_w;
     uint has_bias;
-} pc;
+};
 
-void main() {
-    uint ow = gl_GlobalInvocationID.x;
-    uint oh = gl_GlobalInvocationID.y;
-    uint oc = gl_GlobalInvocationID.z;
-    uint n = gl_WorkGroupID.z / ((pc.C_out + 3u) / 4u); // batch index
-    uint real_oc = (gl_WorkGroupID.z % ((pc.C_out + 3u) / 4u)) * 4u + gl_LocalInvocationID.z;
+[[vk::push_constant]] Conv2dParams pc;
+
+[[vk::binding(0, 0)]] StructuredBuffer<float> dataIn;
+[[vk::binding(1, 0)]] StructuredBuffer<float> dataWeight;
+[[vk::binding(2, 0)]] StructuredBuffer<float> dataBias;
+[[vk::binding(3, 0)]] RWStructuredBuffer<float> dataOut;
+
+[shader("compute")] [numthreads(8, 8, 4)]
+void conv2d(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
+    uint ow = tid.x;
+    uint oh = tid.y;
+    uint c_groups = (pc.C_out + 3u) / 4u;
+    uint n = gid.z / c_groups;
+    uint real_oc = (gid.z % c_groups) * 4u + lid.z;
 
     if (ow >= pc.W_out || oh >= pc.H_out || real_oc >= pc.C_out || n >= pc.N) return;
 
@@ -63,7 +50,6 @@ void main() {
                 uint in_row_offset = in_ch_offset + uint(in_h) * pc.W_in;
                 uint w_row_offset = w_ch_offset + kh * pc.kW;
 
-                [[unroll]]
                 for (uint kw = 0; kw < pc.kW; ++kw) {
                     int in_w = in_w_base + int(kw);
                     if (in_w >= 0 && in_w < int(pc.W_in)) {

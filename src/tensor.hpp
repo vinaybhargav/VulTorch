@@ -69,7 +69,9 @@ public:
     std::shared_ptr<NativeTensor> binary_op(uint32_t op_type, std::shared_ptr<NativeTensor> other);
     std::shared_ptr<NativeTensor> binary_op_scalar(uint32_t op_type, float scalar_val, bool reverse = false);
     std::shared_ptr<NativeTensor> unary_op(uint32_t op_type, float p1 = 0.0f, float p2 = 0.0f);
-    std::shared_ptr<NativeTensor> matmul(std::shared_ptr<NativeTensor> other);
+    std::shared_ptr<NativeTensor> matmul(std::shared_ptr<NativeTensor> other,
+                                         bool trans_a = false, bool trans_b = false,
+                                         std::shared_ptr<NativeTensor> bias = nullptr);
     std::shared_ptr<NativeTensor> reduce_sum(int64_t dim = -1, bool keepdim = false);
     std::shared_ptr<NativeTensor> reduce_mean(int64_t dim = -1, bool keepdim = false);
     std::shared_ptr<NativeTensor> reduce_max(int64_t dim = -1, bool keepdim = false);
@@ -78,9 +80,11 @@ public:
     // Fused softmax cross-entropy over the last axis of a 2-D [rows, cols]
     // tensor. `targets` is a [rows] tensor of class indices stored as floats.
     // per_row() returns [rows]; grad() returns [rows, cols] holding
-    // (softmax - onehot), unscaled so the caller can apply the reduction.
+    // (softmax - onehot) scaled by `scale` and optional upstream `grad_out`.
     std::shared_ptr<NativeTensor> cross_entropy_per_row(const std::shared_ptr<NativeTensor>& targets) const;
-    std::shared_ptr<NativeTensor> cross_entropy_grad(const std::shared_ptr<NativeTensor>& targets) const;
+    std::shared_ptr<NativeTensor> cross_entropy_grad(const std::shared_ptr<NativeTensor>& targets,
+                                                     const std::shared_ptr<NativeTensor>& grad_out = nullptr,
+                                                     float scale = 1.0f) const;
     std::shared_ptr<NativeTensor> conv2d(std::shared_ptr<NativeTensor> weight, std::shared_ptr<NativeTensor> bias,
                                         uint32_t stride_h, uint32_t stride_w, uint32_t pad_h, uint32_t pad_w);
     std::shared_ptr<NativeTensor> conv2d_backward_input(std::shared_ptr<NativeTensor> weight,

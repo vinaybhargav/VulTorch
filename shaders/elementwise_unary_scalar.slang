@@ -1,24 +1,17 @@
-#version 450
-
-layout(local_size_x = 256) in;
-
-layout(std430, binding = 0) readonly buffer BufferIn {
-    float dataIn[];
-};
-
-layout(std430, binding = 1) writeonly buffer BufferOut {
-    float dataOut[];
-};
-
-layout(push_constant) uniform PushConstants {
+struct UnaryScalarParams {
     uint total_elements;
     uint op_type;
     float param1;
     float param2;
-} pc;
+};
 
-const float SQRT_2_OVER_PI = 0.7978845608;
-const float GELU_COEFF = 0.044715;
+[[vk::push_constant]] UnaryScalarParams pc;
+
+[[vk::binding(0, 0)]] StructuredBuffer<float> dataIn;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> dataOut;
+
+static const float SQRT_2_OVER_PI = 0.7978845608;
+static const float GELU_COEFF = 0.044715;
 
 float fast_gelu_scalar(float x) {
     float inner = SQRT_2_OVER_PI * (x + GELU_COEFF * x * x * x);
@@ -31,7 +24,7 @@ float apply_op_scalar(float x, uint op) {
         case 1u: return exp(x);
         case 2u: return log(x);
         case 3u: return sqrt(x);
-        case 4u: return inversesqrt(x);
+        case 4u: return rsqrt(x);
         case 5u: return abs(x);
         case 6u: return sin(x);
         case 7u: return cos(x);
@@ -41,15 +34,15 @@ float apply_op_scalar(float x, uint op) {
         case 11u: return fast_gelu_scalar(x);
         case 12u: return x / (1.0 + exp(-x));
         case 13u: return clamp(x, pc.param1, pc.param2);
-        case 14u: return sign(x);
+        case 14u: return float(sign(x));
         case 15u: return x * pc.param1 + pc.param2;
         default: return x;
     }
 }
 
-void main() {
-    uint idx = gl_GlobalInvocationID.x;
+[shader("compute")] [numthreads(256, 1, 1)]
+void elementwise_unary_scalar(uint3 tid : SV_DispatchThreadID) {
+    uint idx = tid.x;
     if (idx >= pc.total_elements) return;
-
     dataOut[idx] = apply_op_scalar(dataIn[idx], pc.op_type);
 }

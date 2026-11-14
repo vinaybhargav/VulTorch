@@ -1,20 +1,4 @@
-#version 450
-
-layout(local_size_x = 16, local_size_y = 16) in;
-
-layout(std430, binding = 0) readonly buffer BufferIn {
-    float dataIn[];
-};
-
-layout(std430, binding = 1) writeonly buffer BufferOut {
-    float dataOut[];
-};
-
-layout(std430, binding = 2) writeonly buffer BufferIndices {
-    uint maxIndices[];
-};
-
-layout(push_constant) uniform PushConstants {
+struct MaxPool2dParams {
     uint N;
     uint C;
     uint H_in;
@@ -27,12 +11,19 @@ layout(push_constant) uniform PushConstants {
     uint stride_w;
     uint pad_h;
     uint pad_w;
-} pc;
+};
 
-void main() {
-    uint ow = gl_GlobalInvocationID.x;
-    uint oh = gl_GlobalInvocationID.y;
-    uint nc = gl_WorkGroupID.z;
+[[vk::push_constant]] MaxPool2dParams pc;
+
+[[vk::binding(0, 0)]] StructuredBuffer<float> dataIn;
+[[vk::binding(1, 0)]] RWStructuredBuffer<float> dataOut;
+[[vk::binding(2, 0)]] RWStructuredBuffer<uint> maxIndices;
+
+[shader("compute")] [numthreads(16, 16, 1)]
+void maxpool2d(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID) {
+    uint ow = tid.x;
+    uint oh = tid.y;
+    uint nc = gid.z;
 
     if (ow >= pc.W_out || oh >= pc.H_out || nc >= (pc.N * pc.C)) return;
 

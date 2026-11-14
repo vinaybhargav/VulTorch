@@ -298,15 +298,27 @@ class Tensor:
 
     def __matmul__(self, other) -> 'Tensor':
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
-        native_out = self._native.matmul(other._native)
+        native_out = self._native.matmul(other._native, False, False, None)
         req_grad = (self.requires_grad or other.requires_grad) and is_grad_enabled()
         out = Tensor(native_out, device=self.device, requires_grad=req_grad)
 
         if req_grad:
             out.is_leaf = False
             def matmul_backward(grad_out: 'Tensor'):
-                g_self = grad_out @ other.transpose(-1, -2) if self.requires_grad else None
-                g_other = self.transpose(-1, -2) @ grad_out if other.requires_grad else None
+                g_self = None
+                g_other = None
+                if self.requires_grad:
+                    g_self = Tensor(grad_out._native.matmul(other._native, False, True, None), device=self.device)
+                if other.requires_grad:
+                    if self.ndim > 2 and other.ndim == 2:
+                        k = self.shape[-1]
+                        n = grad_out.shape[-1]
+                        m_total = self.numel // k
+                        x_2d = self.contiguous()._native.reshape_view([m_total, k])
+                        g_2d = grad_out.contiguous()._native.reshape_view([m_total, n])
+                        g_other = Tensor(x_2d.matmul(g_2d, True, False, None), device=self.device)
+                    else:
+                        g_other = Tensor(self._native.matmul(grad_out._native, True, False, None), device=self.device)
                 return g_self, g_other
             out.grad_fn = Node("MatmulBackward", matmul_backward, [self, other])
         return out

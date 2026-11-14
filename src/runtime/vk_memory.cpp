@@ -247,16 +247,7 @@ void VulkanMemoryManager::copy_device_to_host(uint32_t device_id, std::shared_pt
 void VulkanMemoryManager::copy_buffer_to_buffer(uint32_t device_id, std::shared_ptr<VulkanBuffer> src,
                                                 std::shared_ptr<VulkanBuffer> dst, VkDeviceSize size_bytes) {
     auto dev = VulkanManager::instance_ref().get_device(device_id);
-
-    const VkBuffer src_handle = src->buffer;
-    const VkBuffer dst_handle = dst->buffer;
-    dev->submit_transfer([&](VkCommandBuffer cmd) {
-        VkBufferCopy copy_region{};
-        copy_region.srcOffset = 0;
-        copy_region.dstOffset = 0;
-        copy_region.size = size_bytes;
-        vkCmdCopyBuffer(cmd, src_handle, dst_handle, 1, &copy_region);
-    });
+    dev->record_copy(src->buffer, dst->buffer, size_bytes);
 }
 
 void VulkanMemoryManager::copy_cross_device(uint32_t src_device_id, std::shared_ptr<VulkanBuffer> src_buffer,

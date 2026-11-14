@@ -1,21 +1,4 @@
-#version 450
-
-layout(local_size_x = 256) in;
-
-layout(std430, binding = 0) readonly buffer BufferA {
-    float dataA[];
-};
-
-layout(std430, binding = 1) readonly buffer BufferB {
-    float dataB[];
-};
-
-layout(std430, binding = 2) writeonly buffer BufferC {
-    float dataC[];
-};
-
-// Max 6 dimensions for broadcasting
-layout(push_constant) uniform PushConstants {
+struct BinaryBroadcastParams {
     uint total_elements;
     uint op_type;    // 0: Add, 1: Sub, 2: Mul, 3: Div, 4: Pow, 5: Max, 6: Min, 7: GT, 8: LT, 9: EQ
     uint ndim;
@@ -24,12 +7,18 @@ layout(push_constant) uniform PushConstants {
     uint shape[6];
     uint strideA[6];
     uint strideB[6];
-} pc;
+};
+
+[[vk::push_constant]] BinaryBroadcastParams pc;
+
+[[vk::binding(0, 0)]] StructuredBuffer<float> dataA;
+[[vk::binding(1, 0)]] StructuredBuffer<float> dataB;
+[[vk::binding(2, 0)]] RWStructuredBuffer<float> dataC;
 
 float safe_pow_scalar(float a, float b) {
     float p = pow(abs(a), b);
-    if (mod(floor(abs(b)), 2.0) == 1.0) {
-        return p * sign(a);
+    if (fmod(floor(abs(b)), 2.0) == 1.0) {
+        return p * float(sign(a));
     }
     return p;
 }
@@ -50,8 +39,9 @@ float apply_op_scalar(float a, float b, uint op) {
     }
 }
 
-void main() {
-    uint idx = gl_GlobalInvocationID.x;
+[shader("compute")] [numthreads(256, 1, 1)]
+void elementwise_binary_broadcast(uint3 tid : SV_DispatchThreadID) {
+    uint idx = tid.x;
     if (idx >= pc.total_elements) return;
 
     if (pc.is_b_scalar != 0u) {
@@ -60,12 +50,10 @@ void main() {
     }
 
     if (pc.ndim == 0u) {
-        // Contiguous 1D flat
         dataC[idx] = apply_op_scalar(dataA[idx], dataB[idx], pc.op_type);
         return;
     }
 
-    // Deconstruct linear index into multi-dimensional coordinates
     uint rem = idx;
     uint idxA = 0u;
     uint idxB = 0u;

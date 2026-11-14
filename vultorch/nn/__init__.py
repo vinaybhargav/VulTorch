@@ -161,10 +161,66 @@ class Linear(Module):
             self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:
-        # y = x @ W^T + b
-        out = x @ self.weight.t()
-        if self.bias is not None:
-            out = out + self.bias
+        # Fused y = x @ W^T + b
+        b_native = self.bias._native if self.bias is not None else None
+        orig_shape = x.shape
+        if x.ndim > 2:
+            m_total = x.numel // self.in_features
+            x_2d = x.contiguous()._native.reshape_view([m_total, self.in_features])
+            out_2d = x_2d.matmul(self.weight._native, False, True, b_native)
+            native_out = out_2d.reshape_view(list(orig_shape[:-1]) + [self.out_features])
+        else:
+            x_2d = x._native
+            native_out = x_2d.matmul(self.weight._native, False, True, b_native)
+
+        req_grad = (
+            x.requires_grad
+            or self.weight.requires_grad
+            or (self.bias is not None and self.bias.requires_grad)
+        ) and is_grad_enabled()
+
+        out = Tensor(native_out, device=x.device, requires_grad=req_grad)
+        if req_grad:
+            out.is_leaf = False
+            weight = self.weight
+            bias = self.bias
+            in_feat = self.in_features
+            out_feat = self.out_features
+
+            def linear_backward(grad_out: Tensor):
+                if grad_out.ndim > 2:
+                    m_tot = grad_out.numel // out_feat
+                    g_2d = grad_out.contiguous()._native.reshape_view([m_tot, out_feat])
+                    x_mat = x.contiguous()._native.reshape_view([m_tot, in_feat])
+                else:
+                    g_2d = grad_out._native
+                    x_mat = x._native
+
+                g_x = None
+                g_w = None
+                g_b = None
+
+                if x.requires_grad:
+                    gx_2d = g_2d.matmul(weight._native, False, False, None)
+                    if len(orig_shape) > 2:
+                        gx_2d = gx_2d.reshape_view(list(orig_shape))
+                    g_x = Tensor(gx_2d, device=x.device)
+
+                if weight.requires_grad:
+                    g_w = Tensor(g_2d.matmul(x_mat, True, False, None), device=x.device)
+
+                if bias is not None and bias.requires_grad:
+                    g_b = Tensor(g_2d.reduce_sum(0, False), device=x.device)
+                    return g_x, g_w, g_b
+
+                if bias is not None:
+                    return g_x, g_w, None
+                return g_x, g_w
+
+            inputs = [x, self.weight]
+            if self.bias is not None:
+                inputs.append(self.bias)
+            out.grad_fn = Node("LinearBackward", linear_backward, inputs)
         return out
 
 class Conv2d(Module):
@@ -465,27 +521,44 @@ class CrossEntropyLoss(Module):
         indices = target.reshape((rows,))
 
         req_grad = pred.requires_grad and is_grad_enabled()
-        per_row = Tensor(
-            pred._native.cross_entropy_per_row(indices._native),
+        per_row_native = pred._native.cross_entropy_per_row(indices._native)
+
+        if self.reduction == "mean":
+            out_native = per_row_native.reduce_mean(-999999, False)
+            scale = 1.0 / float(rows) if rows > 0 else 1.0
+        elif self.reduction == "sum":
+            out_native = per_row_native.reduce_sum(-999999, False)
+            scale = 1.0
+        else:
+            out_native = per_row_native
+            scale = 1.0
+
+        out = Tensor(
+            out_native,
             device=pred.device,
             requires_grad=req_grad,
         )
 
         if req_grad:
-            per_row.is_leaf = False
+            out.is_leaf = False
             pred_native = pred._native
             indices_native = indices._native
             device = pred.device
+            reduction = self.reduction
 
             def ce_backward(g: Tensor):
-                # The kernel produces the unscaled (softmax - onehot) gradient;
-                # the reduction scaling (1/N for mean) reaches us through g.
-                grad = Tensor(pred_native.cross_entropy_grad(indices_native), device=device)
-                return grad * g.reshape((rows, 1))
+                if reduction in ("mean", "sum"):
+                    g_native = g._native if g.numel == 1 else None
+                    grad_native = pred_native.cross_entropy_grad(indices_native, g_native, scale)
+                    grad = Tensor(grad_native, device=device)
+                    return grad if g.numel == 1 else grad * g.reshape((rows, 1))
+                else:
+                    grad = Tensor(pred_native.cross_entropy_grad(indices_native, None, 1.0), device=device)
+                    return grad * g.reshape((rows, 1))
 
-            per_row.grad_fn = Node("CrossEntropyBackward", ce_backward, [pred])
+            out.grad_fn = Node("CrossEntropyBackward", ce_backward, [pred])
 
-        return per_row.mean() if self.reduction == "mean" else per_row.sum()
+        return out
 
 # ----------------------------------------------------------------------------
 # Multi-GPU DataParallel

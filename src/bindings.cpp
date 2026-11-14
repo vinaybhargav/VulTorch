@@ -119,13 +119,15 @@ PYBIND11_MODULE(_vultorch_backend, m) {
         .def("binary_op", &NativeTensor::binary_op, py::arg("op_type"), py::arg("other"))
         .def("binary_op_scalar", &NativeTensor::binary_op_scalar, py::arg("op_type"), py::arg("scalar_val"), py::arg("reverse") = false)
         .def("unary_op", &NativeTensor::unary_op, py::arg("op_type"), py::arg("p1") = 0.0f, py::arg("p2") = 0.0f)
-        .def("matmul", &NativeTensor::matmul, py::arg("other"))
+        .def("matmul", &NativeTensor::matmul, py::arg("other"),
+             py::arg("trans_a") = false, py::arg("trans_b") = false, py::arg("bias") = nullptr)
         .def("reduce_sum", &NativeTensor::reduce_sum, py::arg("dim") = -1, py::arg("keepdim") = false)
         .def("reduce_mean", &NativeTensor::reduce_mean, py::arg("dim") = -1, py::arg("keepdim") = false)
         .def("reduce_max", &NativeTensor::reduce_max, py::arg("dim") = -1, py::arg("keepdim") = false)
         .def("softmax", &NativeTensor::softmax, py::arg("dim") = -1, py::arg("is_log") = false)
         .def("cross_entropy_per_row", &NativeTensor::cross_entropy_per_row, py::arg("targets"))
-        .def("cross_entropy_grad", &NativeTensor::cross_entropy_grad, py::arg("targets"))
+        .def("cross_entropy_grad", &NativeTensor::cross_entropy_grad, py::arg("targets"),
+             py::arg("grad_out") = nullptr, py::arg("scale") = 1.0f)
         .def("conv2d", &NativeTensor::conv2d, py::arg("weight"), py::arg("bias") = nullptr,
              py::arg("stride_h") = 1, py::arg("stride_w") = 1, py::arg("pad_h") = 0, py::arg("pad_w") = 0)
         .def("conv2d_backward_input", &NativeTensor::conv2d_backward_input, py::arg("weight"),
