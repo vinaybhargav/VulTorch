@@ -152,7 +152,27 @@ class Tensor:
         return out
 
     def __deepcopy__(self, memo):
-        return Tensor(self.numpy(), device=self.device, requires_grad=self.requires_grad)
+        return Tensor(self._native.clone(), device=self.device, requires_grad=self.requires_grad)
+
+    def fill_(self, val: float) -> 'Tensor':
+        self._native.fill_(float(val))
+        return self
+
+    def zero_(self) -> 'Tensor':
+        self._native.zero_()
+        return self
+
+    def uniform_(self, low: float = 0.0, high: float = 1.0) -> 'Tensor':
+        import vultorch
+        seed, offset = vultorch._next_philox_state()
+        self._native.random_philox_(0, float(low), float(high), seed, offset, None)
+        return self
+
+    def normal_(self, mean: float = 0.0, std: float = 1.0) -> 'Tensor':
+        import vultorch
+        seed, offset = vultorch._next_philox_state()
+        self._native.random_philox_(1, float(mean), float(std), seed, offset, None)
+        return self
 
     def clone(self) -> 'Tensor':
         out = Tensor(self._native.clone(), device=self.device, requires_grad=self.requires_grad)

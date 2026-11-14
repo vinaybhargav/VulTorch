@@ -36,19 +36,43 @@ class Optimizer:
 
 class SGD(Optimizer):
     def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
-                 momentum: float = 0.0, weight_decay: float = 0.0, nesterov: bool = False):
-        defaults = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov)
+                 momentum: float = 0.0, dampening: float = 0.0,
+                 weight_decay: float = 0.0, nesterov: bool = False,
+                 fused: bool = True):
+        defaults = dict(
+            lr=lr, momentum=momentum, dampening=dampening,
+            weight_decay=weight_decay, nesterov=nesterov
+        )
         super().__init__(params, defaults)
+        self.fused = fused
 
     def _step_impl(self):
         for group in self.param_groups:
             lr = group["lr"]
             momentum = group["momentum"]
+            dampening = group.get("dampening", 0.0)
             weight_decay = group["weight_decay"]
             nesterov = group["nesterov"]
 
             for p in group["params"]:
                 if p.grad is None:
+                    continue
+
+                if self.fused and p._native.is_contiguous() and p.grad._native.is_contiguous():
+                    param_state = self.state.setdefault(p, {})
+                    first_step = False
+                    mom_native = None
+                    if momentum != 0.0:
+                        if "momentum_buffer" not in param_state:
+                            param_state["momentum_buffer"] = vultorch.empty(p.shape, device=p.device)
+                            first_step = True
+                        mom_native = param_state["momentum_buffer"]._native
+
+                    p._native.sgd_step_(
+                        p.grad._native, mom_native,
+                        float(lr), float(momentum), float(dampening),
+                        float(weight_decay), bool(nesterov), first_step
+                    )
                     continue
 
                 d_p = p.grad
@@ -61,7 +85,7 @@ class SGD(Optimizer):
                         buf = param_state["momentum_buffer"] = d_p.clone()
                     else:
                         buf = param_state["momentum_buffer"]
-                        buf = buf * momentum + d_p
+                        buf = buf * momentum + d_p * (1.0 - dampening)
                         param_state["momentum_buffer"] = buf
 
                     if nesterov:

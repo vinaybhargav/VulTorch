@@ -17,7 +17,7 @@ struct MaxPool2dParams {
 
 [[vk::binding(0, 0)]] StructuredBuffer<float> dataIn;
 [[vk::binding(1, 0)]] RWStructuredBuffer<float> dataOut;
-[[vk::binding(2, 0)]] RWStructuredBuffer<uint> maxIndices;
+[[vk::binding(2, 0)]] RWStructuredBuffer<float> maxIndices;
 
 [shader("compute")] [numthreads(16, 16, 1)]
 void maxpool2d(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID) {
@@ -54,5 +54,5 @@ void maxpool2d(uint3 tid : SV_DispatchThreadID, uint3 gid : SV_GroupID) {
 
     uint out_idx = nc * (pc.H_out * pc.W_out) + oh * pc.W_out + ow;
     dataOut[out_idx] = max_val;
-    maxIndices[out_idx] = max_idx;
+    maxIndices[out_idx] = asfloat(max_idx);
 }

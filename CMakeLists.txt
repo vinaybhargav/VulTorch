@@ -98,11 +98,20 @@ set(SLANG_KERNELS
     softmax:softmax
     softmax_cross_entropy:softmax_cross_entropy
     layernorm:layernorm
+    layernorm:layernorm_backward_dx
+    layernorm:rmsnorm
+    layernorm:rmsnorm_backward_dx
     conv2d:conv2d
     conv2d_backward:conv2d_backward_input
     conv2d_backward:conv2d_backward_weight
     maxpool2d:maxpool2d
     maxpool2d_backward:maxpool2d_backward
+    avgpool2d:avgpool2d
+    avgpool2d:avgpool2d_backward
+    embedding:embedding_forward
+    embedding:embedding_backward
+    random:philox_rng
+    sgd:sgd_step
 )
 
 set(SPV_OUTPUTS)

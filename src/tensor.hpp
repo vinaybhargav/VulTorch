@@ -7,6 +7,8 @@
 #include <memory>
 #include <string>
 #include <cstdint>
+#include <tuple>
+#include <utility>
 
 namespace vultorch {
 
@@ -50,6 +52,15 @@ public:
                     const std::shared_ptr<NativeTensor>& exp_avg_sq,
                     float lr, float beta1, float beta2, float eps,
                     float weight_decay, bool decoupled, int64_t step);
+
+    void sgd_step_(const std::shared_ptr<NativeTensor>& grad,
+                   const std::shared_ptr<NativeTensor>& momentum_buf,
+                   float lr, float momentum, float dampening,
+                   float weight_decay, bool nesterov, bool first_step);
+
+    void random_philox_(uint32_t mode, float p1, float p2,
+                        uint64_t seed, uint32_t offset,
+                        const std::shared_ptr<NativeTensor>& src = nullptr);
 
     // Materialises a strided view into a new contiguous tensor. `src_strides`
     // are the source strides expressed in the output's coordinate order, which
@@ -97,7 +108,35 @@ public:
     std::shared_ptr<NativeTensor> conv2d_backward_weight(std::shared_ptr<NativeTensor> input,
                                                          const std::vector<int64_t>& weight_shape,
                                                          uint32_t stride_h, uint32_t stride_w, uint32_t pad_h, uint32_t pad_w);
-    std::shared_ptr<NativeTensor> layernorm(std::shared_ptr<NativeTensor> gamma, std::shared_ptr<NativeTensor> beta, float eps);
+    std::shared_ptr<NativeTensor> layernorm(std::shared_ptr<NativeTensor> gamma, std::shared_ptr<NativeTensor> beta, float eps, uint32_t norm_dims = 1);
+    std::tuple<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    layernorm_backward(std::shared_ptr<NativeTensor> grad_out, std::shared_ptr<NativeTensor> gamma,
+                       float eps, uint32_t norm_dims, bool need_dx, bool need_dgamma, bool need_dbeta);
+
+    std::shared_ptr<NativeTensor> rmsnorm(std::shared_ptr<NativeTensor> gamma, float eps, uint32_t norm_dims = 1);
+    std::pair<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    rmsnorm_backward(std::shared_ptr<NativeTensor> grad_out, std::shared_ptr<NativeTensor> gamma,
+                     float eps, uint32_t norm_dims, bool need_dx, bool need_dgamma);
+
+    std::pair<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    maxpool2d(uint32_t kH, uint32_t kW, uint32_t stride_h, uint32_t stride_w, uint32_t pad_h, uint32_t pad_w);
+    std::shared_ptr<NativeTensor> maxpool2d_backward(std::shared_ptr<NativeTensor> indices,
+                                                     const std::vector<int64_t>& in_shape,
+                                                     uint32_t kH, uint32_t kW,
+                                                     uint32_t stride_h, uint32_t stride_w,
+                                                     uint32_t pad_h, uint32_t pad_w);
+
+    std::shared_ptr<NativeTensor> avgpool2d(uint32_t kH, uint32_t kW, uint32_t stride_h, uint32_t stride_w,
+                                            uint32_t pad_h, uint32_t pad_w, bool count_include_pad = true,
+                                            bool is_adaptive = false, uint32_t out_h = 0, uint32_t out_w = 0);
+    std::shared_ptr<NativeTensor> avgpool2d_backward(const std::vector<int64_t>& in_shape,
+                                                     uint32_t kH, uint32_t kW, uint32_t stride_h, uint32_t stride_w,
+                                                     uint32_t pad_h, uint32_t pad_w, bool count_include_pad = true,
+                                                     bool is_adaptive = false);
+
+    std::shared_ptr<NativeTensor> embedding(std::shared_ptr<NativeTensor> weight, int64_t padding_idx = -1);
+    std::shared_ptr<NativeTensor> embedding_backward(std::shared_ptr<NativeTensor> indices,
+                                                     int64_t num_embeddings, int64_t padding_idx = -1);
 };
 
 } // namespace vultorch

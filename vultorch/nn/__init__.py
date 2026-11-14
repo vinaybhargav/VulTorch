@@ -151,12 +151,12 @@ class Linear(Module):
 
         # Kaiming uniform initialization
         bound = 1.0 / math.sqrt(in_features)
-        w_data = np.random.uniform(-bound, bound, (out_features, in_features)).astype(np.float32)
-        self.weight = Parameter(vultorch.tensor(w_data, device=device), requires_grad=True)
+        w = vultorch.empty((out_features, in_features), device=device).uniform_(-bound, bound)
+        self.weight = Parameter(w, requires_grad=True)
 
         if bias:
-            b_data = np.random.uniform(-bound, bound, (out_features,)).astype(np.float32)
-            self.bias = Parameter(vultorch.tensor(b_data, device=device), requires_grad=True)
+            b = vultorch.empty((out_features,), device=device).uniform_(-bound, bound)
+            self.bias = Parameter(b, requires_grad=True)
         else:
             self.bias = None
 
@@ -237,12 +237,12 @@ class Conv2d(Module):
 
         # Kaiming init
         k = 1.0 / math.sqrt(in_channels * self.kH * self.kW)
-        w_data = np.random.uniform(-k, k, (out_channels, in_channels, self.kH, self.kW)).astype(np.float32)
-        self.weight = Parameter(vultorch.tensor(w_data, device=device), requires_grad=True)
+        w = vultorch.empty((out_channels, in_channels, self.kH, self.kW), device=device).uniform_(-k, k)
+        self.weight = Parameter(w, requires_grad=True)
 
         if bias:
-            b_data = np.random.uniform(-k, k, (out_channels,)).astype(np.float32)
-            self.bias = Parameter(vultorch.tensor(b_data, device=device), requires_grad=True)
+            b = vultorch.empty((out_channels,), device=device).uniform_(-k, k)
+            self.bias = Parameter(b, requires_grad=True)
         else:
             self.bias = None
 
@@ -295,47 +295,98 @@ class MaxPool2d(Module):
         self.pad_h, self.pad_w = (padding, padding) if isinstance(padding, int) else padding
 
     def forward(self, x: Tensor) -> Tensor:
-        # Spatial pooling forward
-        N, C, H, W = x.shape
-        out_h = (H + 2 * self.pad_h - self.kH) // self.stride_h + 1
-        out_w = (W + 2 * self.pad_w - self.kW) // self.stride_w + 1
-
-        x_np = x.numpy()
-        out_np = np.zeros((N, C, out_h, out_w), dtype=np.float32)
-
-        for oh in range(out_h):
-            for ow in range(out_w):
-                ih_start = oh * self.stride_h - self.pad_h
-                iw_start = ow * self.stride_w - self.pad_w
-                ih_end = min(ih_start + self.kH, H)
-                iw_end = min(iw_start + self.kW, W)
-                ih_start = max(ih_start, 0)
-                iw_start = max(iw_start, 0)
-                window = x_np[:, :, ih_start:ih_end, iw_start:iw_end]
-                out_np[:, :, oh, ow] = np.max(window, axis=(2, 3))
-
-        out = Tensor(out_np, device=x.device, requires_grad=x.requires_grad)
-        if is_grad_enabled() and x.requires_grad:
+        out_native, idx_native = x._native.maxpool2d(
+            self.kH, self.kW, self.stride_h, self.stride_w, self.pad_h, self.pad_w
+        )
+        req_grad = x.requires_grad and is_grad_enabled()
+        out = Tensor(out_native, device=x.device, requires_grad=req_grad)
+        if req_grad:
             out.is_leaf = False
+            in_shape = list(x.shape)
+            kH, kW = self.kH, self.kW
+            sh, sw = self.stride_h, self.stride_w
+            ph, pw = self.pad_h, self.pad_w
+            dev = x.device
+
             def pool_backward(grad_out: Tensor):
-                g_in = np.zeros_like(x_np)
-                g_out_np = grad_out.numpy()
-                for oh in range(out_h):
-                    for ow in range(out_w):
-                        ih_start = oh * self.stride_h - self.pad_h
-                        iw_start = ow * self.stride_w - self.pad_w
-                        ih_end = min(ih_start + self.kH, H)
-                        iw_end = min(iw_start + self.kW, W)
-                        ih_start = max(ih_start, 0)
-                        iw_start = max(iw_start, 0)
-                        window = x_np[:, :, ih_start:ih_end, iw_start:iw_end]
-                        max_mask = (window == np.max(window, axis=(2, 3), keepdims=True))
-                        g_in[:, :, ih_start:ih_end, iw_start:iw_end] += (
-                            max_mask * g_out_np[:, :, oh:oh+1, ow:ow+1]
-                        )
-                return Tensor(g_in, device=x.device)
+                gin_native = grad_out.contiguous()._native.maxpool2d_backward(
+                    idx_native, in_shape, kH, kW, sh, sw, ph, pw
+                )
+                return Tensor(gin_native, device=dev)
+
             out.grad_fn = Node("MaxPool2dBackward", pool_backward, [x])
         return out
+
+class AvgPool2d(Module):
+    def __init__(self, kernel_size: Union[int, Tuple[int, int]],
+                 stride: Optional[Union[int, Tuple[int, int]]] = None,
+                 padding: Union[int, Tuple[int, int]] = 0,
+                 count_include_pad: bool = True):
+        super().__init__()
+        self.kH, self.kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        stride = stride if stride is not None else kernel_size
+        self.stride_h, self.stride_w = (stride, stride) if isinstance(stride, int) else stride
+        self.pad_h, self.pad_w = (padding, padding) if isinstance(padding, int) else padding
+        self.count_include_pad = count_include_pad
+
+    def forward(self, x: Tensor) -> Tensor:
+        out_native = x._native.avgpool2d(
+            self.kH, self.kW, self.stride_h, self.stride_w,
+            self.pad_h, self.pad_w, self.count_include_pad, False, 0, 0
+        )
+        req_grad = x.requires_grad and is_grad_enabled()
+        out = Tensor(out_native, device=x.device, requires_grad=req_grad)
+        if req_grad:
+            out.is_leaf = False
+            in_shape = list(x.shape)
+            kH, kW = self.kH, self.kW
+            sh, sw = self.stride_h, self.stride_w
+            ph, pw = self.pad_h, self.pad_w
+            cip = self.count_include_pad
+            dev = x.device
+
+            def avgpool_backward(grad_out: Tensor):
+                gin = grad_out.contiguous()._native.avgpool2d_backward(
+                    in_shape, kH, kW, sh, sw, ph, pw, cip, False
+                )
+                return Tensor(gin, device=dev)
+
+            out.grad_fn = Node("AvgPool2dBackward", avgpool_backward, [x])
+        return out
+
+class AdaptiveAvgPool2d(Module):
+    def __init__(self, output_size: Union[int, Tuple[int, int]]):
+        super().__init__()
+        self.out_h, self.out_w = (output_size, output_size) if isinstance(output_size, int) else output_size
+
+    def forward(self, x: Tensor) -> Tensor:
+        out_native = x._native.avgpool2d(
+            1, 1, 1, 1, 0, 0, False, True, self.out_h, self.out_w
+        )
+        req_grad = x.requires_grad and is_grad_enabled()
+        out = Tensor(out_native, device=x.device, requires_grad=req_grad)
+        if req_grad:
+            out.is_leaf = False
+            in_shape = list(x.shape)
+            dev = x.device
+
+            def adaptive_avgpool_backward(grad_out: Tensor):
+                gin = grad_out.contiguous()._native.avgpool2d_backward(
+                    in_shape, 1, 1, 1, 1, 0, 0, False, True
+                )
+                return Tensor(gin, device=dev)
+
+            out.grad_fn = Node("AdaptiveAvgPool2dBackward", adaptive_avgpool_backward, [x])
+        return out
+
+class Flatten(Module):
+    def __init__(self, start_dim: int = 1, end_dim: int = -1):
+        super().__init__()
+        self.start_dim = start_dim
+        self.end_dim = end_dim
+
+    def forward(self, x: Tensor) -> Tensor:
+        return x.flatten(self.start_dim, self.end_dim)
 
 class LayerNorm(Module):
     def __init__(self, normalized_shape: Union[int, List[int]], eps: float = 1e-5, elementwise_affine: bool = True, device="vk"):
@@ -352,14 +403,15 @@ class LayerNorm(Module):
             self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:
-        if x.ndim < len(self.normalized_shape):
+        ndim_norm = len(self.normalized_shape)
+        if x.ndim < ndim_norm:
             raise ValueError(
-                f"LayerNorm expected at least {len(self.normalized_shape)} dims, got {x.ndim}"
+                f"LayerNorm expected at least {ndim_norm} dims, got {x.ndim}"
             )
 
         g_native = self.weight._native if self.weight is not None else None
         b_native = self.bias._native if self.bias is not None else None
-        native_out = x._native.layernorm(g_native, b_native, self.eps)
+        native_out = x._native.layernorm(g_native, b_native, self.eps, ndim_norm)
 
         req_grad = (
             x.requires_grad
@@ -372,35 +424,22 @@ class LayerNorm(Module):
             return out
 
         out.is_leaf = False
-        ndim_norm = len(self.normalized_shape)
-        dims = tuple(range(x.ndim - ndim_norm, x.ndim))
-        outer_dims = tuple(range(0, x.ndim - ndim_norm))
-        D = 1
-        for d in self.normalized_shape:
-            D *= d
         eps = self.eps
         weight, bias = self.weight, self.bias
+        dev = x.device
 
         def layernorm_backward(g: Tensor):
-            # Analytic backward. Statistics are recomputed here rather than
-            # cached, so the forward pass stays a single dispatch.
-            mean = x.mean(dim=dims, keepdim=True)
-            var = ((x - mean) ** 2).mean(dim=dims, keepdim=True)
-            std = (var + eps).sqrt()
-            xhat = (x - mean) / std
-
-            gy = g * weight if weight is not None else g
-            sum_gy = gy.sum(dim=dims, keepdim=True)
-            sum_gy_xhat = (gy * xhat).sum(dim=dims, keepdim=True)
-
-            inv_d = 1.0 / D
-            dx = (gy - sum_gy * inv_d - xhat * sum_gy_xhat * inv_d) / std
-
-            grads = [dx if x.requires_grad else None]
+            need_dx = x.requires_grad
+            need_dg = weight is not None and weight.requires_grad
+            need_db = bias is not None and bias.requires_grad
+            dx_nat, dg_nat, db_nat = x._native.layernorm_backward(
+                g.contiguous()._native, g_native, eps, ndim_norm, need_dx, need_dg, need_db
+            )
+            grads = [Tensor(dx_nat, device=dev) if dx_nat is not None else None]
             if weight is not None:
-                grads.append(((g * xhat).sum(dim=outer_dims)) if weight.requires_grad else None)
+                grads.append(Tensor(dg_nat, device=dev) if dg_nat is not None else None)
             if bias is not None:
-                grads.append((g.sum(dim=outer_dims)) if bias.requires_grad else None)
+                grads.append(Tensor(db_nat, device=dev) if db_nat is not None else None)
             return tuple(grads)
 
         inputs = [x]
@@ -411,36 +450,129 @@ class LayerNorm(Module):
         out.grad_fn = Node("LayerNormBackward", layernorm_backward, inputs)
         return out
 
+class RMSNorm(Module):
+    def __init__(self, normalized_shape: Union[int, List[int]], eps: float = 1e-6, elementwise_affine: bool = True, device="vk"):
+        super().__init__()
+        self.normalized_shape = (normalized_shape,) if isinstance(normalized_shape, int) else tuple(normalized_shape)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+
+        if elementwise_affine:
+            self.weight = Parameter(vultorch.ones(self.normalized_shape, device=device), requires_grad=True)
+        else:
+            self.weight = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        ndim_norm = len(self.normalized_shape)
+        if x.ndim < ndim_norm:
+            raise ValueError(
+                f"RMSNorm expected at least {ndim_norm} dims, got {x.ndim}"
+            )
+
+        g_native = self.weight._native if self.weight is not None else None
+        native_out = x._native.rmsnorm(g_native, self.eps, ndim_norm)
+
+        req_grad = (
+            x.requires_grad or (self.weight is not None and self.weight.requires_grad)
+        ) and is_grad_enabled()
+
+        out = Tensor(native_out, device=x.device, requires_grad=req_grad)
+        if not req_grad:
+            return out
+
+        out.is_leaf = False
+        eps = self.eps
+        weight = self.weight
+        dev = x.device
+
+        def rmsnorm_backward(g: Tensor):
+            need_dx = x.requires_grad
+            need_dg = weight is not None and weight.requires_grad
+            dx_nat, dg_nat = x._native.rmsnorm_backward(
+                g.contiguous()._native, g_native, eps, ndim_norm, need_dx, need_dg
+            )
+            grads = [Tensor(dx_nat, device=dev) if dx_nat is not None else None]
+            if weight is not None:
+                grads.append(Tensor(dg_nat, device=dev) if dg_nat is not None else None)
+            return tuple(grads)
+
+        inputs = [x]
+        if self.weight is not None:
+            inputs.append(self.weight)
+        out.grad_fn = Node("RMSNormBackward", rmsnorm_backward, inputs)
+        return out
+
 class Dropout(Module):
     def __init__(self, p: float = 0.5):
         super().__init__()
-        self.p = p
+        if not (0.0 <= p < 1.0):
+            raise ValueError(f"Dropout probability must be in [0, 1), got {p}")
+        self.p = float(p)
 
     def forward(self, x: Tensor) -> Tensor:
         if not self.training or self.p == 0.0:
             return x
-        mask_np = (np.random.rand(*x.shape) > self.p).astype(np.float32) / (1.0 - self.p)
-        mask = Tensor(mask_np, device=x.device)
-        return x * mask
+
+        seed, offset = vultorch._next_philox_state()
+        inv_keep = 1.0 / (1.0 - self.p)
+        req_grad = x.requires_grad and is_grad_enabled()
+
+        out = vultorch.empty(x.shape, device=x.device, requires_grad=req_grad)
+        out._native.random_philox_(2, self.p, inv_keep, seed, offset, x.contiguous()._native)
+
+        if req_grad:
+            out.is_leaf = False
+            p_val = self.p
+            dev = x.device
+
+            def dropout_backward(g: Tensor):
+                gin = vultorch.empty(g.shape, device=dev)
+                gin._native.random_philox_(2, p_val, inv_keep, seed, offset, g.contiguous()._native)
+                return gin
+
+            out.grad_fn = Node("DropoutBackward", dropout_backward, [x])
+        return out
 
 class Embedding(Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int, device="vk"):
+    def __init__(self, num_embeddings: int, embedding_dim: int,
+                 padding_idx: Optional[int] = None, device="vk"):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
-        w_data = np.random.randn(num_embeddings, embedding_dim).astype(np.float32)
-        self.weight = Parameter(vultorch.tensor(w_data, device=device), requires_grad=True)
+        self.padding_idx = -1 if padding_idx is None else int(padding_idx)
+        self.weight = Parameter(
+            vultorch.randn(num_embeddings, embedding_dim, device=device),
+            requires_grad=True,
+        )
+        if padding_idx is not None and 0 <= self.padding_idx < num_embeddings:
+            with no_grad():
+                p_idx = self.padding_idx
+                zero_row = vultorch.zeros((1, embedding_dim), device=device)
+                parts = []
+                if p_idx > 0:
+                    parts.append(self.weight[:p_idx])
+                parts.append(zero_row)
+                if p_idx + 1 < num_embeddings:
+                    parts.append(self.weight[p_idx + 1:])
+                self.weight.copy_(vultorch.cat(parts, dim=0, device=device))
 
     def forward(self, indices: Tensor) -> Tensor:
-        idx_np = indices.numpy().astype(int)
-        out_np = self.weight.numpy()[idx_np]
-        out = Tensor(out_np, device=indices.device, requires_grad=self.weight.requires_grad)
-        if is_grad_enabled() and self.weight.requires_grad:
+        if indices.device != self.weight.device:
+            indices = indices.to(self.weight.device)
+        native_out = indices.contiguous()._native.embedding(self.weight._native, self.padding_idx)
+        req_grad = self.weight.requires_grad and is_grad_enabled()
+        out = Tensor(native_out, device=self.weight.device, requires_grad=req_grad)
+        if req_grad:
             out.is_leaf = False
+            idx_native = indices.contiguous()._native
+            num_emb = self.num_embeddings
+            pad_idx = self.padding_idx
+            dev = self.weight.device
+
             def emb_backward(g: Tensor):
-                grad_w = np.zeros_like(self.weight.numpy())
-                np.add.at(grad_w, idx_np, g.numpy())
-                return Tensor(grad_w, device=indices.device)
+                gw_native = g.contiguous()._native.embedding_backward(idx_native, num_emb, pad_idx)
+                return Tensor(gw_native, device=dev)
+
             out.grad_fn = Node("EmbeddingBackward", emb_backward, [self.weight])
         return out
 

@@ -13,7 +13,29 @@ from . import optim
 from . import utils
 from . import _vultorch_backend as _backend
 
+import threading
+
 __version__ = "0.1.0"
+
+_rng_lock = threading.Lock()
+_rng_seed: int = 0x5DEECE66D
+_rng_offset: int = 0
+
+def manual_seed(seed: int):
+    """Sets the global Philox PRNG seed and resets the counter offset."""
+    global _rng_seed, _rng_offset
+    with _rng_lock:
+        _rng_seed = int(seed) & 0xFFFFFFFFFFFFFFFF
+        _rng_offset = 0
+    np.random.seed(int(seed) & 0xFFFFFFFF)
+
+def _next_philox_state() -> Tuple[int, int]:
+    global _rng_offset
+    with _rng_lock:
+        seed = _rng_seed
+        off = _rng_offset
+        _rng_offset = (off + 1) & 0xFFFFFFFF
+        return seed, off
 
 def device(d: Union[str, Device]) -> Device:
     return Device(d)
@@ -21,17 +43,23 @@ def device(d: Union[str, Device]) -> Device:
 def tensor(data, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
     return Tensor(data, device=device, requires_grad=requires_grad)
 
-def zeros(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
+def empty(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
     if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
         shape = shape[0]
-    arr = np.zeros(shape, dtype=np.float32)
-    return Tensor(arr, device=device, requires_grad=requires_grad)
+    dev = Device(device)
+    dev_id = -1 if dev.type == "cpu" else dev.index
+    native = _backend.NativeTensor([int(d) for d in shape], dev_id)
+    return Tensor(native, device=dev, requires_grad=requires_grad)
+
+def zeros(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
+    t = empty(*shape, device=device, requires_grad=requires_grad)
+    t._native.zero_()
+    return t
 
 def ones(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
-    if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
-        shape = shape[0]
-    arr = np.ones(shape, dtype=np.float32)
-    return Tensor(arr, device=device, requires_grad=requires_grad)
+    t = empty(*shape, device=device, requires_grad=requires_grad)
+    t._native.fill_(1.0)
+    return t
 
 def zeros_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_grad: bool = False) -> Tensor:
     dev = device if device is not None else t.device
@@ -42,16 +70,16 @@ def ones_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_g
     return ones(t.shape, device=dev, requires_grad=requires_grad)
 
 def randn(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
-    if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
-        shape = shape[0]
-    arr = np.random.randn(*shape).astype(np.float32)
-    return Tensor(arr, device=device, requires_grad=requires_grad)
+    t = empty(*shape, device=device, requires_grad=requires_grad)
+    seed, offset = _next_philox_state()
+    t._native.random_philox_(1, 0.0, 1.0, seed, offset, None)
+    return t
 
 def rand(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
-    if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
-        shape = shape[0]
-    arr = np.random.rand(*shape).astype(np.float32)
-    return Tensor(arr, device=device, requires_grad=requires_grad)
+    t = empty(*shape, device=device, requires_grad=requires_grad)
+    seed, offset = _next_philox_state()
+    t._native.random_philox_(0, 0.0, 1.0, seed, offset, None)
+    return t
 
 def arange(start: float, end: Optional[float] = None, step: float = 1.0, device: Union[str, Device] = "vk") -> Tensor:
     if end is None:
@@ -148,8 +176,13 @@ class _VulkanInfo:
         return _backend.get_all_devices()
 
     @staticmethod
-    def synchronize(device_id: int = 0):
-        _backend.synchronize(device_id)
+    def synchronize(device_id: Union[int, str, Device] = 0):
+        if isinstance(device_id, (str, Device)):
+            dev = Device(device_id)
+            if dev.type == "cpu":
+                return
+            device_id = dev.index
+        _backend.synchronize(int(device_id))
 
     @staticmethod
     def synchronize_all():

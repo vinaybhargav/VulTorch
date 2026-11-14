@@ -135,6 +135,13 @@ PYBIND11_MODULE(_vultorch_backend, m) {
              py::arg("exp_avg_sq"), py::arg("lr"), py::arg("beta1"), py::arg("beta2"),
              py::arg("eps"), py::arg("weight_decay"), py::arg("decoupled"), py::arg("step"),
              py::call_guard<py::gil_scoped_release>())
+        .def("sgd_step_", &NativeTensor::sgd_step_, py::arg("grad"), py::arg("momentum_buf") = nullptr,
+             py::arg("lr"), py::arg("momentum") = 0.0f, py::arg("dampening") = 0.0f,
+             py::arg("weight_decay") = 0.0f, py::arg("nesterov") = false, py::arg("first_step") = false,
+             py::call_guard<py::gil_scoped_release>())
+        .def("random_philox_", &NativeTensor::random_philox_, py::arg("mode"), py::arg("p1"),
+             py::arg("p2"), py::arg("seed"), py::arg("offset"), py::arg("src") = nullptr,
+             py::call_guard<py::gil_scoped_release>())
         .def("binary_op", &NativeTensor::binary_op, py::arg("op_type"), py::arg("other"),
              py::call_guard<py::gil_scoped_release>())
         .def("binary_op_scalar", &NativeTensor::binary_op_scalar, py::arg("op_type"), py::arg("scalar_val"), py::arg("reverse") = false,
@@ -166,7 +173,44 @@ PYBIND11_MODULE(_vultorch_backend, m) {
         .def("conv2d_backward_weight", &NativeTensor::conv2d_backward_weight, py::arg("input"),
              py::arg("weight_shape"), py::arg("stride_h") = 1, py::arg("stride_w") = 1, py::arg("pad_h") = 0, py::arg("pad_w") = 0,
              py::call_guard<py::gil_scoped_release>())
-        .def("layernorm", &NativeTensor::layernorm, py::arg("gamma") = nullptr, py::arg("beta") = nullptr, py::arg("eps") = 1e-5f,
+        .def("layernorm", &NativeTensor::layernorm, py::arg("gamma") = nullptr, py::arg("beta") = nullptr,
+             py::arg("eps") = 1e-5f, py::arg("norm_dims") = 1,
+             py::call_guard<py::gil_scoped_release>())
+        .def("layernorm_backward", &NativeTensor::layernorm_backward, py::arg("grad_out"),
+             py::arg("gamma") = nullptr, py::arg("eps") = 1e-5f, py::arg("norm_dims") = 1,
+             py::arg("need_dx") = true, py::arg("need_dgamma") = true, py::arg("need_dbeta") = true,
+             py::call_guard<py::gil_scoped_release>())
+        .def("rmsnorm", &NativeTensor::rmsnorm, py::arg("gamma") = nullptr,
+             py::arg("eps") = 1e-6f, py::arg("norm_dims") = 1,
+             py::call_guard<py::gil_scoped_release>())
+        .def("rmsnorm_backward", &NativeTensor::rmsnorm_backward, py::arg("grad_out"),
+             py::arg("gamma") = nullptr, py::arg("eps") = 1e-6f, py::arg("norm_dims") = 1,
+             py::arg("need_dx") = true, py::arg("need_dgamma") = true,
+             py::call_guard<py::gil_scoped_release>())
+        .def("maxpool2d", &NativeTensor::maxpool2d,
+             py::arg("kH"), py::arg("kW"), py::arg("stride_h"), py::arg("stride_w"),
+             py::arg("pad_h") = 0, py::arg("pad_w") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("maxpool2d_backward", &NativeTensor::maxpool2d_backward,
+             py::arg("indices"), py::arg("in_shape"),
+             py::arg("kH"), py::arg("kW"), py::arg("stride_h"), py::arg("stride_w"),
+             py::arg("pad_h") = 0, py::arg("pad_w") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("avgpool2d", &NativeTensor::avgpool2d,
+             py::arg("kH"), py::arg("kW"), py::arg("stride_h"), py::arg("stride_w"),
+             py::arg("pad_h") = 0, py::arg("pad_w") = 0, py::arg("count_include_pad") = true,
+             py::arg("is_adaptive") = false, py::arg("out_h") = 0, py::arg("out_w") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("avgpool2d_backward", &NativeTensor::avgpool2d_backward,
+             py::arg("in_shape"),
+             py::arg("kH"), py::arg("kW"), py::arg("stride_h"), py::arg("stride_w"),
+             py::arg("pad_h") = 0, py::arg("pad_w") = 0, py::arg("count_include_pad") = true,
+             py::arg("is_adaptive") = false,
+             py::call_guard<py::gil_scoped_release>())
+        .def("embedding", &NativeTensor::embedding, py::arg("weight"), py::arg("padding_idx") = -1,
+             py::call_guard<py::gil_scoped_release>())
+        .def("embedding_backward", &NativeTensor::embedding_backward,
+             py::arg("indices"), py::arg("num_embeddings"), py::arg("padding_idx") = -1,
              py::call_guard<py::gil_scoped_release>())
         .def("to_numpy", [](std::shared_ptr<NativeTensor> self) -> py::array_t<float> {
             std::vector<ssize_t> py_shape(self->shape.begin(), self->shape.end());
