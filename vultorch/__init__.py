@@ -71,25 +71,37 @@ def eye(n: int, m: Optional[int] = None, device: Union[str, Device] = "vk") -> T
 def matmul(a: Tensor, b: Tensor) -> Tensor:
     return a @ b
 
-def cat(tensors: List[Tensor], dim: int = 0) -> Tensor:
+def cat(tensors: List[Tensor], dim: int = 0, device: Optional[Union[str, Device]] = None) -> Tensor:
     if not tensors:
         raise ValueError("cat expects a non-empty list of tensors")
-    dev = tensors[0].device
-    arrs = [t.numpy() for t in tensors]
-    res = np.concatenate(arrs, axis=dim)
-    req_grad = any(t.requires_grad for t in tensors)
-    out = Tensor(res, device=dev, requires_grad=req_grad)
+    dev = Device(device) if device is not None else tensors[0].device
+    ndim = tensors[0].ndim
+    norm_dim = dim if dim >= 0 else dim + ndim
+    req_grad = any(t.requires_grad for t in tensors) and is_grad_enabled()
 
-    if is_grad_enabled() and req_grad:
+    if norm_dim == 0 and ndim >= 1 and all(t._native.is_contiguous() for t in tensors):
+        target_dev_id = -1 if dev.type == "cpu" else dev.index
+        native_out = _backend.NativeTensor.cat_dim0([t._native for t in tensors], target_dev_id)
+        out = Tensor(native_out, device=dev, requires_grad=req_grad)
+    else:
+        arrs = [t.numpy() for t in tensors]
+        res = np.concatenate(arrs, axis=dim)
+        out = Tensor(res, device=dev, requires_grad=req_grad)
+
+    if req_grad:
         out.is_leaf = False
         split_sizes = [t.shape[dim] for t in tensors]
+        src_devices = [t.device for t in tensors]
         def cat_backward(grad_out: Tensor):
             grads = []
             curr = 0
-            for sz in split_sizes:
+            for sz, sdev in zip(split_sizes, src_devices):
                 idx = [slice(None)] * grad_out.ndim
                 idx[dim] = slice(curr, curr + sz)
-                grads.append(grad_out[tuple(idx)])
+                g_chunk = grad_out[tuple(idx)]
+                if g_chunk.device != sdev:
+                    g_chunk = g_chunk.to(sdev)
+                grads.append(g_chunk)
                 curr += sz
             return tuple(grads)
         from .autograd import Node
@@ -112,6 +124,8 @@ def load(f):
 
 # Vulkan System and Diagnostics
 class _VulkanInfo:
+    _tflops_cache: dict = {}
+
     @staticmethod
     def is_available() -> bool:
         return _backend.get_device_count() > 0
@@ -140,6 +154,94 @@ class _VulkanInfo:
     @staticmethod
     def synchronize_all():
         _backend.synchronize_all()
+
+    @classmethod
+    def get_device_tflops(cls, device_id: int = 0, n: int = 1024, force_recalibrate: bool = False) -> float:
+        """Measures and caches effective FP32 GEMM throughput (TFLOPS) for `vk:<device_id>`."""
+        key = (int(device_id), int(n))
+        if not force_recalibrate and key in cls._tflops_cache:
+            return cls._tflops_cache[key]
+
+        import time
+        dev_str = f"vk:{device_id}"
+        with no_grad():
+            a = ones((n, n), device=dev_str)
+            b = ones((n, n), device=dev_str)
+            # Warmup (includes kernel autotuning on first run)
+            for _ in range(2):
+                _ = a @ b
+            cls.synchronize(device_id)
+
+            reps = 3
+            t0 = time.perf_counter()
+            for _ in range(reps):
+                _ = a @ b
+            cls.synchronize(device_id)
+            elapsed = max(time.perf_counter() - t0, 1e-9)
+
+        flops = 2.0 * (n ** 3) * reps
+        tflops = (flops / elapsed) / 1e12
+        cls._tflops_cache[key] = tflops
+        return tflops
+
+    @classmethod
+    def compute_split_sizes(
+        cls,
+        batch_size: int,
+        device_ids: Optional[List[Union[str, Device]]] = None,
+        weights: Optional[List[float]] = None,
+        min_chunk: int = 1,
+    ) -> List[int]:
+        """Partitions `batch_size` across `device_ids` proportional to measured TFLOPS."""
+        if device_ids is None:
+            device_ids = [f"vk:{i}" for i in range(cls.device_count())]
+        n_devs = len(device_ids)
+        if n_devs == 0:
+            return []
+        if n_devs == 1 or batch_size <= 0:
+            return [batch_size] + [0] * (n_devs - 1)
+
+        if weights is None:
+            raw_weights = []
+            for d in device_ids:
+                dev_obj = d if isinstance(d, Device) else Device(d)
+                if dev_obj.type == "vk":
+                    raw_weights.append(max(cls.get_device_tflops(dev_obj.index), 1e-3))
+                else:
+                    raw_weights.append(0.05)
+        else:
+            raw_weights = [max(float(w), 0.0) for w in weights]
+
+        total_w = sum(raw_weights)
+        if total_w <= 0.0:
+            raw_weights = [1.0] * n_devs
+            total_w = float(n_devs)
+
+        norm_w = [w / total_w for w in raw_weights]
+        effective_min = min_chunk if batch_size >= n_devs * min_chunk else 0
+
+        sizes = [max(effective_min, int(batch_size * w)) for w in norm_w]
+        # Adjust remainder or excess according to fractional parts
+        diff = batch_size - sum(sizes)
+        if diff > 0:
+            fracs = sorted(
+                range(n_devs),
+                key=lambda i: (batch_size * norm_w[i]) - sizes[i],
+                reverse=True,
+            )
+            for i in range(diff):
+                sizes[fracs[i % n_devs]] += 1
+        elif diff < 0:
+            fracs = sorted(
+                range(n_devs),
+                key=lambda i: sizes[i] - effective_min,
+                reverse=True,
+            )
+            for idx in fracs:
+                while diff < 0 and sizes[idx] > effective_min:
+                    sizes[idx] -= 1
+                    diff += 1
+        return sizes
 
 vulkan = _VulkanInfo()
 

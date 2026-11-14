@@ -366,8 +366,11 @@ class Tensor:
         out = Tensor(native_out, device=self.device, requires_grad=self.requires_grad)
         if is_grad_enabled() and self.requires_grad:
             out.is_leaf = False
-            mask = Tensor((self.numpy() > 0).astype(np.float32), device=self.device)
-            out.grad_fn = Node("ReluBackward", lambda g: g * mask, [self])
+            out.grad_fn = Node(
+                "ReluBackward",
+                lambda g: Tensor(g._native.binary_op(10, self._native), device=self.device),
+                [self],
+            )
         return out
 
     def gelu(self) -> 'Tensor':
@@ -375,15 +378,11 @@ class Tensor:
         out = Tensor(native_out, device=self.device, requires_grad=self.requires_grad)
         if is_grad_enabled() and self.requires_grad:
             out.is_leaf = False
-            # d(gelu)/dx approx: 0.5 * (1 + tanh(...)) + 0.5 * x * sech^2(...) * ...
-            x_np = self.numpy()
-            c = np.sqrt(2 / np.pi)
-            inner = c * (x_np + 0.044715 * x_np**3)
-            tanh_inner = np.tanh(inner)
-            dtanh = (1.0 - tanh_inner**2) * c * (1.0 + 3.0 * 0.044715 * x_np**2)
-            grad_x = 0.5 * (1.0 + tanh_inner) + 0.5 * x_np * dtanh
-            grad_tensor = Tensor(grad_x.astype(np.float32), device=self.device)
-            out.grad_fn = Node("GeluBackward", lambda g: g * grad_tensor, [self])
+            out.grad_fn = Node(
+                "GeluBackward",
+                lambda g: Tensor(g._native.binary_op(11, self._native), device=self.device),
+                [self],
+            )
         return out
 
     def silu(self) -> 'Tensor':
@@ -391,9 +390,11 @@ class Tensor:
         out = Tensor(native_out, device=self.device, requires_grad=self.requires_grad)
         if is_grad_enabled() and self.requires_grad:
             out.is_leaf = False
-            sig = self.sigmoid()
-            grad_x = sig + self * sig * (1.0 - sig)
-            out.grad_fn = Node("SiluBackward", lambda g: g * grad_x, [self])
+            out.grad_fn = Node(
+                "SiluBackward",
+                lambda g: Tensor(g._native.binary_op(12, self._native), device=self.device),
+                [self],
+            )
         return out
 
     def sigmoid(self) -> 'Tensor':
@@ -651,6 +652,37 @@ class Tensor:
     # ------------------------------------------------------------------------
 
     def __getitem__(self, idx) -> 'Tensor':
+        # Fast GPU path for contiguous outer-dimension slicing `x[start:stop]`
+        if (
+            isinstance(idx, slice)
+            and (idx.step is None or idx.step == 1)
+            and self.ndim >= 1
+            and self._native.is_contiguous()
+        ):
+            start, stop, _ = idx.indices(self.shape[0])
+            if stop > start:
+                native_out = self._native.slice_dim0(start, stop)
+                req_grad = self.requires_grad and is_grad_enabled()
+                out = Tensor(native_out, device=self.device, requires_grad=req_grad)
+                if req_grad:
+                    out.is_leaf = False
+                    src_shape = self.shape
+                    dev = self.device
+
+                    def slice_backward(g: 'Tensor'):
+                        parts = []
+                        if start > 0:
+                            parts.append(Tensor(np.zeros((start,) + src_shape[1:], dtype=np.float32), device=dev))
+                        parts.append(g)
+                        if stop < src_shape[0]:
+                            parts.append(Tensor(np.zeros((src_shape[0] - stop,) + src_shape[1:], dtype=np.float32), device=dev))
+                        if len(parts) == 1:
+                            return parts[0]
+                        return Tensor(backend.NativeTensor.cat_dim0([p._native for p in parts], g._native.device_id), device=dev)
+
+                    out.grad_fn = Node("SliceBackward", slice_backward, [self])
+                return out
+
         arr = self.numpy()[idx]
         req_grad = self.requires_grad and is_grad_enabled()
         out = Tensor(arr, device=self.device, requires_grad=req_grad)

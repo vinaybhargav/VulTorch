@@ -23,6 +23,22 @@ float safe_pow_scalar(float a, float b) {
     return p;
 }
 
+static const float SQRT_2_OVER_PI = 0.7978845608;
+static const float GELU_COEFF = 0.044715;
+
+float gelu_grad_scalar(float g, float x) {
+    float x2 = x * x;
+    float inner = SQRT_2_OVER_PI * (x + GELU_COEFF * x2 * x);
+    float t = tanh(inner);
+    float dt = (1.0 - t * t) * SQRT_2_OVER_PI * (1.0 + (3.0 * GELU_COEFF) * x2);
+    return g * (0.5 * (1.0 + t) + 0.5 * x * dt);
+}
+
+float silu_grad_scalar(float g, float x) {
+    float s = 1.0 / (1.0 + exp(-x));
+    return g * s * (1.0 + x * (1.0 - s));
+}
+
 float apply_op_scalar(float a, float b, uint op) {
     switch (op) {
         case 0u: return a + b;
@@ -35,6 +51,9 @@ float apply_op_scalar(float a, float b, uint op) {
         case 7u: return (a > b) ? 1.0 : 0.0;
         case 8u: return (a < b) ? 1.0 : 0.0;
         case 9u: return (a == b) ? 1.0 : 0.0;
+        case 10u: return (b > 0.0) ? a : 0.0;
+        case 11u: return gelu_grad_scalar(a, b);
+        case 12u: return silu_grad_scalar(a, b);
         default: return a + b;
     }
 }

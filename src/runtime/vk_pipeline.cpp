@@ -47,8 +47,8 @@ VulkanPipelineManager::~VulkanPipelineManager() {
 }
 
 VulkanPipelineManager& VulkanPipelineManager::instance() {
-    static VulkanPipelineManager mgr;
-    return mgr;
+    static VulkanPipelineManager* mgr = new VulkanPipelineManager();
+    return *mgr;
 }
 
 void VulkanPipelineManager::set_shader_directory(const std::string& dir) {

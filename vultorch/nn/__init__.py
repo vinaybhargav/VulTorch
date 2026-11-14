@@ -10,7 +10,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import vultorch
 from ..tensor import Tensor, Device
-from ..autograd import is_grad_enabled, Node
+from ..autograd import is_grad_enabled, no_grad, Node
 
 class Parameter(Tensor):
     """A kind of Tensor that is to be considered a module parameter."""
@@ -565,62 +565,132 @@ class CrossEntropyLoss(Module):
 # ----------------------------------------------------------------------------
 class DataParallel(Module):
     """
-    Heterogeneous Multi-GPU DataParallel container.
-    Splits mini-batch chunks across multiple Vulkan devices (e.g. AMD 7900 XTX 'vk:0' + NVIDIA RTX 3080 'vk:1'),
-    computes concurrently on both GPUs, and merges outputs!
+    Heterogeneous Multi-GPU DataParallel container with TFLOPS-aware load balancing.
+    Splits mini-batch chunks across multiple Vulkan devices proportionally to each
+    GPU's measured FP32 GEMM throughput (or custom weights), computes concurrently
+    across all GPUs with the GIL released, and merges outputs and gradients.
     """
-    def __init__(self, module: Module, device_ids: Optional[List[str]] = None):
+    def __init__(
+        self,
+        module: Module,
+        device_ids: Optional[List[str]] = None,
+        balance: Union[bool, str] = "tflops",
+        device_weights: Optional[List[float]] = None,
+    ):
         super().__init__()
         if device_ids is None:
             count = vultorch.vulkan.device_count()
             device_ids = [f"vk:{i}" for i in range(count)]
         self.module = module
-        self.device_ids = device_ids
-        self.pool = ThreadPoolExecutor(max_workers=len(device_ids))
+        self.device_ids = [str(Device(d)) for d in device_ids]
+        self.balance = balance
+        self.device_weights = list(device_weights) if device_weights is not None else None
+        self.pool: Optional[ThreadPoolExecutor] = None
         self.replicas: Dict[str, Module] = {}
+        self.last_split_sizes: List[int] = []
+        self._replicas_synced: bool = False
+        self.sync_every_forward: bool = False
+
+    def _get_pool(self) -> ThreadPoolExecutor:
+        if self.pool is None:
+            self.pool = ThreadPoolExecutor(max_workers=max(1, len(self.device_ids)))
+        return self.pool
+
+    def __del__(self):
+        if getattr(self, "pool", None) is not None:
+            try:
+                self.pool.shutdown(wait=False)
+            except Exception:
+                pass
+
+    def get_split_sizes(self, batch_size: int) -> List[int]:
+        n_devs = len(self.device_ids)
+        if n_devs <= 1:
+            return [batch_size]
+        if self.device_weights is not None:
+            return vultorch.vulkan.compute_split_sizes(
+                batch_size, self.device_ids, weights=self.device_weights
+            )
+        if self.balance in (True, "tflops", "auto"):
+            return vultorch.vulkan.compute_split_sizes(batch_size, self.device_ids)
+        # Equal split fallback (balance=False or balance="equal")
+        equal_w = [1.0] * n_devs
+        return vultorch.vulkan.compute_split_sizes(batch_size, self.device_ids, weights=equal_w)
+
+    def sync_parameters(self):
+        """Copies master module parameters to all created replicas."""
+        master_params = list(self.module.named_parameters())
+        if not master_params:
+            return
+        master_dev = master_params[0][1].device
+        with no_grad():
+            for dev_id, replica in self.replicas.items():
+                if Device(dev_id) == master_dev or replica is self.module:
+                    continue
+                for (_, p_src), (_, p_dst) in zip(master_params, replica.named_parameters()):
+                    p_dst.copy_(p_src.to(dev_id))
+        self._replicas_synced = True
 
     def _get_replica(self, device: str) -> Module:
+        target_dev = Device(device)
+        master_params = list(self.module.named_parameters())
+        if master_params and master_params[0][1].device == target_dev:
+            self.replicas[device] = self.module
+            return self.module
+
         if device not in self.replicas:
             import copy
             replica = copy.deepcopy(self.module)
             replica.to(device)
             self.replicas[device] = replica
-        else:
-            # Sync parameters
+        elif self.sync_every_forward or not self._replicas_synced:
             replica = self.replicas[device]
-            for (name, p_src), (_, p_dst) in zip(self.module.named_parameters(), replica.named_parameters()):
-                p_dst.copy_(p_src.to(device))
+            with no_grad():
+                for (_, p_src), (_, p_dst) in zip(master_params, replica.named_parameters()):
+                    p_dst.copy_(p_src.to(device))
         return self.replicas[device]
 
     def forward(self, x: Tensor) -> Tensor:
         if len(self.device_ids) <= 1:
             return self.module(x)
 
-        # Split batch dimension
         batch_size = x.shape[0]
-        n_devs = len(self.device_ids)
-        chunk_size = (batch_size + n_devs - 1) // n_devs
+        split_sizes = self.get_split_sizes(batch_size)
+        self.last_split_sizes = split_sizes
 
         chunks = []
-        for i in range(n_devs):
-            start = i * chunk_size
-            end = min(start + chunk_size, batch_size)
-            if start < batch_size:
-                chunk = x[start:end].to(self.device_ids[i])
-                chunks.append((self.device_ids[i], chunk))
+        offset = 0
+        for dev_id, sz in zip(self.device_ids, split_sizes):
+            if sz > 0 and offset < batch_size:
+                end = min(offset + sz, batch_size)
+                chunks.append((dev_id, offset, end))
+                offset = end
 
-        def run_device(dev_id, chunk_x):
+        if len(chunks) == 1:
+            dev_id, start, end = chunks[0]
             rep = self._get_replica(dev_id)
-            return rep(chunk_x).to(x.device)
+            return rep(x.to(dev_id)).to(x.device)
 
-        futures = [self.pool.submit(run_device, dev, chunk) for dev, chunk in chunks]
+        # Ensure replicas are initialized (and synced if needed) before parallel dispatch
+        for dev_id, _, _ in chunks:
+            self._get_replica(dev_id)
+        self._replicas_synced = True
+
+        def run_device(dev_id, start, end):
+            rep = self.replicas[dev_id]
+            chunk_x = x[start:end].to(dev_id)
+            return rep(chunk_x)
+
+        pool = self._get_pool()
+        futures = [pool.submit(run_device, dev, s, e) for dev, s, e in chunks]
         results = [f.result() for f in futures]
-        return vultorch.cat(results, dim=0)
+        return vultorch.cat(results, dim=0, device=x.device)
 
     def zero_grad(self):
         self.module.zero_grad()
         for rep in self.replicas.values():
             rep.zero_grad()
+        self._replicas_synced = False
 
     def reduce_gradients(self):
         """

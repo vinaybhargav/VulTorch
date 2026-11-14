@@ -245,18 +245,52 @@ void VulkanMemoryManager::copy_device_to_host(uint32_t device_id, std::shared_pt
 }
 
 void VulkanMemoryManager::copy_buffer_to_buffer(uint32_t device_id, std::shared_ptr<VulkanBuffer> src,
-                                                std::shared_ptr<VulkanBuffer> dst, VkDeviceSize size_bytes) {
+                                                std::shared_ptr<VulkanBuffer> dst, VkDeviceSize size_bytes,
+                                                VkDeviceSize src_offset, VkDeviceSize dst_offset) {
     auto dev = VulkanManager::instance_ref().get_device(device_id);
-    dev->record_copy(src->buffer, dst->buffer, size_bytes);
+    dev->record_copy(src->buffer, dst->buffer, size_bytes, src_offset, dst_offset);
 }
 
 void VulkanMemoryManager::copy_cross_device(uint32_t src_device_id, std::shared_ptr<VulkanBuffer> src_buffer,
                                            uint32_t dst_device_id, std::shared_ptr<VulkanBuffer> dst_buffer,
-                                           VkDeviceSize size_bytes) {
-    // Stage from src device to host, then host to dst device
-    std::vector<uint8_t> staging_host(size_bytes);
-    copy_device_to_host(src_device_id, src_buffer, staging_host.data(), size_bytes);
-    copy_host_to_device(dst_device_id, staging_host.data(), dst_buffer, size_bytes);
+                                           VkDeviceSize size_bytes,
+                                           VkDeviceSize src_offset, VkDeviceSize dst_offset) {
+    if (size_bytes == 0) return;
+    if (src_device_id == dst_device_id) {
+        copy_buffer_to_buffer(src_device_id, src_buffer, dst_buffer, size_bytes, src_offset, dst_offset);
+        return;
+    }
+
+    auto src_dev = VulkanManager::instance_ref().get_device(src_device_id);
+    auto dst_dev = VulkanManager::instance_ref().get_device(dst_device_id);
+    auto src_staging = create_staging_buffer(src_device_id, size_bytes);
+    auto dst_staging = create_staging_buffer(dst_device_id, size_bytes);
+
+    const VkBuffer src_handle = src_buffer->buffer;
+    const VkBuffer src_stage_handle = src_staging->buffer;
+    src_dev->submit_transfer([&](VkCommandBuffer cmd) {
+        VkBufferCopy copy_region{};
+        copy_region.srcOffset = src_offset;
+        copy_region.dstOffset = 0;
+        copy_region.size = size_bytes;
+        vkCmdCopyBuffer(cmd, src_handle, src_stage_handle, 1, &copy_region);
+    });
+
+    void* src_mapped = src_staging->map();
+    src_staging->invalidate();
+    void* dst_mapped = dst_staging->map();
+    std::memcpy(dst_mapped, src_mapped, size_bytes);
+    dst_staging->flush();
+
+    const VkBuffer dst_stage_handle = dst_staging->buffer;
+    const VkBuffer dst_handle = dst_buffer->buffer;
+    dst_dev->submit_transfer([&](VkCommandBuffer cmd) {
+        VkBufferCopy copy_region{};
+        copy_region.srcOffset = 0;
+        copy_region.dstOffset = dst_offset;
+        copy_region.size = size_bytes;
+        vkCmdCopyBuffer(cmd, dst_stage_handle, dst_handle, 1, &copy_region);
+    });
 }
 
 } // namespace vultorch

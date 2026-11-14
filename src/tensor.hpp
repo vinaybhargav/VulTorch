@@ -65,6 +65,10 @@ public:
     // Copies from another tensor on the same device without a host round trip.
     void copy_from_native(const std::shared_ptr<NativeTensor>& src);
 
+    // Contiguous outer-dimension slice [start:end] and concatenation along dim 0.
+    std::shared_ptr<NativeTensor> slice_dim0(int64_t start, int64_t end) const;
+    static std::shared_ptr<NativeTensor> cat_dim0(const std::vector<std::shared_ptr<NativeTensor>>& tensors, int target_device_id);
+
     // High performance GPU Compute Operations
     std::shared_ptr<NativeTensor> binary_op(uint32_t op_type, std::shared_ptr<NativeTensor> other);
     std::shared_ptr<NativeTensor> binary_op_scalar(uint32_t op_type, float scalar_val, bool reverse = false);

@@ -264,15 +264,16 @@ void VulkanDeviceContext::add_compute_barrier(VkCommandBuffer cmd) {
                          0, 1, &mem_barrier, 0, nullptr, 0, nullptr);
 }
 
-void VulkanDeviceContext::record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize size_bytes) {
+void VulkanDeviceContext::record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize size_bytes,
+                                      VkDeviceSize src_offset, VkDeviceSize dst_offset) {
     std::lock_guard<std::mutex> lock(submit_mutex);
 
     open_batch_locked();
     VkCommandBuffer cmd = slots[static_cast<size_t>(open_slot)].cmd;
 
     VkBufferCopy copy_region{};
-    copy_region.srcOffset = 0;
-    copy_region.dstOffset = 0;
+    copy_region.srcOffset = src_offset;
+    copy_region.dstOffset = dst_offset;
     copy_region.size = size_bytes;
     vkCmdCopyBuffer(cmd, src, dst, 1, &copy_region);
 
@@ -491,8 +492,11 @@ VulkanManager::~VulkanManager() {
 }
 
 VulkanManager& VulkanManager::instance_ref() {
-    static VulkanManager manager;
-    return manager;
+    // Deliberately heap-allocated so C++ static exit order cannot race with
+    // NVIDIA/Intel driver internal static destructors at process exit.
+    // Cleanup is driven deterministically via Python's atexit hook.
+    static VulkanManager* manager = new VulkanManager();
+    return *manager;
 }
 
 uint32_t VulkanManager::get_device_count() {

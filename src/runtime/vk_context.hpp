@@ -126,7 +126,8 @@ public:
 
     // Records a device-to-device buffer copy into the open batch without
     // flushing or waiting on the host.
-    void record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize size_bytes);
+    void record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize size_bytes,
+                     VkDeviceSize src_offset = 0, VkDeviceSize dst_offset = 0);
 
     // Submits the open batch without waiting. Called automatically when a batch
     // fills or when anything needs to read results back.

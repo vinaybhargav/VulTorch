@@ -61,30 +61,31 @@ def bench_matmul(device: str, n: int = 1024, iters: int = 10) -> tuple:
     return ms, tflops
 
 
-def bench_two_device_concurrency(n: int = 1024, per_device: int = 10) -> tuple:
-    """Same work, run serialised vs overlapped.
+def bench_two_device_concurrency(n: int = 1024, total_ops: int = 22) -> tuple:
+    """Same total work, split across devices by TFLOPS, run serialised vs overlapped.
 
     Serial: drain device 0 before submitting anything to device 1.
-    Concurrent: submit to both, then wait once. A correct engine gives ~2x
-    because the two GPUs are independent.
+    Concurrent: submit to both, then wait once.
     """
     a0 = torch.randn(n, n, device="vk:0")
     b0 = torch.randn(n, n, device="vk:0")
     a1 = torch.randn(n, n, device="vk:1")
     b1 = torch.randn(n, n, device="vk:1")
 
+    ops0, ops1 = torch.vulkan.compute_split_sizes(total_ops, ["vk:0", "vk:1"], min_chunk=2)
+
     def serial():
-        for _ in range(per_device):
+        for _ in range(ops0):
             _ = a0 @ b0
         torch.vulkan.synchronize(0)
-        for _ in range(per_device):
+        for _ in range(ops1):
             _ = a1 @ b1
         torch.vulkan.synchronize(1)
 
     def concurrent():
-        for _ in range(per_device):
+        for _ in range(ops0):
             _ = a0 @ b0
-        for _ in range(per_device):
+        for _ in range(ops1):
             _ = a1 @ b1
         torch.vulkan.synchronize_all()
 
@@ -100,7 +101,7 @@ def bench_two_device_concurrency(n: int = 1024, per_device: int = 10) -> tuple:
     concurrent()
     t_concurrent = time.perf_counter() - start
 
-    return t_serial * 1e3, t_concurrent * 1e3, t_serial / t_concurrent
+    return t_serial * 1e3, t_concurrent * 1e3, t_serial / t_concurrent, (ops0, ops1)
 
 
 def bench_train_step(device: str, iters: int = 10, batch: int = 512) -> float:
@@ -149,8 +150,8 @@ def main() -> None:
         print(f"matmul {n}^3 fp32               : {ms:8.3f} ms  -> {tflops:6.2f} TFLOPS")
 
     if torch.vulkan.device_count() >= 2:
-        single, split, speedup = bench_two_device_concurrency()
-        print(f"2 devices, 2 matmuls serial    : {single:8.3f} ms")
+        single, split, speedup, (ops0, ops1) = bench_two_device_concurrency()
+        print(f"2 devices ({ops0}+{ops1} matmuls) serial : {single:8.3f} ms")
         print(f"2 devices, posted concurrently : {split:8.3f} ms  -> {speedup:4.2f}x")
 
     ms = bench_train_step(args.device)

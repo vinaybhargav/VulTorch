@@ -67,12 +67,14 @@ public:
                              void* host_ptr, VkDeviceSize size_bytes);
 
     void copy_buffer_to_buffer(uint32_t device_id, std::shared_ptr<VulkanBuffer> src,
-                               std::shared_ptr<VulkanBuffer> dst, VkDeviceSize size_bytes);
+                               std::shared_ptr<VulkanBuffer> dst, VkDeviceSize size_bytes,
+                               VkDeviceSize src_offset = 0, VkDeviceSize dst_offset = 0);
 
     // Cross-GPU copy between e.g. vk:0 and vk:1 (staged through the host).
     void copy_cross_device(uint32_t src_device_id, std::shared_ptr<VulkanBuffer> src_buffer,
                            uint32_t dst_device_id, std::shared_ptr<VulkanBuffer> dst_buffer,
-                           VkDeviceSize size_bytes);
+                           VkDeviceSize size_bytes,
+                           VkDeviceSize src_offset = 0, VkDeviceSize dst_offset = 0);
 
     // Diagnostics and tests.
     size_t pooled_buffer_count() const;

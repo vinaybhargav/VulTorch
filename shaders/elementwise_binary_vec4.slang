@@ -26,6 +26,22 @@ float4 safe_pow(float4 a, float4 b) {
     );
 }
 
+static const float SQRT_2_OVER_PI = 0.7978845608;
+static const float GELU_COEFF = 0.044715;
+
+float4 gelu_grad_vec4(float4 g, float4 x) {
+    float4 x2 = x * x;
+    float4 inner = SQRT_2_OVER_PI * (x + GELU_COEFF * x2 * x);
+    float4 t = tanh(inner);
+    float4 dt = (float4(1.0) - t * t) * SQRT_2_OVER_PI * (float4(1.0) + (3.0 * GELU_COEFF) * x2);
+    return g * (0.5 * (float4(1.0) + t) + 0.5 * x * dt);
+}
+
+float4 silu_grad_vec4(float4 g, float4 x) {
+    float4 s = float4(1.0) / (float4(1.0) + exp(-x));
+    return g * s * (float4(1.0) + x * (float4(1.0) - s));
+}
+
 float4 apply_op(float4 a, float4 b, uint op) {
     switch (op) {
         case 0u: return a + b;
@@ -38,6 +54,9 @@ float4 apply_op(float4 a, float4 b, uint op) {
         case 7u: return select(a > b, float4(1.0), float4(0.0));
         case 8u: return select(a < b, float4(1.0), float4(0.0));
         case 9u: return select(a == b, float4(1.0), float4(0.0));
+        case 10u: return select(b > float4(0.0), a, float4(0.0));
+        case 11u: return gelu_grad_vec4(a, b);
+        case 12u: return silu_grad_vec4(a, b);
         default: return a + b;
     }
 }

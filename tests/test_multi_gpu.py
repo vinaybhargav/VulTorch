@@ -45,3 +45,23 @@ def test_data_parallel_heterogeneous():
 
     assert out.shape == (16, 4)
     assert out.device == torch.device("vk:0")
+    assert sum(dp_model.last_split_sizes) == 16
+    assert all(s >= 1 for s in dp_model.last_split_sizes)
+
+    # Verify DataParallel output matches single-device reference
+    ref = model(x)
+    np.testing.assert_allclose(out.numpy(), ref.numpy(), rtol=1e-4, atol=1e-4)
+
+@pytest.mark.skipif(torch.vulkan.device_count() < 2, reason="Multi-GPU test requires at least 2 Vulkan devices")
+def test_tflops_load_balancer_weights():
+    t0 = torch.vulkan.get_device_tflops(0)
+    t1 = torch.vulkan.get_device_tflops(1)
+    assert t0 > 0.0 and t1 > 0.0
+
+    splits = torch.vulkan.compute_split_sizes(100, ["vk:0", "vk:1"])
+    assert sum(splits) == 100
+    # More capable GPU receives a strictly larger share of the batch
+    if t1 > t0:
+        assert splits[1] > splits[0]
+    elif t0 > t1:
+        assert splits[0] > splits[1]

@@ -183,6 +183,8 @@ MatmulChoice select_matmul_shader(uint32_t device_id, uint32_t M, uint32_t N, ui
 // and the shader paths use the same op numbering (see
 // shaders/elementwise_binary_broadcast.comp).
 inline float apply_binary_op(uint32_t op, float a, float b) {
+    constexpr float kSqrt2OverPi = 0.7978845608f;
+    constexpr float kGeluCoeff = 0.044715f;
     switch (op) {
         case 0: return a + b;
         case 1: return a - b;
@@ -194,6 +196,18 @@ inline float apply_binary_op(uint32_t op, float a, float b) {
         case 7: return (a > b) ? 1.0f : 0.0f;
         case 8: return (a < b) ? 1.0f : 0.0f;
         case 9: return (a == b) ? 1.0f : 0.0f;
+        case 10: return (b > 0.0f) ? a : 0.0f;
+        case 11: {
+            const float x2 = b * b;
+            const float inner = kSqrt2OverPi * (b + kGeluCoeff * x2 * b);
+            const float t = std::tanh(inner);
+            const float dt = (1.0f - t * t) * kSqrt2OverPi * (1.0f + 3.0f * kGeluCoeff * x2);
+            return a * (0.5f * (1.0f + t) + 0.5f * b * dt);
+        }
+        case 12: {
+            const float s = 1.0f / (1.0f + std::exp(-b));
+            return a * s * (1.0f + b * (1.0f - s));
+        }
         default:
             throw std::runtime_error("Unsupported binary op_type: " + std::to_string(op));
     }
@@ -397,6 +411,100 @@ void NativeTensor::copy_from_native(const std::shared_ptr<NativeTensor>& src) {
     } else {
         std::copy(src->cpu_data.begin(), src->cpu_data.begin() + numel, cpu_data.begin());
     }
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::slice_dim0(int64_t start, int64_t end) const {
+    if (shape.empty()) {
+        throw std::runtime_error("slice_dim0 requires at least 1D tensor");
+    }
+    if (!is_contiguous()) {
+        throw std::runtime_error("slice_dim0 requires a contiguous tensor");
+    }
+    const int64_t dim0 = shape[0];
+    if (start < 0) start += dim0;
+    if (end < 0) end += dim0;
+    start = std::max<int64_t>(0, std::min<int64_t>(start, dim0));
+    end = std::max<int64_t>(start, std::min<int64_t>(end, dim0));
+
+    std::vector<int64_t> out_shape = shape;
+    out_shape[0] = end - start;
+    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+    if (out->numel == 0) return out;
+
+    const size_t inner = strides[0];
+    const size_t offset_elems = static_cast<size_t>(start) * inner;
+    const size_t count_elems = out->numel;
+
+    if (device_id >= 0) {
+        VulkanMemoryManager::instance().copy_buffer_to_buffer(
+            device_id, gpu_buffer, out->gpu_buffer,
+            count_elems * sizeof(float),
+            offset_elems * sizeof(float), 0);
+    } else {
+        std::copy(cpu_data.begin() + offset_elems,
+                  cpu_data.begin() + offset_elems + count_elems,
+                  out->cpu_data.begin());
+    }
+    return out;
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::cat_dim0(
+    const std::vector<std::shared_ptr<NativeTensor>>& tensors, int target_device_id) {
+    if (tensors.empty()) {
+        throw std::runtime_error("cat_dim0 expects a non-empty list of tensors");
+    }
+    const auto& first = tensors.front();
+    if (first->shape.empty()) {
+        throw std::runtime_error("cat_dim0 requires at least 1D tensors");
+    }
+
+    int64_t total_dim0 = 0;
+    for (const auto& t : tensors) {
+        if (t->shape.size() != first->shape.size()) {
+            throw std::runtime_error("cat_dim0: rank mismatch");
+        }
+        for (size_t d = 1; d < first->shape.size(); ++d) {
+            if (t->shape[d] != first->shape[d]) {
+                throw std::runtime_error("cat_dim0: non-concat dimension mismatch");
+            }
+        }
+        if (!t->is_contiguous()) {
+            throw std::runtime_error("cat_dim0 requires contiguous tensors");
+        }
+        total_dim0 += t->shape[0];
+    }
+
+    std::vector<int64_t> out_shape = first->shape;
+    out_shape[0] = total_dim0;
+    auto out = std::make_shared<NativeTensor>(out_shape, target_device_id);
+
+    size_t offset_elems = 0;
+    for (const auto& t : tensors) {
+        if (t->numel == 0) continue;
+        const size_t bytes = t->numel * sizeof(float);
+        const size_t dst_off_bytes = offset_elems * sizeof(float);
+
+        if (target_device_id >= 0 && t->device_id >= 0) {
+            if (t->device_id == target_device_id) {
+                VulkanMemoryManager::instance().copy_buffer_to_buffer(
+                    target_device_id, t->gpu_buffer, out->gpu_buffer, bytes, 0, dst_off_bytes);
+            } else {
+                VulkanMemoryManager::instance().copy_cross_device(
+                    t->device_id, t->gpu_buffer, target_device_id, out->gpu_buffer, bytes, 0, dst_off_bytes);
+            }
+        } else if (target_device_id == -1 && t->device_id == -1) {
+            std::copy(t->cpu_data.begin(), t->cpu_data.end(), out->cpu_data.begin() + offset_elems);
+        } else if (target_device_id == -1 && t->device_id >= 0) {
+            t->copy_to_host(out->cpu_data.data() + offset_elems, t->numel);
+        } else {
+            // CPU -> GPU
+            auto stage_t = t->to_device(target_device_id);
+            VulkanMemoryManager::instance().copy_buffer_to_buffer(
+                target_device_id, stage_t->gpu_buffer, out->gpu_buffer, bytes, 0, dst_off_bytes);
+        }
+        offset_elems += t->numel;
+    }
+    return out;
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::from_float_array(const float* data, const std::vector<int64_t>& shape, int dev_id) {
