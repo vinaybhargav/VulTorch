@@ -8,6 +8,8 @@ import os
 import sys
 import time
 import struct
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import numpy as np
 import vultorch as torch
 import vultorch.nn as nn
@@ -36,8 +38,8 @@ class NeuralCompressor1M(nn.Module):
         logits = self.fc3(h2)
         return logits
 
-def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, device="vk:0"):
-    """Trains the 1M parameter model on text patterns using VulTorch on GPU."""
+def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, device="vk:0", devices=None):
+    """Trains the 1M parameter model on text patterns using VulTorch on GPU (supports multi-GPU DataParallel)."""
     K = 8
     padded = bytes([0] * K) + text_bytes
     N = len(text_bytes)
@@ -52,15 +54,35 @@ def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, de
     ctx_arr = np.array(contexts, dtype=np.int64)
     tgt_arr = np.array(targets, dtype=np.int64)
 
-    model = NeuralCompressor1M(context_len=K, device=device)
+    if devices is None:
+        dev_count = torch.vulkan.device_count()
+        if dev_count > 1:
+            devices = [f"vk:{i}" for i in range(dev_count)]
+        else:
+            devices = [device]
+
+    master_dev = devices[0]
+    model = NeuralCompressor1M(context_len=K, device=master_dev)
     total_params = sum(p.numel for p in model.parameters())
-    print(f"🔧 Neural Model Initialized: {total_params:,} parameters on {torch.vulkan.get_device_name(0)}")
+    use_multi_gpu = len(devices) > 1
+
+    if use_multi_gpu:
+        print(f"🔧 Neural Model Initialized: {total_params:,} parameters across {len(devices)} GPUs: {devices}")
+        for d in devices:
+            d_idx = int(d.split(":")[-1])
+            print(f"   - {d}: {torch.vulkan.get_device_name(d_idx)}")
+        parallel_model = nn.DataParallel(model, device_ids=devices)
+        parallel_model.sync_every_forward = True
+    else:
+        print(f"🔧 Neural Model Initialized: {total_params:,} parameters on {master_dev} ({torch.vulkan.get_device_name(int(master_dev.split(':')[-1]))})")
+        parallel_model = model
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
 
     num_batches = (N + batch_size - 1) // batch_size
-    print(f"🏋️  Training 1M parameter model on {N:,} bytes ({epochs} epochs, batch size {batch_size})...")
+    mode_str = f"Heterogeneous Multi-GPU ({', '.join(devices)})" if use_multi_gpu else f"Single GPU ({master_dev})"
+    print(f"🏋️  Training 1M parameter model on {N:,} bytes ({epochs} epochs, batch size {batch_size}, {mode_str})...")
 
     t0 = time.time()
     for ep in range(1, epochs + 1):
@@ -69,13 +91,20 @@ def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, de
 
         for b in range(num_batches):
             idx = perm[b * batch_size: min((b + 1) * batch_size, N)]
-            bx = torch.tensor(ctx_arr[idx], device=device)
-            by = torch.tensor(tgt_arr[idx], device=device)
+            bx = torch.tensor(ctx_arr[idx], device=master_dev)
+            by = torch.tensor(tgt_arr[idx], device=master_dev)
 
             optimizer.zero_grad()
-            logits = model(bx)
-            loss = criterion(logits, by)
-            loss.backward()
+            if use_multi_gpu:
+                parallel_model.zero_grad()
+                logits = parallel_model(bx)
+                loss = criterion(logits, by)
+                loss.backward()
+                parallel_model.reduce_gradients()
+            else:
+                logits = parallel_model(bx)
+                loss = criterion(logits, by)
+                loss.backward()
             optimizer.step()
 
             total_loss += loss.item() * len(idx)
@@ -85,7 +114,8 @@ def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, de
         if ep % 5 == 0 or ep == 1:
             print(f"   Epoch {ep:2d}/{epochs} | Loss: {avg_loss:.4f} nats | Shannon Entropy: {bpc:.2f} bits/byte")
 
-    print(f"✅ Training completed in {time.time() - t0:.2f}s on Vulkan GPU!")
+    torch.vulkan.synchronize_all()
+    print(f"✅ Training completed in {time.time() - t0:.2f}s on Vulkan GPU(s)!")
     return model
 
 def compress_file(model, data: bytes, batch_size=512, device="vk:0") -> bytes:

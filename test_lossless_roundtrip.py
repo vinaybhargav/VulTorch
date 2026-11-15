@@ -16,7 +16,7 @@ from examples.neural_text_compressor import (
     decompress_file
 )
 
-def verify_lossless_roundtrip(data: bytes, device: str = "vk:0"):
+def verify_lossless_roundtrip(data: bytes, device: str = "vk:0", devices=None):
     print("=" * 70)
     print("🔍 VulTorch Neural Compressor: Byte-for-Byte Lossless Verification")
     print("=" * 70)
@@ -25,14 +25,19 @@ def verify_lossless_roundtrip(data: bytes, device: str = "vk:0"):
     print(f"📄 Original Data Size:   {orig_len:,} bytes")
     print(f"🔑 Original SHA-256:     {orig_sha256}")
 
-    # 1. Train model on GPU 0 (AMD 7900 XTX via Vulkan)
-    print(f"\n1️⃣  Training 1M Parameter Model on GPU (vk:0)...")
-    model = train_codec_model(data, epochs=10, batch_size=256, lr=0.005, device="vk:0")
+    if devices is None:
+        count = torch.vulkan.device_count()
+        devices = [f"vk:{i}" for i in range(count)] if count > 1 else [device]
+
+    # 1. Train model on GPU(s) (Heterogeneous Multi-GPU DataParallel)
+    dev_str = f"Multi-GPU ({', '.join(devices)})" if len(devices) > 1 else f"Single GPU ({device})"
+    print(f"\n1️⃣  Training 1M Parameter Model on {dev_str}...")
+    model = train_codec_model(data, epochs=10, batch_size=256, lr=0.005, device=device, devices=devices)
 
     # 2. Compress
-    print(f"\n2️⃣  Compressing on GPU...")
+    print(f"\n2️⃣  Compressing on GPU ({device})...")
     t0 = time.time()
-    compressed = compress_file(model, data, device="vk:0")
+    compressed = compress_file(model, data, device=device)
     comp_time = time.time() - t0
 
     comp_len = len(compressed)

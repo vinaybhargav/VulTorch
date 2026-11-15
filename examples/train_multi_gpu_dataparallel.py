@@ -5,8 +5,12 @@ Concurrently trains a neural network across both AMD Radeon RX 7900 XTX (vk:0)
 and NVIDIA GeForce RTX 3080 (vk:1) in the exact same process!
 """
 
+import os
+import sys
 import numpy as np
 import time
+
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 import vultorch as torch
 import vultorch.nn as nn
 import vultorch.optim as optim
