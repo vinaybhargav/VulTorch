@@ -381,6 +381,115 @@ class Tensor:
             out.grad_fn = Node("SqrtBackward", lambda g: g / (2.0 * out), [self])
         return out
 
+    def rsqrt(self) -> 'Tensor':
+        native_out = self._native.unary_op(4)
+        out = Tensor(native_out, device=self.device, requires_grad=self.requires_grad)
+        if is_grad_enabled() and self.requires_grad:
+            out.is_leaf = False
+            out.grad_fn = Node("RsqrtBackward", lambda g: -0.5 * g * out * out * out, [self])
+        return out
+
+    def abs(self) -> 'Tensor':
+        native_out = self._native.unary_op(5)
+        out = Tensor(native_out, device=self.device, requires_grad=self.requires_grad)
+        if is_grad_enabled() and self.requires_grad:
+            out.is_leaf = False
+            out.grad_fn = Node(
+                "AbsBackward",
+                lambda g: Tensor(g._native.binary_op(13, self._native), device=self.device),
+                [self],
+            )
+        return out
+
+    def __abs__(self) -> 'Tensor':
+        return self.abs()
+
+    def sign(self) -> 'Tensor':
+        native_out = self._native.unary_op(14)
+        return Tensor(native_out, device=self.device, requires_grad=False)
+
+    def sin(self) -> 'Tensor':
+        native_out = self._native.unary_op(6)
+        out = Tensor(native_out, device=self.device, requires_grad=self.requires_grad)
+        if is_grad_enabled() and self.requires_grad:
+            out.is_leaf = False
+            out.grad_fn = Node("SinBackward", lambda g: g * self.cos(), [self])
+        return out
+
+    def cos(self) -> 'Tensor':
+        native_out = self._native.unary_op(7)
+        out = Tensor(native_out, device=self.device, requires_grad=self.requires_grad)
+        if is_grad_enabled() and self.requires_grad:
+            out.is_leaf = False
+            out.grad_fn = Node("CosBackward", lambda g: -g * self.sin(), [self])
+        return out
+
+    def clamp(
+        self,
+        min: Optional[float] = None,
+        max: Optional[float] = None,
+    ) -> 'Tensor':
+        if min is None and max is None:
+            raise ValueError("clamp requires at least one of min or max to be specified")
+        lo = -3.402823466e+38 if min is None else float(min)
+        hi = 3.402823466e+38 if max is None else float(max)
+        native_out = self._native.unary_op(13, lo, hi)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor(native_out, device=self.device, requires_grad=req_grad)
+        if req_grad:
+            out.is_leaf = False
+            dev = self.device
+            out_native = native_out
+            in_native = self._native
+
+            def clamp_backward(g: 'Tensor'):
+                # Mask is 1.0 where clamped output equals input (i.e. inside [min, max]), 0.0 where clamped
+                mask_native = in_native.binary_op(14, out_native)
+                return Tensor(g._native.binary_op(2, mask_native), device=dev)
+
+            out.grad_fn = Node("ClampBackward", clamp_backward, [self])
+        return out
+
+    def clip(
+        self,
+        min: Optional[float] = None,
+        max: Optional[float] = None,
+    ) -> 'Tensor':
+        return self.clamp(min=min, max=max)
+
+    def clamp_(
+        self,
+        min: Optional[float] = None,
+        max: Optional[float] = None,
+    ) -> 'Tensor':
+        clamped = self.clamp(min=min, max=max)
+        self._native.copy_from_native(clamped._native)
+        return self
+
+    def __gt__(self, other) -> 'Tensor':
+        if isinstance(other, (int, float)):
+            return Tensor(self._native.binary_op_scalar(7, float(other), False), device=self.device)
+        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        return Tensor(self._native.binary_op(7, other._native), device=self.device)
+
+    def __lt__(self, other) -> 'Tensor':
+        if isinstance(other, (int, float)):
+            return Tensor(self._native.binary_op_scalar(8, float(other), False), device=self.device)
+        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        return Tensor(self._native.binary_op(8, other._native), device=self.device)
+
+    def __ge__(self, other) -> 'Tensor':
+        if isinstance(other, (int, float)):
+            return Tensor(self._native.binary_op_scalar(15, float(other), False), device=self.device)
+        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        return Tensor(self._native.binary_op(15, other._native), device=self.device)
+
+    def __le__(self, other) -> 'Tensor':
+        if isinstance(other, (int, float)):
+            return Tensor(self._native.binary_op_scalar(16, float(other), False), device=self.device)
+        other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        return Tensor(self._native.binary_op(16, other._native), device=self.device)
+
     def relu(self) -> 'Tensor':
         native_out = self._native.unary_op(10)
         out = Tensor(native_out, device=self.device, requires_grad=self.requires_grad)

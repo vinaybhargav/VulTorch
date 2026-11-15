@@ -13,6 +13,7 @@ from . import optim
 from . import utils
 from . import _vultorch_backend as _backend
 
+import builtins as _builtins
 import threading
 
 __version__ = "0.1.0"
@@ -98,6 +99,70 @@ def eye(n: int, m: Optional[int] = None, device: Union[str, Device] = "vk") -> T
 
 def matmul(a: Tensor, b: Tensor) -> Tensor:
     return a @ b
+
+def abs(x: Tensor) -> Tensor:
+    return x.abs()
+
+def sign(x: Tensor) -> Tensor:
+    return x.sign()
+
+def exp(x: Tensor) -> Tensor:
+    return x.exp()
+
+def log(x: Tensor) -> Tensor:
+    return x.log()
+
+def sqrt(x: Tensor) -> Tensor:
+    return x.sqrt()
+
+def rsqrt(x: Tensor) -> Tensor:
+    return x.rsqrt()
+
+def sin(x: Tensor) -> Tensor:
+    return x.sin()
+
+def cos(x: Tensor) -> Tensor:
+    return x.cos()
+
+def tanh(x: Tensor) -> Tensor:
+    return x.tanh()
+
+def sigmoid(x: Tensor) -> Tensor:
+    return x.sigmoid()
+
+def relu(x: Tensor) -> Tensor:
+    return x.relu()
+
+def gelu(x: Tensor) -> Tensor:
+    return x.gelu()
+
+def silu(x: Tensor) -> Tensor:
+    return x.silu()
+
+def softmax(x: Tensor, dim: int = -1) -> Tensor:
+    return x.softmax(dim=dim)
+
+def log_softmax(x: Tensor, dim: int = -1) -> Tensor:
+    return x.log_softmax(dim=dim)
+
+def clamp(x: Tensor, min: Optional[float] = None, max: Optional[float] = None) -> Tensor:
+    return x.clamp(min=min, max=max)
+
+def clip(x: Tensor, min: Optional[float] = None, max: Optional[float] = None) -> Tensor:
+    return x.clamp(min=min, max=max)
+
+def sum(x: Tensor, dim: Optional[Union[int, Tuple[int, ...]]] = None, keepdim: bool = False) -> Tensor:
+    if not isinstance(x, Tensor):
+        return _builtins.sum(x)
+    return x.sum(dim=dim, keepdim=keepdim)
+
+def mean(x: Tensor, dim: Optional[Union[int, Tuple[int, ...]]] = None, keepdim: bool = False) -> Tensor:
+    return x.mean(dim=dim, keepdim=keepdim)
+
+def max(x: Tensor, dim: Optional[int] = None, keepdim: bool = False) -> Tensor:
+    if not isinstance(x, Tensor):
+        return _builtins.max(x, dim) if dim is not None else _builtins.max(x)
+    return x.max(dim=dim, keepdim=keepdim)
 
 def cat(tensors: List[Tensor], dim: int = 0, device: Optional[Union[str, Device]] = None) -> Tensor:
     if not tensors:

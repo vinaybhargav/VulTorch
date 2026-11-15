@@ -54,6 +54,10 @@ float apply_op_scalar(float a, float b, uint op) {
         case 10u: return (b > 0.0) ? a : 0.0;
         case 11u: return gelu_grad_scalar(a, b);
         case 12u: return silu_grad_scalar(a, b);
+        case 13u: return a * float(sign(b));
+        case 14u: return (a == b) ? 1.0 : 0.0;
+        case 15u: return (a >= b) ? 1.0 : 0.0;
+        case 16u: return (a <= b) ? 1.0 : 0.0;
         default: return a + b;
     }
 }

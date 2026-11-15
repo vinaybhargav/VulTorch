@@ -209,6 +209,10 @@ inline float apply_binary_op(uint32_t op, float a, float b) {
             const float s = 1.0f / (1.0f + std::exp(-b));
             return a * s * (1.0f + b * (1.0f - s));
         }
+        case 13: return (b > 0.0f) ? a : ((b < 0.0f) ? -a : 0.0f);
+        case 14: return (a == b) ? 1.0f : 0.0f;
+        case 15: return (a >= b) ? 1.0f : 0.0f;
+        case 16: return (a <= b) ? 1.0f : 0.0f;
         default:
             throw std::runtime_error("Unsupported binary op_type: " + std::to_string(op));
     }

@@ -331,3 +331,95 @@ def test_gpu_dropout_reconstructs_exact_mask_in_backward(device):
     drop.eval()
     y_eval = drop(x)
     np.testing.assert_allclose(y_eval.numpy(), x_np, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("device", DEVICES)
+def test_abs_softsign_and_clamp_gradcheck(device):
+    rng = np.random.default_rng(707)
+    # Avoid exact 0 for abs() finite differences and avoid exact clamp boundaries (-0.5, 0.5)
+    x_np = np.array([[-1.2, -0.8, -0.25, 0.15, 0.35, 0.9]], dtype=np.float32)
+
+    # 1. Algebraic softsign: x / (1 + x.abs())
+    assert gradcheck(
+        lambda t: (t / (1.0 + t.abs())).sum(),
+        x_np,
+        eps=1e-3,
+        rtol=1e-2,
+        atol=1e-2,
+        device=device,
+    )
+
+    # 2. Tensor.clamp(min, max), clamp(min=...), clamp(max=...), and vultorch.clamp
+    assert gradcheck(
+        lambda t: (vultorch.clamp(t, min=-0.5, max=0.5) * 2.0).sum(),
+        x_np,
+        eps=1e-3,
+        rtol=1e-2,
+        atol=1e-2,
+        device=device,
+    )
+    assert gradcheck(
+        lambda t: t.clamp(min=-0.5).sum(),
+        x_np,
+        eps=1e-3,
+        rtol=1e-2,
+        atol=1e-2,
+        device=device,
+    )
+    assert gradcheck(
+        lambda t: t.clamp(max=0.5).sum(),
+        x_np,
+        eps=1e-3,
+        rtol=1e-2,
+        atol=1e-2,
+        device=device,
+    )
+
+
+def test_dataparallel_multi_head_tuple_and_dict_outputs():
+    class MultiHeadNet(nn.Module):
+        def __init__(self, device="vk:0"):
+            super().__init__()
+            self.trunk = nn.Linear(8, 12, device=device)
+            self.head1 = nn.Linear(12, 4, device=device)
+            self.head2 = nn.Linear(12, 3, device=device)
+
+        def forward(self, x):
+            # Uses algebraic softsign with .abs() and .clamp()
+            h = self.trunk(x)
+            h = h / (1.0 + h.abs())
+            out1 = self.head1(h).clamp(min=-2.0, max=2.0)
+            out2 = self.head2(h).sigmoid().clamp(min=1e-5, max=1.0 - 1e-5)
+            return out1, out2
+
+    devs = [d for d in DEVICES if d.startswith("vk:")]
+    if not devs:
+        devs = ["cpu"]
+
+    master_dev = devs[0]
+    net = MultiHeadNet(device=master_dev)
+    dp = nn.DataParallel(net, device_ids=devs, balance="tflops")
+
+    x = vultorch.randn(16, 8, device=master_dev, requires_grad=True)
+    h1, h2 = dp(x)
+
+    assert isinstance(h1, vultorch.Tensor) and isinstance(h2, vultorch.Tensor)
+    assert h1.shape == (16, 4)
+    assert h2.shape == (16, 3)
+
+    # Verify against single-device execution on master_dev
+    with vultorch.no_grad():
+        ref1, ref2 = net(x)
+    np.testing.assert_allclose(h1.numpy(), ref1.numpy(), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(h2.numpy(), ref2.numpy(), rtol=1e-4, atol=1e-4)
+
+    # Verify backward + reduce_gradients across both heads
+    dp.zero_grad()
+    loss = h1.sum() + h2.log().sum()
+    loss.backward()
+    dp.reduce_gradients()
+
+    for name, p in net.named_parameters():
+        assert p.grad is not None, f"Missing gradient for {name}"
+        assert np.all(np.isfinite(p.grad.numpy()))
+

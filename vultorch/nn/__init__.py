@@ -782,11 +782,85 @@ class DataParallel(Module):
                     p_dst.copy_(p_src.to(device))
         return self.replicas[device]
 
-    def forward(self, x: Tensor) -> Tensor:
-        if len(self.device_ids) <= 1:
-            return self.module(x)
+    @staticmethod
+    def _move_tree(obj, device):
+        if isinstance(obj, Tensor):
+            return obj.to(device)
+        if isinstance(obj, tuple):
+            if hasattr(obj, "_fields"):  # namedtuple
+                return type(obj)(*(DataParallel._move_tree(v, device) for v in obj))
+            return tuple(DataParallel._move_tree(v, device) for v in obj)
+        if isinstance(obj, list):
+            return [DataParallel._move_tree(v, device) for v in obj]
+        if isinstance(obj, dict):
+            return type(obj)((k, DataParallel._move_tree(v, device)) for k, v in obj.items())
+        return obj
 
-        batch_size = x.shape[0]
+    @staticmethod
+    def _slice_tree(obj, start: int, end: int, dev_id: str):
+        if isinstance(obj, Tensor):
+            return obj[start:end].to(dev_id)
+        if isinstance(obj, tuple):
+            if hasattr(obj, "_fields"):
+                return type(obj)(*(DataParallel._slice_tree(v, start, end, dev_id) for v in obj))
+            return tuple(DataParallel._slice_tree(v, start, end, dev_id) for v in obj)
+        if isinstance(obj, list):
+            return [DataParallel._slice_tree(v, start, end, dev_id) for v in obj]
+        if isinstance(obj, dict):
+            return type(obj)((k, DataParallel._slice_tree(v, start, end, dev_id)) for k, v in obj.items())
+        return obj
+
+    @staticmethod
+    def _gather_outputs(outputs: List, target_device):
+        first = outputs[0]
+        if isinstance(first, Tensor):
+            return vultorch.cat(outputs, dim=0, device=target_device)
+        if isinstance(first, tuple):
+            gathered = tuple(
+                DataParallel._gather_outputs([o[i] for o in outputs], target_device)
+                for i in range(len(first))
+            )
+            if hasattr(first, "_fields"):  # namedtuple
+                return type(first)(*gathered)
+            return gathered
+        if isinstance(first, list):
+            return [
+                DataParallel._gather_outputs([o[i] for o in outputs], target_device)
+                for i in range(len(first))
+            ]
+        if isinstance(first, dict):
+            return type(first)(
+                (k, DataParallel._gather_outputs([o[k] for o in outputs], target_device))
+                for k in first.keys()
+            )
+        return first
+
+    @staticmethod
+    def _find_first_tensor(obj) -> Optional[Tensor]:
+        if isinstance(obj, Tensor):
+            return obj
+        if isinstance(obj, (tuple, list)):
+            for item in obj:
+                found = DataParallel._find_first_tensor(item)
+                if found is not None:
+                    return found
+        elif isinstance(obj, dict):
+            for item in obj.values():
+                found = DataParallel._find_first_tensor(item)
+                if found is not None:
+                    return found
+        return None
+
+    def forward(self, *inputs, **kwargs):
+        if len(self.device_ids) <= 1:
+            return self.module(*inputs, **kwargs)
+
+        first_tensor = self._find_first_tensor((inputs, kwargs))
+        if first_tensor is None:
+            return self.module(*inputs, **kwargs)
+
+        batch_size = first_tensor.shape[0]
+        target_device = first_tensor.device
         split_sizes = self.get_split_sizes(batch_size)
         self.last_split_sizes = split_sizes
 
@@ -801,7 +875,9 @@ class DataParallel(Module):
         if len(chunks) == 1:
             dev_id, start, end = chunks[0]
             rep = self._get_replica(dev_id)
-            return rep(x.to(dev_id)).to(x.device)
+            dev_inputs = self._move_tree(inputs, dev_id)
+            dev_kwargs = self._move_tree(kwargs, dev_id)
+            return self._move_tree(rep(*dev_inputs, **dev_kwargs), target_device)
 
         # Ensure replicas are initialized (and synced if needed) before parallel dispatch
         for dev_id, _, _ in chunks:
@@ -810,13 +886,14 @@ class DataParallel(Module):
 
         def run_device(dev_id, start, end):
             rep = self.replicas[dev_id]
-            chunk_x = x[start:end].to(dev_id)
-            return rep(chunk_x)
+            chunk_inputs = self._slice_tree(inputs, start, end, dev_id)
+            chunk_kwargs = self._slice_tree(kwargs, start, end, dev_id)
+            return rep(*chunk_inputs, **chunk_kwargs)
 
         pool = self._get_pool()
         futures = [pool.submit(run_device, dev, s, e) for dev, s, e in chunks]
         results = [f.result() for f in futures]
-        return vultorch.cat(results, dim=0, device=x.device)
+        return self._gather_outputs(results, target_device)
 
     def zero_grad(self):
         self.module.zero_grad()

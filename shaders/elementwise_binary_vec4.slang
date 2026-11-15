@@ -57,6 +57,10 @@ float4 apply_op(float4 a, float4 b, uint op) {
         case 10u: return select(b > float4(0.0), a, float4(0.0));
         case 11u: return gelu_grad_vec4(a, b);
         case 12u: return silu_grad_vec4(a, b);
+        case 13u: return a * float4(sign(b));
+        case 14u: return select(a == b, float4(1.0), float4(0.0));
+        case 15u: return select(a >= b, float4(1.0), float4(0.0));
+        case 16u: return select(a <= b, float4(1.0), float4(0.0));
         default: return a + b;
     }
 }
