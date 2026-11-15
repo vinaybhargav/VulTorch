@@ -1,12 +1,53 @@
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <pybind11/numpy.h>
+#include <cstring>
+#include <vector>
 #include "tensor.hpp"
 #include "runtime/vk_context.hpp"
+#include "runtime/vk_memory.hpp"
 #include "runtime/vk_pipeline.hpp"
 
 namespace py = pybind11;
 using namespace vultorch;
+
+namespace {
+
+py::dtype scalar_type_to_numpy_dtype(ScalarType dt) {
+    switch (dt) {
+        case ScalarType::Float32: return py::dtype("float32");
+        case ScalarType::Float16: return py::dtype("float16");
+        case ScalarType::BFloat16: return py::dtype("float32"); // Exposed as fp32 to NumPy
+        case ScalarType::Int32: return py::dtype("int32");
+        case ScalarType::Int64: return py::dtype("int64");
+        case ScalarType::Bool: return py::dtype("bool");
+        case ScalarType::UInt8: return py::dtype("uint8");
+    }
+    return py::dtype("float32");
+}
+
+ScalarType infer_scalar_type_from_numpy(const py::array& arr) {
+    const py::dtype dt = arr.dtype();
+    if (dt.is(py::dtype("float32")) || dt.is(py::dtype("float64"))) return ScalarType::Float32;
+    if (dt.is(py::dtype("float16"))) return ScalarType::Float16;
+    if (dt.is(py::dtype("int32"))) return ScalarType::Int32;
+    if (dt.is(py::dtype("int64"))) return ScalarType::Int64;
+    if (dt.is(py::dtype("bool"))) return ScalarType::Bool;
+    if (dt.is(py::dtype("uint8"))) return ScalarType::UInt8;
+    return ScalarType::Float32;
+}
+
+py::array ensure_contiguous_numpy_for_dtype(const py::array& arr, ScalarType target_dt) {
+    py::dtype target_np = scalar_type_to_numpy_dtype(target_dt);
+    const bool is_c = (arr.flags() & py::array::c_style) != 0;
+    if (is_c && arr.dtype().is(target_np)) {
+        return arr;
+    }
+    py::module_ np = py::module_::import("numpy");
+    return np.attr("ascontiguousarray")(arr, target_np).cast<py::array>();
+}
+
+} // namespace
 
 PYBIND11_MODULE(_vultorch_backend, m) {
     m.doc() = "VulTorch: High-Performance Vulkan-Native Deep Learning Engine";
@@ -101,26 +142,90 @@ PYBIND11_MODULE(_vultorch_backend, m) {
         return VulkanPipelineManager::instance().get_shader_directory();
     });
 
+    m.def("recorded_dispatches", [](uint32_t device_id) {
+        return VulkanManager::instance_ref().get_device(device_id)->recorded_dispatches();
+    }, py::arg("device_id") = 0);
+
+    m.def("submitted_batches", [](uint32_t device_id) {
+        return VulkanManager::instance_ref().get_device(device_id)->submitted_batches();
+    }, py::arg("device_id") = 0);
+
+    m.def("driver_allocation_count", [](int device_id) {
+        return VulkanMemoryManager::instance().driver_allocation_count(device_id);
+    }, py::arg("device_id") = -1);
+
+    m.def("active_arena_bytes", [](int device_id) {
+        return VulkanMemoryManager::instance().active_arena_bytes(device_id);
+    }, py::arg("device_id") = -1);
+
+    m.def("reserved_arena_bytes", [](int device_id) {
+        return VulkanMemoryManager::instance().reserved_arena_bytes(device_id);
+    }, py::arg("device_id") = -1);
+
+    m.def("pooled_buffer_count", []() {
+        return VulkanMemoryManager::instance().pooled_buffer_count();
+    });
+
+    m.def("live_allocation_count", []() {
+        return VulkanMemoryManager::instance().live_allocation_count();
+    });
+
     // NativeTensor Bindings
     py::class_<NativeTensor, std::shared_ptr<NativeTensor>>(m, "NativeTensor")
-        .def(py::init([](const std::vector<int64_t>& shape, int dev_id) {
-            return std::make_shared<NativeTensor>(shape, dev_id);
-        }), py::arg("shape"), py::arg("device_id") = 0)
+        .def(py::init([](const std::vector<int64_t>& shape, int dev_id, const std::string& dt) {
+            return std::make_shared<NativeTensor>(shape, dev_id, parse_dtype(dt));
+        }), py::arg("shape"), py::arg("device_id") = 0, py::arg("dtype") = "float32")
+        .def_static("create", [](const std::vector<int64_t>& shape, int dev_id, const std::string& dt) {
+            return NativeTensor::create(shape, dev_id, parse_dtype(dt));
+        }, py::arg("shape"), py::arg("device_id") = 0, py::arg("dtype") = "float32")
         .def_readonly("device_id", &NativeTensor::device_id)
         .def_readonly("shape", &NativeTensor::shape)
         .def_readonly("strides", &NativeTensor::strides)
         .def_readonly("numel", &NativeTensor::numel)
+        .def_readonly("storage_offset", &NativeTensor::storage_offset)
+        .def_property_readonly("dtype", &NativeTensor::dtype_str)
+        .def("itemsize", &NativeTensor::itemsize)
+        .def("nbytes", &NativeTensor::nbytes)
+        .def("storage_id", &NativeTensor::storage_id)
+        .def("data_ptr", &NativeTensor::data_ptr)
         .def("to_device", &NativeTensor::to_device, py::arg("target_device_id"),
              py::call_guard<py::gil_scoped_release>())
-        .def("copy_from_numpy", [](std::shared_ptr<NativeTensor> self, py::array_t<float, py::array::c_style | py::array::forcecast> arr) {
-            const float* ptr = arr.data();
-            const size_t count = std::min(self->numel, static_cast<size_t>(arr.size()));
-            py::gil_scoped_release release;
-            self->copy_from_host(ptr, count);
+        .def("copy_from_numpy", [](std::shared_ptr<NativeTensor> self, py::array arr) {
+            py::array arr_c = ensure_contiguous_numpy_for_dtype(arr, self->dtype);
+            const size_t count = std::min(self->numel, static_cast<size_t>(arr_c.size()));
+            if (count == 0) return;
+            if (self->dtype == ScalarType::BFloat16) {
+                const float* fptr = static_cast<const float*>(arr_c.data());
+                std::vector<uint16_t> bf_buf(count);
+                for (size_t i = 0; i < count; ++i) {
+                    bf_buf[i] = fp32_to_bf16(fptr[i]);
+                }
+                py::gil_scoped_release release;
+                self->copy_from_raw_bytes(bf_buf.data(), count * sizeof(uint16_t));
+            } else {
+                const void* ptr = arr_c.data();
+                const size_t bytes = count * self->itemsize();
+                py::gil_scoped_release release;
+                self->copy_from_raw_bytes(ptr, bytes);
+            }
         })
         .def("clone", &NativeTensor::clone, py::call_guard<py::gil_scoped_release>())
         .def("strided_copy", &NativeTensor::strided_copy, py::arg("out_shape"), py::arg("src_strides"),
              py::call_guard<py::gil_scoped_release>())
+        .def("contiguous", &NativeTensor::contiguous, py::call_guard<py::gil_scoped_release>())
+        .def("force_contiguous", &NativeTensor::force_contiguous, py::call_guard<py::gil_scoped_release>())
+        .def("cast", [](std::shared_ptr<NativeTensor> self, const std::string& dt) {
+            ScalarType target = parse_dtype(dt);
+            py::gil_scoped_release release;
+            return self->cast(target);
+        }, py::arg("dtype"))
+        .def("as_strided", &NativeTensor::as_strided, py::arg("shape"), py::arg("strides"),
+             py::arg("storage_offset") = -1)
+        .def("transpose_view", &NativeTensor::transpose_view, py::arg("dim0"), py::arg("dim1"))
+        .def("permute_view", &NativeTensor::permute_view, py::arg("dims"))
+        .def("expand_view", &NativeTensor::expand_view, py::arg("shape"))
+        .def("slice_view", &NativeTensor::slice_view, py::arg("dim"), py::arg("start"),
+             py::arg("end"), py::arg("step") = 1)
         .def("reshape_view", &NativeTensor::reshape_view, py::arg("new_shape"))
         .def("copy_from_native", &NativeTensor::copy_from_native, py::arg("src"),
              py::call_guard<py::gil_scoped_release>())
@@ -131,6 +236,7 @@ PYBIND11_MODULE(_vultorch_backend, m) {
         .def("fill_", &NativeTensor::fill_, py::arg("val"), py::call_guard<py::gil_scoped_release>())
         .def("zero_", &NativeTensor::zero_, py::call_guard<py::gil_scoped_release>())
         .def("is_contiguous", &NativeTensor::is_contiguous)
+        .def("is_dense_zero_offset", &NativeTensor::is_dense_zero_offset)
         .def("adam_step_", &NativeTensor::adam_step_, py::arg("grad"), py::arg("exp_avg"),
              py::arg("exp_avg_sq"), py::arg("lr"), py::arg("beta1"), py::arg("beta2"),
              py::arg("eps"), py::arg("weight_decay"), py::arg("decoupled"), py::arg("step"),
@@ -212,30 +318,53 @@ PYBIND11_MODULE(_vultorch_backend, m) {
         .def("embedding_backward", &NativeTensor::embedding_backward,
              py::arg("indices"), py::arg("num_embeddings"), py::arg("padding_idx") = -1,
              py::call_guard<py::gil_scoped_release>())
-        .def("to_numpy", [](std::shared_ptr<NativeTensor> self) -> py::array_t<float> {
+        .def("to_numpy", [](std::shared_ptr<NativeTensor> self) -> py::array {
             std::vector<ssize_t> py_shape(self->shape.begin(), self->shape.end());
-            std::vector<ssize_t> py_strides;
-            for (auto s : self->strides) {
-                py_strides.push_back(s * sizeof(float));
+            if (self->dtype == ScalarType::BFloat16) {
+                std::vector<uint16_t> bf_buf(self->numel);
+                {
+                    py::gil_scoped_release release;
+                    self->to_raw_bytes(bf_buf.data(), self->numel * sizeof(uint16_t));
+                }
+                py::array_t<float> arr(py_shape);
+                float* out_ptr = arr.mutable_data();
+                for (size_t i = 0; i < self->numel; ++i) {
+                    out_ptr[i] = bf16_to_fp32(bf_buf[i]);
+                }
+                return arr;
             }
-            py::array_t<float> arr(py_shape, py_strides);
-            float* ptr = arr.mutable_data();
-            const size_t count = self->numel;
+            py::dtype np_dt = scalar_type_to_numpy_dtype(self->dtype);
+            py::array arr(np_dt, py_shape);
+            void* ptr = arr.mutable_data();
+            const size_t bytes = self->nbytes();
             {
                 py::gil_scoped_release release;
-                self->copy_to_host(ptr, count);
+                self->to_raw_bytes(ptr, bytes);
             }
             return arr;
         })
-        .def_static("from_numpy", [](py::array_t<float, py::array::c_style | py::array::forcecast> arr, int device_id) {
+        .def_static("from_numpy", [](py::array arr, int device_id, const std::string& target_dtype) {
             std::vector<int64_t> shape(arr.ndim());
             for (int i = 0; i < arr.ndim(); ++i) {
                 shape[i] = arr.shape(i);
             }
-            const float* ptr = arr.data();
+            ScalarType dt = target_dtype.empty()
+                                ? infer_scalar_type_from_numpy(arr)
+                                : parse_dtype(target_dtype);
+            py::array arr_c = ensure_contiguous_numpy_for_dtype(arr, dt);
+            if (dt == ScalarType::BFloat16) {
+                const size_t count = static_cast<size_t>(arr_c.size());
+                const float* fptr = static_cast<const float*>(arr_c.data());
+                std::vector<uint16_t> bf_buf(count);
+                for (size_t i = 0; i < count; ++i) {
+                    bf_buf[i] = fp32_to_bf16(fptr[i]);
+                }
+                py::gil_scoped_release release;
+                return NativeTensor::from_raw_bytes(bf_buf.data(), count * sizeof(uint16_t), shape, device_id, dt);
+            }
+            const void* ptr = arr_c.data();
+            const size_t bytes = static_cast<size_t>(arr_c.size()) * element_size(dt);
             py::gil_scoped_release release;
-            auto tensor = NativeTensor::create(shape, device_id);
-            tensor->copy_from_host(ptr, tensor->numel);
-            return tensor;
-        }, py::arg("array"), py::arg("device_id") = 0);
+            return NativeTensor::from_raw_bytes(ptr, bytes, shape, device_id, dt);
+        }, py::arg("array"), py::arg("device_id") = 0, py::arg("dtype") = "");
 }

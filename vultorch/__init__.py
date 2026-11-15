@@ -5,7 +5,22 @@ VulTorch: A High-Performance Pure Vulkan Deep Learning Library
 import numpy as np
 from typing import Tuple, List, Union, Optional
 
-from .tensor import Tensor, Device
+from .tensor import (
+    Tensor,
+    Device,
+    DType,
+    parse_dtype,
+    float32,
+    float16,
+    half,
+    bfloat16,
+    int32,
+    int64,
+    long,
+    bool_dtype as _bool_dtype,
+    uint8,
+    byte,
+)
 from .autograd import no_grad, is_grad_enabled, backward
 from .testing import gradcheck
 from . import nn
@@ -19,18 +34,18 @@ import threading
 __version__ = "0.1.0"
 
 _rng_lock = threading.Lock()
-_rng_seed: int = 0x5DEECE66D
-_rng_offset: int = 0
+_rng_seed: _builtins.int = 0x5DEECE66D
+_rng_offset: _builtins.int = 0
 
-def manual_seed(seed: int):
+def manual_seed(seed: _builtins.int):
     """Sets the global Philox PRNG seed and resets the counter offset."""
     global _rng_seed, _rng_offset
     with _rng_lock:
-        _rng_seed = int(seed) & 0xFFFFFFFFFFFFFFFF
+        _rng_seed = _builtins.int(seed) & 0xFFFFFFFFFFFFFFFF
         _rng_offset = 0
-    np.random.seed(int(seed) & 0xFFFFFFFF)
+    np.random.seed(_builtins.int(seed) & 0xFFFFFFFF)
 
-def _next_philox_state() -> Tuple[int, int]:
+def _next_philox_state() -> Tuple[_builtins.int, _builtins.int]:
     global _rng_offset
     with _rng_lock:
         seed = _rng_seed
@@ -41,61 +56,91 @@ def _next_philox_state() -> Tuple[int, int]:
 def device(d: Union[str, Device]) -> Device:
     return Device(d)
 
-def tensor(data, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
-    return Tensor(data, device=device, requires_grad=requires_grad)
+def tensor(data, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    return Tensor(data, device=device, requires_grad=requires_grad, dtype=dtype)
 
-def empty(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
+def from_numpy(ndarray: np.ndarray, device: Union[str, Device] = "vk", dtype=None) -> Tensor:
+    if not isinstance(ndarray, np.ndarray):
+        ndarray = np.asarray(ndarray)
+    return Tensor(ndarray, device=device, dtype=dtype)
+
+def empty(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
         shape = shape[0]
     dev = Device(device)
     dev_id = -1 if dev.type == "cpu" else dev.index
-    native = _backend.NativeTensor([int(d) for d in shape], dev_id)
+    dt = parse_dtype(dtype) if dtype is not None else float32
+    if requires_grad and not dt.is_floating_point:
+        raise RuntimeError("Only Tensors of floating point dtype can require gradients")
+    native = _backend.NativeTensor([_builtins.int(d) for d in shape], dev_id, dt.name)
     return Tensor(native, device=dev, requires_grad=requires_grad)
 
-def zeros(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
-    t = empty(*shape, device=device, requires_grad=requires_grad)
+def zeros(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    t = empty(*shape, device=device, requires_grad=requires_grad, dtype=dtype)
     t._native.zero_()
     return t
 
-def ones(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
-    t = empty(*shape, device=device, requires_grad=requires_grad)
+def ones(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    t = empty(*shape, device=device, requires_grad=requires_grad, dtype=dtype)
     t._native.fill_(1.0)
     return t
 
-def zeros_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_grad: bool = False) -> Tensor:
-    dev = device if device is not None else t.device
-    return zeros(t.shape, device=dev, requires_grad=requires_grad)
+def full(shape, fill_value, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    if isinstance(shape, _builtins.int):
+        shape = (shape,)
+    if dtype is None:
+        if isinstance(fill_value, _builtins.bool):
+            dtype = _bool_dtype
+        elif isinstance(fill_value, _builtins.int):
+            dtype = int64
+        else:
+            dtype = float32
+    t = empty(shape, device=device, requires_grad=requires_grad, dtype=dtype)
+    t._native.fill_(_builtins.float(fill_value))
+    return t
 
-def ones_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_grad: bool = False) -> Tensor:
+def zeros_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     dev = device if device is not None else t.device
-    return ones(t.shape, device=dev, requires_grad=requires_grad)
+    dt = dtype if dtype is not None else t.dtype
+    return zeros(t.shape, device=dev, requires_grad=requires_grad, dtype=dt)
 
-def randn(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
-    t = empty(*shape, device=device, requires_grad=requires_grad)
+def ones_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    dev = device if device is not None else t.device
+    dt = dtype if dtype is not None else t.dtype
+    return ones(t.shape, device=dev, requires_grad=requires_grad, dtype=dt)
+
+def randn(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    t = empty(*shape, device=device, requires_grad=requires_grad, dtype=dtype)
     seed, offset = _next_philox_state()
     t._native.random_philox_(1, 0.0, 1.0, seed, offset, None)
     return t
 
-def rand(*shape, device: Union[str, Device] = "vk", requires_grad: bool = False) -> Tensor:
-    t = empty(*shape, device=device, requires_grad=requires_grad)
+def rand(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    t = empty(*shape, device=device, requires_grad=requires_grad, dtype=dtype)
     seed, offset = _next_philox_state()
     t._native.random_philox_(0, 0.0, 1.0, seed, offset, None)
     return t
 
-def arange(start: float, end: Optional[float] = None, step: float = 1.0, device: Union[str, Device] = "vk") -> Tensor:
+def arange(start, end=None, step=1, device: Union[str, Device] = "vk", dtype=None) -> Tensor:
+    dt = parse_dtype(dtype) if dtype is not None else float32
+    np_dt = dt.numpy_dtype if dt.numpy_dtype is not None else np.float32
     if end is None:
-        arr = np.arange(start, dtype=np.float32)
+        arr = np.arange(start, dtype=np_dt)
     else:
-        arr = np.arange(start, end, step, dtype=np.float32)
-    return Tensor(arr, device=device)
+        arr = np.arange(start, end, step, dtype=np_dt)
+    return Tensor(arr, device=device, dtype=dt)
 
-def linspace(start: float, end: float, steps: int, device: Union[str, Device] = "vk") -> Tensor:
-    arr = np.linspace(start, end, steps, dtype=np.float32)
-    return Tensor(arr, device=device)
+def linspace(start: _builtins.float, end: _builtins.float, steps: _builtins.int, device: Union[str, Device] = "vk", dtype=None) -> Tensor:
+    dt = parse_dtype(dtype) if dtype is not None else float32
+    np_dt = dt.numpy_dtype if dt.numpy_dtype is not None else np.float32
+    arr = np.linspace(start, end, steps, dtype=np_dt)
+    return Tensor(arr, device=device, dtype=dt)
 
-def eye(n: int, m: Optional[int] = None, device: Union[str, Device] = "vk") -> Tensor:
-    arr = np.eye(n, m, dtype=np.float32)
-    return Tensor(arr, device=device)
+def eye(n: _builtins.int, m: Optional[_builtins.int] = None, device: Union[str, Device] = "vk", dtype=None) -> Tensor:
+    dt = parse_dtype(dtype) if dtype is not None else float32
+    np_dt = dt.numpy_dtype if dt.numpy_dtype is not None else np.float32
+    arr = np.eye(n, m, dtype=np_dt)
+    return Tensor(arr, device=device, dtype=dt)
 
 def matmul(a: Tensor, b: Tensor) -> Tensor:
     return a @ b
@@ -164,22 +209,47 @@ def max(x: Tensor, dim: Optional[int] = None, keepdim: bool = False) -> Tensor:
         return _builtins.max(x, dim) if dim is not None else _builtins.max(x)
     return x.max(dim=dim, keepdim=keepdim)
 
-def cat(tensors: List[Tensor], dim: int = 0, device: Optional[Union[str, Device]] = None) -> Tensor:
+def as_strided(x: Tensor, size, stride, storage_offset=None) -> Tensor:
+    return x.as_strided(size, stride, storage_offset=storage_offset)
+
+def transpose(x: Tensor, dim0: _builtins.int, dim1: _builtins.int) -> Tensor:
+    return x.transpose(dim0, dim1)
+
+def permute(x: Tensor, dims) -> Tensor:
+    return x.permute(dims)
+
+def narrow(x: Tensor, dim: _builtins.int, start: _builtins.int, length: _builtins.int) -> Tensor:
+    return x.narrow(dim, start, length)
+
+def where(condition: Tensor, x, y) -> Tensor:
+    dev = condition.device
+    xt = x if isinstance(x, Tensor) else Tensor(x, device=dev)
+    yt = y if isinstance(y, Tensor) else Tensor(y, device=dev, dtype=xt.dtype)
+    cond_f = condition.float()
+    res = (cond_f * xt) + ((1.0 - cond_f) * yt)
+    if xt.dtype != res.dtype and xt.dtype == yt.dtype:
+        res = res.to(xt.dtype)
+    return res
+
+def cat(tensors: List[Tensor], dim: _builtins.int = 0, device: Optional[Union[str, Device]] = None) -> Tensor:
     if not tensors:
         raise ValueError("cat expects a non-empty list of tensors")
     dev = Device(device) if device is not None else tensors[0].device
     ndim = tensors[0].ndim
     norm_dim = dim if dim >= 0 else dim + ndim
     req_grad = any(t.requires_grad for t in tensors) and is_grad_enabled()
+    first_dt = tensors[0].dtype
+    same_dt = all(t.dtype == first_dt for t in tensors)
 
-    if norm_dim == 0 and ndim >= 1 and all(t._native.is_contiguous() for t in tensors):
+    if norm_dim == 0 and ndim >= 1 and same_dt and all(t._native.is_dense_zero_offset() for t in tensors):
         target_dev_id = -1 if dev.type == "cpu" else dev.index
         native_out = _backend.NativeTensor.cat_dim0([t._native for t in tensors], target_dev_id)
         out = Tensor(native_out, device=dev, requires_grad=req_grad)
     else:
+        target_dt = first_dt if same_dt else float32
         arrs = [t.numpy() for t in tensors]
         res = np.concatenate(arrs, axis=dim)
-        out = Tensor(res, device=dev, requires_grad=req_grad)
+        out = Tensor(res, device=dev, requires_grad=req_grad, dtype=target_dt)
 
     if req_grad:
         out.is_leaf = False
@@ -241,22 +311,50 @@ class _VulkanInfo:
         return _backend.get_all_devices()
 
     @staticmethod
-    def synchronize(device_id: Union[int, str, Device] = 0):
+    def synchronize(device_id: Union[_builtins.int, str, Device] = 0):
         if isinstance(device_id, (str, Device)):
             dev = Device(device_id)
             if dev.type == "cpu":
                 return
             device_id = dev.index
-        _backend.synchronize(int(device_id))
+        _backend.synchronize(_builtins.int(device_id))
 
     @staticmethod
     def synchronize_all():
         _backend.synchronize_all()
 
+    @staticmethod
+    def recorded_dispatches(device_id: _builtins.int = 0) -> _builtins.int:
+        return _backend.recorded_dispatches(_builtins.int(device_id))
+
+    @staticmethod
+    def submitted_batches(device_id: _builtins.int = 0) -> _builtins.int:
+        return _backend.submitted_batches(_builtins.int(device_id))
+
+    @staticmethod
+    def driver_allocation_count(device_id: _builtins.int = -1) -> _builtins.int:
+        return _backend.driver_allocation_count(_builtins.int(device_id))
+
+    @staticmethod
+    def active_arena_bytes(device_id: _builtins.int = -1) -> _builtins.int:
+        return _backend.active_arena_bytes(_builtins.int(device_id))
+
+    @staticmethod
+    def reserved_arena_bytes(device_id: _builtins.int = -1) -> _builtins.int:
+        return _backend.reserved_arena_bytes(_builtins.int(device_id))
+
+    @staticmethod
+    def pooled_buffer_count() -> _builtins.int:
+        return _backend.pooled_buffer_count()
+
+    @staticmethod
+    def live_allocation_count() -> _builtins.int:
+        return _backend.live_allocation_count()
+
     @classmethod
-    def get_device_tflops(cls, device_id: int = 0, n: int = 1024, force_recalibrate: bool = False) -> float:
+    def get_device_tflops(cls, device_id: _builtins.int = 0, n: _builtins.int = 1024, force_recalibrate: _builtins.bool = False) -> _builtins.float:
         """Measures and caches effective FP32 GEMM throughput (TFLOPS) for `vk:<device_id>`."""
-        key = (int(device_id), int(n))
+        key = (_builtins.int(device_id), _builtins.int(n))
         if not force_recalibrate and key in cls._tflops_cache:
             return cls._tflops_cache[key]
 
@@ -275,7 +373,7 @@ class _VulkanInfo:
             for _ in range(reps):
                 _ = a @ b
             cls.synchronize(device_id)
-            elapsed = max(time.perf_counter() - t0, 1e-9)
+            elapsed = _builtins.max(time.perf_counter() - t0, 1e-9)
 
         flops = 2.0 * (n ** 3) * reps
         tflops = (flops / elapsed) / 1e12
@@ -285,11 +383,11 @@ class _VulkanInfo:
     @classmethod
     def compute_split_sizes(
         cls,
-        batch_size: int,
+        batch_size: _builtins.int,
         device_ids: Optional[List[Union[str, Device]]] = None,
-        weights: Optional[List[float]] = None,
-        min_chunk: int = 1,
-    ) -> List[int]:
+        weights: Optional[List[_builtins.float]] = None,
+        min_chunk: _builtins.int = 1,
+    ) -> List[_builtins.int]:
         """Partitions `batch_size` across `device_ids` proportional to measured TFLOPS."""
         if device_ids is None:
             device_ids = [f"vk:{i}" for i in range(cls.device_count())]
@@ -304,23 +402,23 @@ class _VulkanInfo:
             for d in device_ids:
                 dev_obj = d if isinstance(d, Device) else Device(d)
                 if dev_obj.type == "vk":
-                    raw_weights.append(max(cls.get_device_tflops(dev_obj.index), 1e-3))
+                    raw_weights.append(_builtins.max(cls.get_device_tflops(dev_obj.index), 1e-3))
                 else:
                     raw_weights.append(0.05)
         else:
-            raw_weights = [max(float(w), 0.0) for w in weights]
+            raw_weights = [_builtins.max(_builtins.float(w), 0.0) for w in weights]
 
-        total_w = sum(raw_weights)
+        total_w = _builtins.sum(raw_weights)
         if total_w <= 0.0:
             raw_weights = [1.0] * n_devs
-            total_w = float(n_devs)
+            total_w = _builtins.float(n_devs)
 
         norm_w = [w / total_w for w in raw_weights]
         effective_min = min_chunk if batch_size >= n_devs * min_chunk else 0
 
-        sizes = [max(effective_min, int(batch_size * w)) for w in norm_w]
+        sizes = [_builtins.max(effective_min, _builtins.int(batch_size * w)) for w in norm_w]
         # Adjust remainder or excess according to fractional parts
-        diff = batch_size - sum(sizes)
+        diff = batch_size - _builtins.sum(sizes)
         if diff > 0:
             fracs = sorted(
                 range(n_devs),
@@ -342,6 +440,11 @@ class _VulkanInfo:
         return sizes
 
 vulkan = _VulkanInfo()
+
+# Export PyTorch-compatible DType singletons at package level
+float = float32
+int = int32
+bool = _bool_dtype
 
 # Friendly reminder for users looking for cuda
 class _NoCudaNotice:

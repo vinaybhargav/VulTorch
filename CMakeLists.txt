@@ -112,6 +112,9 @@ set(SLANG_KERNELS
     embedding:embedding_backward
     random:philox_rng
     sgd:sgd_step
+    gemm_fp16:gemm_fp16
+    gemm_fp16:matmul_coopmat_fp16
+    cast:cast_dtype
 )
 
 set(SPV_OUTPUTS)

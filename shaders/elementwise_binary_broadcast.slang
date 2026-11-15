@@ -1,9 +1,11 @@
 struct BinaryBroadcastParams {
     uint total_elements;
-    uint op_type;    // 0: Add, 1: Sub, 2: Mul, 3: Div, 4: Pow, 5: Max, 6: Min, 7: GT, 8: LT, 9: EQ
+    uint op_type;    // 0: Add, 1: Sub, 2: Mul, 3: Div, 4: Pow, 5: Max, 6: Min, 7: GT, 8: LT, 9: EQ, ...
     uint ndim;
     uint is_b_scalar;
     float scalar_b;
+    uint offsetA;
+    uint offsetB;
     uint shape[6];
     uint strideA[6];
     uint strideB[6];
@@ -67,19 +69,15 @@ void elementwise_binary_broadcast(uint3 tid : SV_DispatchThreadID) {
     uint idx = tid.x;
     if (idx >= pc.total_elements) return;
 
-    if (pc.is_b_scalar != 0u) {
-        dataC[idx] = apply_op_scalar(dataA[idx], pc.scalar_b, pc.op_type);
-        return;
-    }
-
     if (pc.ndim == 0u) {
-        dataC[idx] = apply_op_scalar(dataA[idx], dataB[idx], pc.op_type);
+        float b_val = (pc.is_b_scalar != 0u) ? pc.scalar_b : dataB[pc.offsetB + idx];
+        dataC[idx] = apply_op_scalar(dataA[pc.offsetA + idx], b_val, pc.op_type);
         return;
     }
 
     uint rem = idx;
-    uint idxA = 0u;
-    uint idxB = 0u;
+    uint idxA = pc.offsetA;
+    uint idxB = pc.offsetB;
 
     for (int d = int(pc.ndim) - 1; d >= 0; --d) {
         uint dim_size = pc.shape[d];
@@ -90,5 +88,6 @@ void elementwise_binary_broadcast(uint3 tid : SV_DispatchThreadID) {
         idxB += coord * pc.strideB[d];
     }
 
-    dataC[idx] = apply_op_scalar(dataA[idxA], dataB[idxB], pc.op_type);
+    float b_val = (pc.is_b_scalar != 0u) ? pc.scalar_b : dataB[idxB];
+    dataC[idx] = apply_op_scalar(dataA[idxA], b_val, pc.op_type);
 }

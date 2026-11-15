@@ -60,19 +60,23 @@ def backward(root_tensor: 'Tensor', grad: Optional['Tensor'] = None):
                 raise RuntimeError("grad can be implicitly created only for scalar outputs")
             grad = vultorch.ones_like(root_tensor)
 
-        # Topological sort of the computation DAG
+        # Iterative post-order topological sort (avoids recursive closure reference cycles)
         topo: List['Tensor'] = []
         visited: Set['Tensor'] = set()
-
-        def build_topo(tensor: 'Tensor'):
-            if tensor not in visited:
-                visited.add(tensor)
-                if tensor.grad_fn is not None:
-                    for inp in tensor.grad_fn.inputs:
-                        build_topo(inp)
-                    topo.append(tensor)
-
-        build_topo(root_tensor)
+        stack: List[Tuple['Tensor', bool]] = [(root_tensor, False)]
+        while stack:
+            node_t, expanded = stack.pop()
+            if expanded:
+                topo.append(node_t)
+                continue
+            if node_t in visited:
+                continue
+            visited.add(node_t)
+            if node_t.grad_fn is not None:
+                stack.append((node_t, True))
+                for inp in reversed(node_t.grad_fn.inputs):
+                    if inp not in visited:
+                        stack.append((inp, False))
 
         # Dictionary of accumulated gradients: Tensor -> Tensor
         grads = {root_tensor: grad}
@@ -104,13 +108,17 @@ def backward(root_tensor: 'Tensor', grad: Optional['Tensor'] = None):
                 if inp.is_leaf:
                     if inp.grad is None:
                         nid = id(g_in._native)
-                        if nid in used_leaf_natives or not g_in._native.is_contiguous():
+                        if nid in used_leaf_natives or not g_in._native.is_dense_zero_offset():
                             inp.grad = g_in.clone()
                         else:
                             used_leaf_natives.add(nid)
                             inp.grad = g_in
                     else:
                         inp.grad = inp.grad + g_in
+
+        grads.clear()
+        visited.clear()
+        topo.clear()
 
 def _reduce_broadcast_gradient(grad: 'Tensor', target_shape: Tuple[int, ...]) -> 'Tensor':
     """Sums gradient over dimensions that were broadcasted during forward pass."""

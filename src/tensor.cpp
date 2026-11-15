@@ -295,34 +295,179 @@ BroadcastPlan make_broadcast_plan(const std::vector<int64_t>& a_shape,
 
 } // namespace
 
-NativeTensor::NativeTensor(const std::vector<int64_t>& s, int dev_id)
-    : device_id(dev_id), shape(s) {
+namespace {
+
+bool compute_view_strides(const std::vector<int64_t>& old_shape,
+                          const std::vector<int64_t>& old_strides,
+                          size_t numel,
+                          const std::vector<int64_t>& new_shape,
+                          std::vector<int64_t>& out_strides) {
+    out_strides.assign(new_shape.size(), 0);
+    if (numel == 0) {
+        int64_t s = 1;
+        for (int i = static_cast<int>(new_shape.size()) - 1; i >= 0; --i) {
+            out_strides[static_cast<size_t>(i)] = s;
+            s *= new_shape[static_cast<size_t>(i)];
+        }
+        return true;
+    }
+    if (new_shape.empty()) {
+        return numel == 1;
+    }
+
+    struct Chunk {
+        int64_t size;
+        int64_t stride;
+    };
+    std::vector<Chunk> chunks;
+    for (int i = static_cast<int>(old_shape.size()) - 1; i >= 0; --i) {
+        int64_t d = old_shape[static_cast<size_t>(i)];
+        int64_t st = old_strides[static_cast<size_t>(i)];
+        if (d == 1) continue;
+        if (!chunks.empty() && st == chunks.back().size * chunks.back().stride) {
+            chunks.back().size *= d;
+        } else {
+            chunks.push_back({d, st});
+        }
+    }
+    if (chunks.empty()) {
+        chunks.push_back({1, 1});
+    }
+
+    size_t chunk_idx = 0;
+    int64_t chunk_rem = chunks[0].size;
+    int64_t cur_stride = chunks[0].stride;
+
+    for (int i = static_cast<int>(new_shape.size()) - 1; i >= 0; --i) {
+        int64_t d = new_shape[static_cast<size_t>(i)];
+        if (d == 1) {
+            if (i + 1 < static_cast<int>(new_shape.size())) {
+                out_strides[static_cast<size_t>(i)] =
+                    out_strides[static_cast<size_t>(i + 1)] * new_shape[static_cast<size_t>(i + 1)];
+            } else {
+                out_strides[static_cast<size_t>(i)] = 1;
+            }
+            continue;
+        }
+        while (chunk_rem == 1) {
+            ++chunk_idx;
+            if (chunk_idx >= chunks.size()) return false;
+            chunk_rem = chunks[chunk_idx].size;
+            cur_stride = chunks[chunk_idx].stride;
+        }
+        if (chunk_rem % d != 0) {
+            return false;
+        }
+        out_strides[static_cast<size_t>(i)] = cur_stride;
+        cur_stride *= d;
+        chunk_rem /= d;
+    }
+    return chunk_rem == 1 && (chunk_idx + 1 == chunks.size());
+}
+
+void advance_odometer(size_t ndim,
+                      const std::vector<int64_t>& shape,
+                      const std::vector<int64_t>& strides,
+                      std::vector<int64_t>& coord,
+                      int64_t& offset_accum) {
+    for (int d = static_cast<int>(ndim) - 1; d >= 0; --d) {
+        size_t ud = static_cast<size_t>(d);
+        offset_accum += strides[ud];
+        if (++coord[ud] < shape[ud]) {
+            return;
+        }
+        offset_accum -= strides[ud] * shape[ud];
+        coord[ud] = 0;
+    }
+}
+
+uint32_t packed_word_count(size_t num_elems, size_t elem_bytes) {
+    if (elem_bytes == 4) return static_cast<uint32_t>(num_elems);
+    if (elem_bytes == 8) return static_cast<uint32_t>(num_elems * 2);
+    if (elem_bytes == 2) return static_cast<uint32_t>((num_elems + 1) / 2);
+    return static_cast<uint32_t>((num_elems + 3) / 4);
+}
+
+bool all_strides_non_negative(const std::vector<int64_t>& st) {
+    for (int64_t v : st) {
+        if (v < 0) return false;
+    }
+    return true;
+}
+
+} // namespace
+
+NativeTensor::NativeTensor(const std::vector<int64_t>& s, int dev_id, ScalarType dt)
+    : shape(s), device_id(dev_id), dtype(dt), storage_offset(0) {
     numel = 1;
-    for (auto d : shape) {
+    for (int64_t d : shape) {
+        if (d < 0) {
+            throw std::runtime_error("Negative dimension in tensor shape");
+        }
         numel *= static_cast<size_t>(d);
     }
     compute_default_strides();
 
+    storage = std::make_shared<TensorStorage>();
+    storage->id = TensorStorage::next_id();
+
+    const size_t total_bytes = numel * element_size(dtype);
     if (device_id >= 0) {
-        gpu_buffer = VulkanMemoryManager::instance().allocate(device_id, numel * sizeof(float));
+        VkDeviceSize alloc_bytes = total_bytes == 0 ? 4 : static_cast<VkDeviceSize>(total_bytes);
+        storage->gpu_buffer = VulkanMemoryManager::instance().allocate(
+            static_cast<uint32_t>(device_id), alloc_bytes);
     } else {
-        cpu_data.resize(numel, 0.0f);
+        storage->cpu_bytes.resize(total_bytes, 0);
     }
 }
 
-std::shared_ptr<NativeTensor> NativeTensor::create(const std::vector<int64_t>& shape, int dev_id) {
-    return std::make_shared<NativeTensor>(shape, dev_id);
+NativeTensor::NativeTensor(const std::vector<int64_t>& view_shape,
+                           const std::vector<int64_t>& view_strides,
+                           size_t offset_elems,
+                           std::shared_ptr<TensorStorage> shared_storage,
+                           int dev_id,
+                           ScalarType dt)
+    : shape(view_shape),
+      strides(view_strides),
+      device_id(dev_id),
+      dtype(dt),
+      storage_offset(offset_elems),
+      storage(std::move(shared_storage)) {
+    numel = 1;
+    for (int64_t d : shape) {
+        if (d < 0) {
+            throw std::runtime_error("Negative dimension in view shape");
+        }
+        numel *= static_cast<size_t>(d);
+    }
 }
 
-// Metadata-only construction: shape/strides are set, no storage is allocated.
-// The caller is responsible for attaching a buffer.
+std::shared_ptr<NativeTensor> NativeTensor::create(const std::vector<int64_t>& shape,
+                                                   int dev_id, ScalarType dt) {
+    return std::make_shared<NativeTensor>(shape, dev_id, dt);
+}
+
+// Metadata-only construction: shape/strides are set, storage attached by caller.
 NativeTensor::NativeTensor(const std::vector<int64_t>& s, int dev_id, MetadataOnly)
-    : device_id(dev_id), shape(s) {
+    : shape(s), device_id(dev_id) {
     numel = 1;
-    for (auto d : shape) {
+    for (int64_t d : shape) {
         numel *= static_cast<size_t>(d);
     }
     compute_default_strides();
+}
+
+uintptr_t NativeTensor::data_ptr() const {
+    const size_t byte_off = storage_offset * itemsize();
+    if (device_id < 0) {
+        const uint8_t* ptr = cpu_raw_ptr();
+        return ptr ? (reinterpret_cast<uintptr_t>(ptr) + byte_off) : 0;
+    }
+    auto buf = gpu_buf();
+    if (!buf) return 0;
+    return reinterpret_cast<uintptr_t>(buf->buffer) +
+           static_cast<uintptr_t>(buf->arena_offset) +
+           static_cast<uintptr_t>(byte_off);
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::strided_copy(const std::vector<int64_t>& out_shape,
@@ -330,75 +475,360 @@ std::shared_ptr<NativeTensor> NativeTensor::strided_copy(const std::vector<int64
     if (out_shape.size() != src_strides.size()) {
         throw std::runtime_error("strided_copy: shape and stride rank mismatch");
     }
-    if (out_shape.size() > 6) {
-        throw std::runtime_error("strided_copy supports up to 6 dimensions");
-    }
 
-    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+    auto out = std::make_shared<NativeTensor>(out_shape, device_id, dtype);
+    if (out->numel == 0) return out;
 
-    if (device_id >= 0) {
+    const size_t elem_sz = itemsize();
+
+    if (device_id >= 0 && out_shape.size() <= 6 && all_strides_non_negative(src_strides)) {
         uint32_t ndim = static_cast<uint32_t>(out_shape.size());
         struct {
             uint32_t total_elements;
             uint32_t ndim;
+            uint32_t src_offset;
+            uint32_t elem_bytes;
             uint32_t shape[6];
             uint32_t src_stride[6];
         } pc{};
         pc.total_elements = static_cast<uint32_t>(out->numel);
         pc.ndim = ndim;
+        pc.src_offset = static_cast<uint32_t>(storage_offset);
+        pc.elem_bytes = static_cast<uint32_t>(elem_sz);
         for (uint32_t i = 0; i < ndim; ++i) {
             pc.shape[i] = static_cast<uint32_t>(out_shape[i]);
-            if (src_strides[i] < 0) {
-                throw std::runtime_error("strided_copy: negative strides are not supported");
-            }
             pc.src_stride[i] = static_cast<uint32_t>(src_strides[i]);
         }
 
-        uint32_t groups = (static_cast<uint32_t>(out->numel) + 255) / 256;
+        uint32_t words = packed_word_count(out->numel, elem_sz);
+        uint32_t groups = (words + 255u) / 256u;
         VulkanPipelineManager::instance().dispatch(
             device_id, "copy_strided",
-            {gpu_buffer, out->gpu_buffer},
+            {gpu_buf(), out->gpu_buf()},
             &pc, sizeof(pc), groups);
         return out;
     }
 
-    // CPU fallback.
+    // CPU strided copy (or GPU fallback when rank > 6 / negative stride)
+    if (device_id >= 0) {
+        auto cpu_src = std::make_shared<NativeTensor>(out_shape, -1, dtype);
+        // Copy whole underlying GPU storage to host once, strided-copy on CPU, upload.
+        auto buf = gpu_buf();
+        std::vector<uint8_t> raw_storage(static_cast<size_t>(buf->size));
+        VulkanMemoryManager::instance().copy_device_to_host(device_id, buf, raw_storage.data(), buf->size);
+        const size_t ndim = out_shape.size();
+        std::vector<int64_t> coord(ndim, 0);
+        int64_t src_idx = static_cast<int64_t>(storage_offset);
+        uint8_t* dst_raw = cpu_src->cpu_raw_ptr();
+        for (size_t n = 0; n < out->numel; ++n) {
+            std::memcpy(dst_raw + n * elem_sz,
+                        raw_storage.data() + static_cast<size_t>(src_idx) * elem_sz,
+                        elem_sz);
+            advance_odometer(ndim, out_shape, src_strides, coord, src_idx);
+        }
+        return cpu_src->to_device(device_id);
+    }
+
     const size_t ndim = out_shape.size();
     std::vector<int64_t> coord(ndim, 0);
-    int64_t src_idx = 0;
+    int64_t src_idx = static_cast<int64_t>(storage_offset);
+    const uint8_t* src_raw = cpu_raw_ptr();
+    uint8_t* dst_raw = out->cpu_raw_ptr();
     for (size_t n = 0; n < out->numel; ++n) {
-        out->cpu_data[n] = cpu_data[src_idx];
-        for (int d = static_cast<int>(ndim) - 1; d >= 0; --d) {
-            src_idx += src_strides[d];
-            if (++coord[d] < out_shape[d]) {
-                break;
-            }
-            src_idx -= src_strides[d] * out_shape[d];
-            coord[d] = 0;
-        }
+        std::memcpy(dst_raw + n * elem_sz,
+                    src_raw + static_cast<size_t>(src_idx) * elem_sz,
+                    elem_sz);
+        advance_odometer(ndim, out_shape, src_strides, coord, src_idx);
     }
     return out;
 }
 
+std::shared_ptr<NativeTensor> NativeTensor::contiguous() const {
+    if (is_contiguous()) {
+        return std::const_pointer_cast<NativeTensor>(shared_from_this());
+    }
+    return strided_copy(shape, strides);
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::force_contiguous() const {
+    if (is_dense_zero_offset()) {
+        return std::const_pointer_cast<NativeTensor>(shared_from_this());
+    }
+    if (is_contiguous() && device_id >= 0 && numel > 0) {
+        auto out = std::make_shared<NativeTensor>(shape, device_id, dtype);
+        VulkanMemoryManager::instance().copy_buffer_to_buffer(
+            device_id, gpu_buf(), out->gpu_buf(),
+            nbytes(), storage_offset * itemsize(), 0);
+        return out;
+    }
+    return strided_copy(shape, strides);
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::cast(ScalarType target_dtype) const {
+    if (dtype == target_dtype) {
+        return std::const_pointer_cast<NativeTensor>(shared_from_this());
+    }
+
+    auto out = std::make_shared<NativeTensor>(shape, device_id, target_dtype);
+    if (numel == 0) return out;
+
+    if (device_id >= 0) {
+        std::shared_ptr<const NativeTensor> src_t = shared_from_this();
+        bool flat_contig = is_contiguous();
+        if (!flat_contig && (shape.size() > 6 || !all_strides_non_negative(strides))) {
+            src_t = force_contiguous();
+            flat_contig = true;
+        }
+
+        struct {
+            uint32_t total_elements;
+            uint32_t src_dtype;
+            uint32_t dst_dtype;
+            uint32_t src_offset;
+            uint32_t ndim;
+            uint32_t shape[6];
+            uint32_t src_stride[6];
+        } pc{};
+        pc.total_elements = static_cast<uint32_t>(numel);
+        pc.src_dtype = static_cast<uint32_t>(src_t->dtype);
+        pc.dst_dtype = static_cast<uint32_t>(target_dtype);
+        pc.src_offset = static_cast<uint32_t>(src_t->storage_offset);
+
+        if (flat_contig) {
+            pc.ndim = 1u;
+            pc.shape[0] = static_cast<uint32_t>(numel);
+            pc.src_stride[0] = 1u;
+        } else {
+            pc.ndim = static_cast<uint32_t>(src_t->shape.size());
+            for (uint32_t i = 0; i < pc.ndim; ++i) {
+                pc.shape[i] = static_cast<uint32_t>(src_t->shape[i]);
+                pc.src_stride[i] = static_cast<uint32_t>(src_t->strides[i]);
+            }
+        }
+
+        uint32_t words = packed_word_count(numel, element_size(target_dtype));
+        uint32_t groups = (words + 255u) / 256u;
+        VulkanPipelineManager::instance().dispatch(
+            device_id, "cast_dtype",
+            {src_t->gpu_buf(), out->gpu_buf()},
+            &pc, sizeof(pc), groups);
+        return out;
+    }
+
+    // CPU cast (exact integer path for Int32/Int64/Bool/UInt8 -> Int64/Int32/Bool/UInt8)
+    const size_t ndim = shape.size();
+    std::vector<int64_t> coord(ndim, 0);
+    int64_t src_idx = static_cast<int64_t>(storage_offset);
+    const uint8_t* src_raw = cpu_raw_ptr();
+    uint8_t* dst_raw = out->cpu_raw_ptr();
+
+    for (size_t n = 0; n < numel; ++n) {
+        size_t s = static_cast<size_t>(src_idx);
+        if (target_dtype == ScalarType::Int64 &&
+            (dtype == ScalarType::Int32 || dtype == ScalarType::Bool || dtype == ScalarType::UInt8)) {
+            int64_t iv = 0;
+            if (dtype == ScalarType::Int32) {
+                int32_t v32 = 0;
+                std::memcpy(&v32, src_raw + s * 4, 4);
+                iv = static_cast<int64_t>(v32);
+            } else if (dtype == ScalarType::Bool) {
+                iv = (src_raw[s] != 0) ? 1 : 0;
+            } else {
+                iv = static_cast<int64_t>(src_raw[s]);
+            }
+            std::memcpy(dst_raw + n * 8, &iv, 8);
+        } else if (dtype == ScalarType::Int64 &&
+                   (target_dtype == ScalarType::Int32 || target_dtype == ScalarType::Bool || target_dtype == ScalarType::UInt8)) {
+            int64_t iv = 0;
+            std::memcpy(&iv, src_raw + s * 8, 8);
+            if (target_dtype == ScalarType::Int32) {
+                int32_t v32 = static_cast<int32_t>(iv);
+                std::memcpy(dst_raw + n * 4, &v32, 4);
+            } else if (target_dtype == ScalarType::Bool) {
+                dst_raw[n] = (iv != 0) ? 1u : 0u;
+            } else {
+                dst_raw[n] = static_cast<uint8_t>(iv);
+            }
+        } else {
+            double val = read_scalar_as_double(src_raw, s, dtype);
+            write_scalar_from_double(dst_raw, n, target_dtype, val);
+        }
+        advance_odometer(ndim, shape, strides, coord, src_idx);
+    }
+    return out;
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::as_strided(
+    const std::vector<int64_t>& new_shape,
+    const std::vector<int64_t>& new_strides,
+    int64_t new_offset) const {
+    if (new_shape.size() != new_strides.size()) {
+        throw std::runtime_error("as_strided: shape and stride rank mismatch");
+    }
+    size_t eff_offset = (new_offset < 0) ? storage_offset : static_cast<size_t>(new_offset);
+    size_t view_numel = 1;
+    int64_t max_rel = 0;
+    for (size_t i = 0; i < new_shape.size(); ++i) {
+        if (new_shape[i] < 0) {
+            throw std::runtime_error("as_strided: negative shape dimension");
+        }
+        if (new_strides[i] < 0) {
+            throw std::runtime_error("as_strided: negative stride not supported");
+        }
+        view_numel *= static_cast<size_t>(new_shape[i]);
+        if (new_shape[i] > 0) {
+            max_rel += (new_shape[i] - 1) * new_strides[i];
+        }
+    }
+    if (view_numel > 0) {
+        size_t cap_elems = (device_id >= 0)
+                               ? (gpu_buf()->size / itemsize())
+                               : (storage->cpu_bytes.size() / itemsize());
+        if (eff_offset + static_cast<size_t>(max_rel) >= cap_elems) {
+            throw std::runtime_error("as_strided: view extends past end of storage");
+        }
+    }
+    return std::make_shared<NativeTensor>(new_shape, new_strides, eff_offset, storage, device_id, dtype);
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::transpose_view(int64_t dim0, int64_t dim1) const {
+    const int64_t ndim = static_cast<int64_t>(shape.size());
+    if (dim0 < 0) dim0 += ndim;
+    if (dim1 < 0) dim1 += ndim;
+    if (dim0 < 0 || dim0 >= ndim || dim1 < 0 || dim1 >= ndim) {
+        throw std::runtime_error("transpose: dimension out of range");
+    }
+    std::vector<int64_t> new_shape = shape;
+    std::vector<int64_t> new_strides = strides;
+    std::swap(new_shape[static_cast<size_t>(dim0)], new_shape[static_cast<size_t>(dim1)]);
+    std::swap(new_strides[static_cast<size_t>(dim0)], new_strides[static_cast<size_t>(dim1)]);
+    return std::make_shared<NativeTensor>(new_shape, new_strides, storage_offset, storage, device_id, dtype);
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::permute_view(const std::vector<int64_t>& dims) const {
+    const size_t ndim = shape.size();
+    if (dims.size() != ndim) {
+        throw std::runtime_error("permute: number of dims must match tensor rank");
+    }
+    std::vector<bool> seen(ndim, false);
+    std::vector<int64_t> new_shape(ndim);
+    std::vector<int64_t> new_strides(ndim);
+    for (size_t i = 0; i < ndim; ++i) {
+        int64_t d = dims[i];
+        if (d < 0) d += static_cast<int64_t>(ndim);
+        if (d < 0 || d >= static_cast<int64_t>(ndim) || seen[static_cast<size_t>(d)]) {
+            throw std::runtime_error("permute: invalid or duplicate dimension");
+        }
+        seen[static_cast<size_t>(d)] = true;
+        new_shape[i] = shape[static_cast<size_t>(d)];
+        new_strides[i] = strides[static_cast<size_t>(d)];
+    }
+    return std::make_shared<NativeTensor>(new_shape, new_strides, storage_offset, storage, device_id, dtype);
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::expand_view(const std::vector<int64_t>& new_shape) const {
+    if (new_shape.size() < shape.size()) {
+        throw std::runtime_error("expand: target rank cannot be smaller than tensor rank");
+    }
+    const size_t out_ndim = new_shape.size();
+    const size_t lead = out_ndim - shape.size();
+    std::vector<int64_t> resolved_shape(out_ndim);
+    std::vector<int64_t> new_strides(out_ndim);
+
+    for (size_t i = 0; i < out_ndim; ++i) {
+        int64_t target_d = new_shape[i];
+        if (i < lead) {
+            if (target_d < 0) {
+                throw std::runtime_error("expand: cannot use -1 for new leading dimension");
+            }
+            resolved_shape[i] = target_d;
+            new_strides[i] = 0;
+        } else {
+            size_t j = i - lead;
+            int64_t src_d = shape[j];
+            if (target_d == -1) target_d = src_d;
+            if (target_d == src_d) {
+                resolved_shape[i] = src_d;
+                new_strides[i] = strides[j];
+            } else if (src_d == 1 && target_d >= 0) {
+                resolved_shape[i] = target_d;
+                new_strides[i] = 0;
+            } else {
+                throw std::runtime_error("expand: expanded size must match existing size or be 1");
+            }
+        }
+    }
+    return std::make_shared<NativeTensor>(resolved_shape, new_strides, storage_offset, storage, device_id, dtype);
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::slice_view(int64_t dim, int64_t start,
+                                                       int64_t stop, int64_t step) const {
+    const int64_t ndim = static_cast<int64_t>(shape.size());
+    if (dim < 0) dim += ndim;
+    if (dim < 0 || dim >= ndim) {
+        throw std::runtime_error("slice_view: dimension out of range");
+    }
+    if (step <= 0) {
+        throw std::runtime_error("slice_view: step must be > 0");
+    }
+    const size_t udim = static_cast<size_t>(dim);
+    const int64_t dim_len = shape[udim];
+    if (start < 0) start += dim_len;
+    if (stop < 0) stop += dim_len;
+    start = std::max<int64_t>(0, std::min<int64_t>(start, dim_len));
+    stop = std::max<int64_t>(start, std::min<int64_t>(stop, dim_len));
+
+    const int64_t slice_len = (stop > start) ? ((stop - start + step - 1) / step) : 0;
+    std::vector<int64_t> new_shape = shape;
+    std::vector<int64_t> new_strides = strides;
+    new_shape[udim] = slice_len;
+    new_strides[udim] *= step;
+    const size_t new_offset = storage_offset + static_cast<size_t>(start) * static_cast<size_t>(strides[udim]);
+    return std::make_shared<NativeTensor>(new_shape, new_strides, new_offset, storage, device_id, dtype);
+}
+
 std::shared_ptr<NativeTensor> NativeTensor::reshape_view(const std::vector<int64_t>& new_shape) const {
-    if (!is_contiguous()) {
-        throw std::runtime_error("reshape_view requires a contiguous tensor");
+    std::vector<int64_t> resolved = new_shape;
+    int infer_idx = -1;
+    size_t known_prod = 1;
+    for (size_t i = 0; i < resolved.size(); ++i) {
+        if (resolved[i] == -1) {
+            if (infer_idx >= 0) {
+                throw std::runtime_error("reshape_view: only one -1 dimension allowed");
+            }
+            infer_idx = static_cast<int>(i);
+        } else if (resolved[i] < 0) {
+            throw std::runtime_error("reshape_view: negative dimension size");
+        } else {
+            known_prod *= static_cast<size_t>(resolved[i]);
+        }
+    }
+    if (infer_idx >= 0) {
+        if (known_prod == 0 || numel % known_prod != 0) {
+            throw std::runtime_error("reshape_view: cannot infer dimension size");
+        }
+        resolved[static_cast<size_t>(infer_idx)] = static_cast<int64_t>(numel / known_prod);
     }
 
     size_t new_numel = 1;
-    for (auto d : new_shape) {
-        new_numel *= static_cast<size_t>(d);
-    }
+    for (int64_t d : resolved) new_numel *= static_cast<size_t>(d);
     if (new_numel != numel) {
         throw std::runtime_error("reshape_view: element count mismatch");
     }
 
-    auto view = std::make_shared<NativeTensor>(new_shape, device_id, MetadataOnly{});
-    // GPU: share the buffer (no copy). CPU: the CPU path stores data in a
-    // std::vector, so sharing is expressed as a copy.
-    view->gpu_buffer = gpu_buffer;
-    view->cpu_data = cpu_data;
-    return view;
+    std::vector<int64_t> new_strides;
+    if (compute_view_strides(shape, strides, numel, resolved, new_strides)) {
+        return std::make_shared<NativeTensor>(resolved, new_strides, storage_offset, storage, device_id, dtype);
+    }
+
+    auto dense = force_contiguous();
+    std::vector<int64_t> dense_strides(resolved.size(), 1);
+    int64_t st = 1;
+    for (int i = static_cast<int>(resolved.size()) - 1; i >= 0; --i) {
+        dense_strides[static_cast<size_t>(i)] = st;
+        st *= resolved[static_cast<size_t>(i)];
+    }
+    return std::make_shared<NativeTensor>(resolved, dense_strides, 0, dense->storage, device_id, dtype);
 }
 
 void NativeTensor::copy_from_native(const std::shared_ptr<NativeTensor>& src) {
@@ -409,12 +839,16 @@ void NativeTensor::copy_from_native(const std::shared_ptr<NativeTensor>& src) {
     if (src->device_id != device_id) {
         throw std::runtime_error("copy_from_native requires both tensors on the same device");
     }
+    if (!is_dense_zero_offset()) {
+        throw std::runtime_error("copy_from_native: destination must be dense contiguous with zero offset");
+    }
+    auto src_ready = (src->dtype == dtype) ? src->force_contiguous() : src->cast(dtype)->force_contiguous();
 
     if (device_id >= 0) {
         VulkanMemoryManager::instance().copy_buffer_to_buffer(
-            device_id, src->gpu_buffer, gpu_buffer, numel * sizeof(float));
+            device_id, src_ready->gpu_buf(), gpu_buf(), nbytes());
     } else {
-        std::copy(src->cpu_data.begin(), src->cpu_data.begin() + numel, cpu_data.begin());
+        std::memcpy(cpu_raw_ptr(), src_ready->cpu_raw_ptr(), nbytes());
     }
 }
 
@@ -422,35 +856,7 @@ std::shared_ptr<NativeTensor> NativeTensor::slice_dim0(int64_t start, int64_t en
     if (shape.empty()) {
         throw std::runtime_error("slice_dim0 requires at least 1D tensor");
     }
-    if (!is_contiguous()) {
-        throw std::runtime_error("slice_dim0 requires a contiguous tensor");
-    }
-    const int64_t dim0 = shape[0];
-    if (start < 0) start += dim0;
-    if (end < 0) end += dim0;
-    start = std::max<int64_t>(0, std::min<int64_t>(start, dim0));
-    end = std::max<int64_t>(start, std::min<int64_t>(end, dim0));
-
-    std::vector<int64_t> out_shape = shape;
-    out_shape[0] = end - start;
-    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
-    if (out->numel == 0) return out;
-
-    const size_t inner = strides[0];
-    const size_t offset_elems = static_cast<size_t>(start) * inner;
-    const size_t count_elems = out->numel;
-
-    if (device_id >= 0) {
-        VulkanMemoryManager::instance().copy_buffer_to_buffer(
-            device_id, gpu_buffer, out->gpu_buffer,
-            count_elems * sizeof(float),
-            offset_elems * sizeof(float), 0);
-    } else {
-        std::copy(cpu_data.begin() + offset_elems,
-                  cpu_data.begin() + offset_elems + count_elems,
-                  out->cpu_data.begin());
-    }
-    return out;
+    return slice_view(0, start, end, 1);
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::cat_dim0(
@@ -464,6 +870,7 @@ std::shared_ptr<NativeTensor> NativeTensor::cat_dim0(
     }
 
     int64_t total_dim0 = 0;
+    ScalarType out_dt = first->dtype;
     for (const auto& t : tensors) {
         if (t->shape.size() != first->shape.size()) {
             throw std::runtime_error("cat_dim0: rank mismatch");
@@ -473,48 +880,58 @@ std::shared_ptr<NativeTensor> NativeTensor::cat_dim0(
                 throw std::runtime_error("cat_dim0: non-concat dimension mismatch");
             }
         }
-        if (!t->is_contiguous()) {
-            throw std::runtime_error("cat_dim0 requires contiguous tensors");
-        }
+        out_dt = promote_dtype(out_dt, t->dtype);
         total_dim0 += t->shape[0];
     }
 
     std::vector<int64_t> out_shape = first->shape;
     out_shape[0] = total_dim0;
-    auto out = std::make_shared<NativeTensor>(out_shape, target_device_id);
+    auto out = std::make_shared<NativeTensor>(out_shape, target_device_id, out_dt);
 
+    const size_t elem_sz = element_size(out_dt);
     size_t offset_elems = 0;
-    for (const auto& t : tensors) {
-        if (t->numel == 0) continue;
-        const size_t bytes = t->numel * sizeof(float);
-        const size_t dst_off_bytes = offset_elems * sizeof(float);
+    for (const auto& t_raw : tensors) {
+        if (t_raw->numel == 0) continue;
+        auto t_cast = (t_raw->dtype == out_dt) ? t_raw : t_raw->cast(out_dt);
+        auto t = t_cast->force_contiguous();
+
+        const size_t bytes = t->numel * elem_sz;
+        const size_t dst_off_bytes = offset_elems * elem_sz;
 
         if (target_device_id >= 0 && t->device_id >= 0) {
             if (t->device_id == target_device_id) {
                 VulkanMemoryManager::instance().copy_buffer_to_buffer(
-                    target_device_id, t->gpu_buffer, out->gpu_buffer, bytes, 0, dst_off_bytes);
+                    target_device_id, t->gpu_buf(), out->gpu_buf(), bytes, 0, dst_off_bytes);
             } else {
                 VulkanMemoryManager::instance().copy_cross_device(
-                    t->device_id, t->gpu_buffer, target_device_id, out->gpu_buffer, bytes, 0, dst_off_bytes);
+                    t->device_id, t->gpu_buf(), target_device_id, out->gpu_buf(), bytes, 0, dst_off_bytes);
             }
         } else if (target_device_id == -1 && t->device_id == -1) {
-            std::copy(t->cpu_data.begin(), t->cpu_data.end(), out->cpu_data.begin() + offset_elems);
+            std::memcpy(out->cpu_raw_ptr() + dst_off_bytes, t->cpu_raw_ptr(), bytes);
         } else if (target_device_id == -1 && t->device_id >= 0) {
-            t->copy_to_host(out->cpu_data.data() + offset_elems, t->numel);
+            t->to_raw_bytes(out->cpu_raw_ptr() + dst_off_bytes, bytes);
         } else {
-            // CPU -> GPU
             auto stage_t = t->to_device(target_device_id);
             VulkanMemoryManager::instance().copy_buffer_to_buffer(
-                target_device_id, stage_t->gpu_buffer, out->gpu_buffer, bytes, 0, dst_off_bytes);
+                target_device_id, stage_t->gpu_buf(), out->gpu_buf(), bytes, 0, dst_off_bytes);
         }
         offset_elems += t->numel;
     }
     return out;
 }
 
-std::shared_ptr<NativeTensor> NativeTensor::from_float_array(const float* data, const std::vector<int64_t>& shape, int dev_id) {
-    auto tensor = std::make_shared<NativeTensor>(shape, dev_id);
+std::shared_ptr<NativeTensor> NativeTensor::from_float_array(
+    const float* data, const std::vector<int64_t>& shape, int dev_id) {
+    auto tensor = std::make_shared<NativeTensor>(shape, dev_id, ScalarType::Float32);
     tensor->copy_from_host(data, tensor->numel);
+    return tensor;
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::from_raw_bytes(
+    const void* data, size_t byte_count, const std::vector<int64_t>& shape,
+    int dev_id, ScalarType dt) {
+    auto tensor = std::make_shared<NativeTensor>(shape, dev_id, dt);
+    tensor->copy_from_raw_bytes(data, byte_count);
     return tensor;
 }
 
@@ -523,73 +940,129 @@ void NativeTensor::compute_default_strides() {
     if (shape.empty()) return;
     int64_t stride = 1;
     for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
-        strides[i] = stride;
-        stride *= shape[i];
+        strides[static_cast<size_t>(i)] = stride;
+        stride *= shape[static_cast<size_t>(i)];
     }
 }
 
 bool NativeTensor::is_contiguous() const {
-    if (shape.empty()) return true;
+    if (numel == 0 || shape.empty()) return true;
     int64_t expected = 1;
     for (int i = static_cast<int>(shape.size()) - 1; i >= 0; --i) {
-        if (strides[i] != expected) return false;
-        expected *= shape[i];
+        int64_t d = shape[static_cast<size_t>(i)];
+        if (d != 1) {
+            if (strides[static_cast<size_t>(i)] != expected) return false;
+            expected *= d;
+        }
     }
     return true;
 }
 
-void NativeTensor::copy_from_host(const float* src, size_t count) {
-    size_t copy_count = std::min(count, numel);
+void NativeTensor::copy_from_raw_bytes(const void* src, size_t byte_count) {
+    if (!is_dense_zero_offset()) {
+        throw std::runtime_error("copy_from_raw_bytes requires dense zero-offset tensor");
+    }
+    size_t copy_bytes = std::min(byte_count, nbytes());
+    if (copy_bytes == 0) return;
     if (device_id >= 0) {
-        VulkanMemoryManager::instance().copy_host_to_device(device_id, src, gpu_buffer, copy_count * sizeof(float));
+        VulkanMemoryManager::instance().copy_host_to_device(
+            device_id, src, gpu_buf(), static_cast<VkDeviceSize>(copy_bytes));
     } else {
-        std::copy(src, src + copy_count, cpu_data.data());
+        std::memcpy(cpu_raw_ptr(), src, copy_bytes);
     }
 }
 
-void NativeTensor::copy_to_host(float* dst, size_t count) {
-    size_t copy_count = std::min(count, numel);
-    if (device_id >= 0) {
-        VulkanMemoryManager::instance().copy_device_to_host(device_id, gpu_buffer, dst, copy_count * sizeof(float));
+void NativeTensor::to_raw_bytes(void* dst, size_t byte_count) const {
+    auto src = is_dense_zero_offset() ? std::const_pointer_cast<NativeTensor>(shared_from_this())
+                                       : force_contiguous();
+    size_t copy_bytes = std::min(byte_count, src->nbytes());
+    if (copy_bytes == 0) return;
+    if (src->device_id >= 0) {
+        VulkanMemoryManager::instance().copy_device_to_host(
+            src->device_id, src->gpu_buf(), dst, static_cast<VkDeviceSize>(copy_bytes));
     } else {
-        std::copy(cpu_data.data(), cpu_data.data() + copy_count, dst);
+        std::memcpy(dst, src->cpu_raw_ptr(), copy_bytes);
     }
+}
+
+void NativeTensor::copy_from_host(const float* src, size_t count) {
+    if (dtype == ScalarType::Float32 && is_dense_zero_offset()) {
+        copy_from_raw_bytes(src, std::min(count, numel) * sizeof(float));
+        return;
+    }
+    size_t copy_count = std::min(count, numel);
+    auto f32 = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+    f32->copy_from_raw_bytes(src, copy_count * sizeof(float));
+    auto casted = f32->cast(dtype);
+    copy_from_native(casted);
+}
+
+void NativeTensor::copy_to_host(float* dst, size_t count) {
+    if (dtype == ScalarType::Float32) {
+        to_raw_bytes(dst, std::min(count, numel) * sizeof(float));
+        return;
+    }
+    auto f32 = cast(ScalarType::Float32);
+    f32->to_raw_bytes(dst, std::min(count, numel) * sizeof(float));
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::to_device(int target_device_id) {
     if (device_id == target_device_id) {
         return shared_from_this();
     }
-    auto target = std::make_shared<NativeTensor>(shape, target_device_id);
-    if (device_id == -1 && target_device_id >= 0) {
-        // CPU -> GPU
-        target->copy_from_host(cpu_data.data(), numel);
-    } else if (device_id >= 0 && target_device_id == -1) {
-        // GPU -> CPU
-        copy_to_host(target->cpu_data.data(), numel);
+    auto src = force_contiguous();
+    auto target = std::make_shared<NativeTensor>(shape, target_device_id, dtype);
+    if (numel == 0) return target;
+
+    if (src->device_id == -1 && target_device_id >= 0) {
+        target->copy_from_raw_bytes(src->cpu_raw_ptr(), src->nbytes());
+    } else if (src->device_id >= 0 && target_device_id == -1) {
+        src->to_raw_bytes(target->cpu_raw_ptr(), src->nbytes());
     } else {
-        // GPU -> GPU (Cross-GPU Vulkan transfer, e.g. vk:0 to vk:1)
-        VulkanMemoryManager::instance().copy_cross_device(device_id, gpu_buffer,
-                                                         target_device_id, target->gpu_buffer,
-                                                         numel * sizeof(float));
+        VulkanMemoryManager::instance().copy_cross_device(
+            src->device_id, src->gpu_buf(), target_device_id, target->gpu_buf(), src->nbytes());
     }
     return target;
 }
 
-std::shared_ptr<NativeTensor> NativeTensor::clone() {
-    auto target = std::make_shared<NativeTensor>(shape, device_id);
+std::shared_ptr<NativeTensor> NativeTensor::clone() const {
+    if (!is_dense_zero_offset()) {
+        return force_contiguous();
+    }
+    auto target = std::make_shared<NativeTensor>(shape, device_id, dtype);
+    if (numel == 0) return target;
     if (device_id >= 0) {
-        VulkanMemoryManager::instance().copy_buffer_to_buffer(device_id, gpu_buffer, target->gpu_buffer, numel * sizeof(float));
+        VulkanMemoryManager::instance().copy_buffer_to_buffer(
+            device_id, gpu_buf(), target->gpu_buf(), nbytes());
     } else {
-        target->cpu_data = cpu_data;
+        std::memcpy(target->cpu_raw_ptr(), cpu_raw_ptr(), nbytes());
     }
     return target;
 }
 
 void NativeTensor::fill_(float val) {
-    if (device_id >= 0) {
-        if (numel == 0) return;
-        uint32_t num_vec4 = static_cast<uint32_t>(numel / 4);
+    if (!is_dense_zero_offset()) {
+        throw std::runtime_error("fill_: requires contiguous zero-offset tensor");
+    }
+    if (numel == 0) return;
+
+    if (device_id < 0) {
+        if (dtype == ScalarType::Float32) {
+            float* ptr = cpu_f32();
+            std::fill(ptr, ptr + numel, val);
+        } else {
+            uint8_t* ptr = cpu_raw_ptr();
+            for (size_t i = 0; i < numel; ++i) {
+                write_scalar_from_double(ptr, i, dtype, static_cast<double>(val));
+            }
+        }
+        return;
+    }
+
+    auto buf = gpu_buf();
+    if (dtype == ScalarType::Float32 || val == 0.0f) {
+        size_t word_count = (dtype == ScalarType::Float32) ? numel : ((nbytes() + 3) / 4);
+        uint32_t num_vec4 = static_cast<uint32_t>(word_count / 4);
         if (num_vec4 > 0) {
             struct {
                 uint32_t num_vec4;
@@ -601,27 +1074,31 @@ void NativeTensor::fill_(float val) {
             uint32_t groups = (num_vec4 + 255) / 256;
             VulkanPipelineManager::instance().dispatch(
                 device_id, "elementwise_unary_vec4",
-                {gpu_buffer, gpu_buffer},
+                {buf, buf},
                 &pc, sizeof(pc), groups);
         }
-        uint32_t tail = static_cast<uint32_t>(numel % 4);
+        uint32_t tail = static_cast<uint32_t>(word_count % 4);
         if (tail > 0 || num_vec4 == 0) {
             struct {
                 uint32_t total_elements;
                 uint32_t op_type;
                 float param1;
                 float param2;
-            } pc{static_cast<uint32_t>(numel), 15u, 0.0f, val};
+            } pc{static_cast<uint32_t>(word_count), 15u, 0.0f, val};
 
-            uint32_t groups = (static_cast<uint32_t>(numel) + 255) / 256;
+            uint32_t groups = (static_cast<uint32_t>(word_count) + 255) / 256;
             VulkanPipelineManager::instance().dispatch(
                 device_id, "elementwise_unary_scalar",
-                {gpu_buffer, gpu_buffer},
+                {buf, buf},
                 &pc, sizeof(pc), groups);
         }
-    } else {
-        std::fill(cpu_data.begin(), cpu_data.end(), val);
+        return;
     }
+
+    auto tmp = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+    tmp->fill_(val);
+    auto casted = tmp->cast(dtype);
+    copy_from_native(casted);
 }
 
 void NativeTensor::zero_() {
@@ -633,19 +1110,19 @@ void NativeTensor::adam_step_(const std::shared_ptr<NativeTensor>& grad,
                               const std::shared_ptr<NativeTensor>& exp_avg_sq,
                               float lr, float beta1, float beta2, float eps,
                               float weight_decay, bool decoupled, int64_t step) {
+    if (dtype != ScalarType::Float32 || !is_dense_zero_offset()) {
+        throw std::runtime_error("adam_step_: parameter must be dense float32");
+    }
     for (const auto* t : {grad.get(), exp_avg.get(), exp_avg_sq.get()}) {
         if (t->device_id != device_id) {
             throw std::runtime_error("adam_step_: all tensors must be on the same device");
         }
-        if (t->numel != numel) {
-            throw std::runtime_error("adam_step_: tensors must have the same number of elements");
+        if (t->numel != numel || t->dtype != ScalarType::Float32) {
+            throw std::runtime_error("adam_step_: tensors must have matching size and float32 dtype");
         }
-        if (!t->is_contiguous()) {
-            throw std::runtime_error("adam_step_: tensors must be contiguous");
+        if (!t->is_dense_zero_offset()) {
+            throw std::runtime_error("adam_step_: tensors must be contiguous zero-offset");
         }
-    }
-    if (!is_contiguous()) {
-        throw std::runtime_error("adam_step_: parameter must be contiguous");
     }
     if (step < 1) {
         throw std::runtime_error("adam_step_: step must be >= 1");
@@ -656,16 +1133,20 @@ void NativeTensor::adam_step_(const std::shared_ptr<NativeTensor>& grad,
     const float bias_c2 = static_cast<float>(1.0 - std::pow(static_cast<double>(beta2), static_cast<double>(step)));
 
     if (device_id < 0) {
-        for (size_t i = 0; i < static_cast<size_t>(numel); ++i) {
-            float p = cpu_data[i];
-            float g = grad->cpu_data[i];
+        float* p_ptr = cpu_f32();
+        const float* g_ptr = grad->cpu_f32();
+        float* m_ptr = exp_avg->cpu_f32();
+        float* v_ptr = exp_avg_sq->cpu_f32();
+        for (size_t i = 0; i < numel; ++i) {
+            float p = p_ptr[i];
+            float g = g_ptr[i];
             if (decoupled) p *= 1.0f - lr * weight_decay;
             else g += weight_decay * p;
-            const float m = beta1 * exp_avg->cpu_data[i] + (1.0f - beta1) * g;
-            const float v = beta2 * exp_avg_sq->cpu_data[i] + (1.0f - beta2) * g * g;
-            exp_avg->cpu_data[i] = m;
-            exp_avg_sq->cpu_data[i] = v;
-            cpu_data[i] = p - (lr / bias_c1) * m / (std::sqrt(v / bias_c2) + eps);
+            const float m = beta1 * m_ptr[i] + (1.0f - beta1) * g;
+            const float v = beta2 * v_ptr[i] + (1.0f - beta2) * g * g;
+            m_ptr[i] = m;
+            v_ptr[i] = v;
+            p_ptr[i] = p - (lr / bias_c1) * m / (std::sqrt(v / bias_c2) + eps);
         }
         return;
     }
@@ -691,7 +1172,7 @@ void NativeTensor::adam_step_(const std::shared_ptr<NativeTensor>& grad,
 
     VulkanPipelineManager::instance().dispatch(
         device_id, "adam_step",
-        {gpu_buffer, grad->gpu_buffer, exp_avg->gpu_buffer, exp_avg_sq->gpu_buffer},
+        {gpu_buf(), grad->gpu_buf(), exp_avg->gpu_buf(), exp_avg_sq->gpu_buf()},
         &pc, sizeof(pc), groups_x, groups_y);
 }
 
@@ -704,40 +1185,73 @@ std::shared_ptr<NativeTensor> NativeTensor::binary_op(uint32_t op_type, std::sha
         throw std::runtime_error("Tensors must be on the same device for binary operations!");
     }
 
+    const bool is_comparison =
+        (op_type == 7u || op_type == 8u || op_type == 9u ||
+         op_type == 14u || op_type == 15u || op_type == 16u);
+    const ScalarType common = promote_dtype(dtype, other->dtype);
+
     if (device_id == -1) {
-        // CPU fallback. Uses the same broadcast plan as the GPU path so the two
-        // backends cannot disagree (previously this indexed `other` with the
-        // output linear index and read out of bounds on broadcast shapes).
         const BroadcastPlan plan = make_broadcast_plan(shape, strides, other->shape, other->strides);
-        auto out = std::make_shared<NativeTensor>(plan.out_shape, -1);
+        const ScalarType out_dt = is_comparison ? ScalarType::Float32 : common;
+        auto out = std::make_shared<NativeTensor>(plan.out_shape, -1, out_dt);
+        if (out->numel == 0) return out;
 
         const size_t ndim = plan.out_shape.size();
         std::vector<int64_t> coord(ndim, 0);
-        int64_t ia = 0;
-        int64_t ib = 0;
+        int64_t ia = static_cast<int64_t>(storage_offset);
+        int64_t ib = static_cast<int64_t>(other->storage_offset);
 
-        for (size_t n = 0; n < out->numel; ++n) {
-            out->cpu_data[n] = apply_binary_op(op_type, cpu_data[ia], other->cpu_data[ib]);
-
-            // Odometer increment, last dimension fastest.
-            for (int d = static_cast<int>(ndim) - 1; d >= 0; --d) {
-                ia += plan.strides_a[d];
-                ib += plan.strides_b[d];
-                if (++coord[d] < plan.out_shape[d]) {
-                    break;
+        if (dtype == ScalarType::Float32 && other->dtype == ScalarType::Float32) {
+            const float* a_ptr = cpu_f32();
+            const float* b_ptr = other->cpu_f32();
+            float* out_ptr = out->cpu_f32();
+            for (size_t n = 0; n < out->numel; ++n) {
+                out_ptr[n] = apply_binary_op(op_type, a_ptr[ia], b_ptr[ib]);
+                advance_odometer(ndim, plan.out_shape, plan.strides_a, coord, ia);
+                // Re-step ib using saved delta: use explicit step for both arrays cleanly.
+                // Undo coord update for ib helper? Advance manually instead:
+                for (int d = static_cast<int>(ndim) - 1; d >= 0; --d) {
+                    size_t ud = static_cast<size_t>(d);
+                    ib += plan.strides_b[ud];
+                    if (coord[ud] != 0) break;
+                    ib -= plan.strides_b[ud] * plan.out_shape[ud];
                 }
-                ia -= plan.strides_a[d] * plan.out_shape[d];
-                ib -= plan.strides_b[d] * plan.out_shape[d];
-                coord[d] = 0;
+            }
+            return out;
+        }
+
+        const uint8_t* a_raw = cpu_raw_ptr();
+        const uint8_t* b_raw = other->cpu_raw_ptr();
+        uint8_t* out_raw = out->cpu_raw_ptr();
+        for (size_t n = 0; n < out->numel; ++n) {
+            float va = read_scalar_as_float(a_raw, static_cast<size_t>(ia), dtype);
+            float vb = read_scalar_as_float(b_raw, static_cast<size_t>(ib), other->dtype);
+            float res = apply_binary_op(op_type, va, vb);
+            write_scalar_from_double(out_raw, n, out_dt, static_cast<double>(res));
+            for (int d = static_cast<int>(ndim) - 1; d >= 0; --d) {
+                size_t ud = static_cast<size_t>(d);
+                ia += plan.strides_a[ud];
+                ib += plan.strides_b[ud];
+                if (++coord[ud] < plan.out_shape[ud]) break;
+                ia -= plan.strides_a[ud] * plan.out_shape[ud];
+                ib -= plan.strides_b[ud] * plan.out_shape[ud];
+                coord[ud] = 0;
             }
         }
         return out;
     }
 
-    // Determine output shape (handle broadcasting)
+    if (dtype != ScalarType::Float32 || other->dtype != ScalarType::Float32) {
+        auto a32 = (dtype == ScalarType::Float32) ? shared_from_this() : cast(ScalarType::Float32);
+        auto b32 = (other->dtype == ScalarType::Float32) ? other : other->cast(ScalarType::Float32);
+        auto res32 = a32->binary_op(op_type, b32);
+        return is_comparison ? res32 : res32->cast(common);
+    }
+
     bool same_shape = (shape == other->shape);
-    if (same_shape && is_contiguous() && other->is_contiguous()) {
-        auto out = std::make_shared<NativeTensor>(shape, device_id);
+    if (same_shape && is_dense_zero_offset() && other->is_dense_zero_offset()) {
+        auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+        if (out->numel == 0) return out;
         uint32_t num_vec4 = static_cast<uint32_t>(numel / 4);
 
         if (num_vec4 > 0) {
@@ -751,11 +1265,10 @@ std::shared_ptr<NativeTensor> NativeTensor::binary_op(uint32_t op_type, std::sha
             uint32_t groups = (num_vec4 + 255) / 256;
             VulkanPipelineManager::instance().dispatch(
                 device_id, "elementwise_binary_vec4",
-                {gpu_buffer, other->gpu_buffer, out->gpu_buffer},
+                {gpu_buf(), other->gpu_buf(), out->gpu_buf()},
                 &pc, sizeof(pc), groups);
         }
 
-        // Tail elements
         uint32_t tail_count = static_cast<uint32_t>(numel % 4);
         if (tail_count > 0) {
             struct {
@@ -764,6 +1277,8 @@ std::shared_ptr<NativeTensor> NativeTensor::binary_op(uint32_t op_type, std::sha
                 uint32_t ndim;
                 uint32_t is_b_scalar;
                 float scalar_b;
+                uint32_t offsetA;
+                uint32_t offsetB;
                 uint32_t shape[6];
                 uint32_t strideA[6];
                 uint32_t strideB[6];
@@ -776,138 +1291,277 @@ std::shared_ptr<NativeTensor> NativeTensor::binary_op(uint32_t op_type, std::sha
             uint32_t groups = (static_cast<uint32_t>(numel) + 255) / 256;
             VulkanPipelineManager::instance().dispatch(
                 device_id, "elementwise_binary_broadcast",
-                {gpu_buffer, other->gpu_buffer, out->gpu_buffer},
+                {gpu_buf(), other->gpu_buf(), out->gpu_buf()},
                 &pc, sizeof(pc), groups);
         }
         return out;
-    } else {
-        // Multi-dimensional broadcasting, driven by the shared plan.
-        const BroadcastPlan plan = make_broadcast_plan(shape, strides, other->shape, other->strides);
-        const std::vector<int64_t>& out_shape = plan.out_shape;
-        const size_t max_ndim = out_shape.size();
+    }
 
-        auto out = std::make_shared<NativeTensor>(out_shape, device_id);
-
+    // Fast path for contiguous shapes with storage_offset > 0 and arbitrary rank
+    if (same_shape && is_contiguous() && other->is_contiguous()) {
+        auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+        if (out->numel == 0) return out;
         struct {
             uint32_t total_elements;
             uint32_t op_type;
             uint32_t ndim;
             uint32_t is_b_scalar;
             float scalar_b;
+            uint32_t offsetA;
+            uint32_t offsetB;
             uint32_t shape[6];
             uint32_t strideA[6];
             uint32_t strideB[6];
         } pc{};
-
         pc.total_elements = static_cast<uint32_t>(out->numel);
         pc.op_type = op_type;
-        pc.ndim = static_cast<uint32_t>(max_ndim);
+        pc.ndim = 0;
         pc.is_b_scalar = 0;
-
-        if (max_ndim > 6) {
-            throw std::runtime_error("Broadcasting supports up to 6 dimensions");
-        }
-        for (size_t i = 0; i < max_ndim; ++i) {
-            pc.shape[i] = static_cast<uint32_t>(out_shape[i]);
-            pc.strideA[i] = static_cast<uint32_t>(plan.strides_a[i]);
-            pc.strideB[i] = static_cast<uint32_t>(plan.strides_b[i]);
-        }
+        pc.offsetA = static_cast<uint32_t>(storage_offset);
+        pc.offsetB = static_cast<uint32_t>(other->storage_offset);
 
         uint32_t groups = (static_cast<uint32_t>(out->numel) + 255) / 256;
         VulkanPipelineManager::instance().dispatch(
             device_id, "elementwise_binary_broadcast",
-            {gpu_buffer, other->gpu_buffer, out->gpu_buffer},
+            {gpu_buf(), other->gpu_buf(), out->gpu_buf()},
             &pc, sizeof(pc), groups);
-
-        return out;
-    }
-}
-
-std::shared_ptr<NativeTensor> NativeTensor::binary_op_scalar(uint32_t op_type, float scalar_val, bool reverse) {
-    if (device_id == -1) {
-        auto out = std::make_shared<NativeTensor>(shape, -1);
-        for (size_t i = 0; i < numel; ++i) {
-            float a = reverse ? scalar_val : cpu_data[i];
-            float b = reverse ? cpu_data[i] : scalar_val;
-            out->cpu_data[i] = apply_binary_op(op_type, a, b);
-        }
         return out;
     }
 
-    auto out = std::make_shared<NativeTensor>(shape, device_id);
-    uint32_t num_vec4 = static_cast<uint32_t>(numel / 4);
+    // General broadcasting / strided path.
+    std::shared_ptr<NativeTensor> a_ready = all_strides_non_negative(strides) ? shared_from_this() : force_contiguous();
+    std::shared_ptr<NativeTensor> b_ready = all_strides_non_negative(other->strides) ? other : other->force_contiguous();
 
-    if (num_vec4 > 0 && !reverse) {
-        struct {
-            uint32_t num_vec4;
-            uint32_t op_type;
-            float scalar_b;
-            uint32_t is_b_scalar;
-        } pc{num_vec4, op_type, scalar_val, 1};
-
-        uint32_t groups = (num_vec4 + 255) / 256;
-        VulkanPipelineManager::instance().dispatch(
-            device_id, "elementwise_binary_vec4",
-            {gpu_buffer, gpu_buffer, out->gpu_buffer},
-            &pc, sizeof(pc), groups);
-    }
-
-    // Tails or reverse scalar ops
-    if ((numel % 4 != 0) || reverse || num_vec4 == 0) {
-        struct {
-            uint32_t total_elements;
-            uint32_t op_type;
-            float p1;
-            float p2;
-        } pc{static_cast<uint32_t>(numel), 15, 1.0f, 0.0f};
-
-        // If reverse sub: out = scalar_val - x => (-1)*x + scalar_val
-        if (reverse && op_type == 1) {
-            pc.p1 = -1.0f;
-            pc.p2 = scalar_val;
-            uint32_t groups = (static_cast<uint32_t>(numel) + 255) / 256;
-            VulkanPipelineManager::instance().dispatch(
-                device_id, "elementwise_unary_scalar",
-                {gpu_buffer, out->gpu_buffer},
-                &pc, sizeof(pc), groups);
-            return out;
+    BroadcastPlan plan = make_broadcast_plan(a_ready->shape, a_ready->strides, b_ready->shape, b_ready->strides);
+    if (plan.out_shape.size() > 6) {
+        a_ready = a_ready->force_contiguous();
+        b_ready = b_ready->force_contiguous();
+        plan = make_broadcast_plan(a_ready->shape, a_ready->strides, b_ready->shape, b_ready->strides);
+        if (plan.out_shape.size() > 6) {
+            throw std::runtime_error("Broadcasting supports up to 6 dimensions on GPU");
         }
-
-        struct {
-            uint32_t total_elements;
-            uint32_t op_type;
-            uint32_t ndim;
-            uint32_t is_b_scalar;
-            float scalar_b;
-            uint32_t shape[6];
-            uint32_t strideA[6];
-            uint32_t strideB[6];
-        } b_pc{};
-        b_pc.total_elements = static_cast<uint32_t>(numel);
-        b_pc.op_type = op_type;
-        b_pc.is_b_scalar = 1;
-        b_pc.scalar_b = scalar_val;
-
-        uint32_t groups = (static_cast<uint32_t>(numel) + 255) / 256;
-        VulkanPipelineManager::instance().dispatch(
-            device_id, "elementwise_binary_broadcast",
-            {gpu_buffer, gpu_buffer, out->gpu_buffer},
-            &b_pc, sizeof(b_pc), groups);
     }
+
+    const std::vector<int64_t>& out_shape = plan.out_shape;
+    const size_t max_ndim = out_shape.size();
+    auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
+    if (out->numel == 0) return out;
+
+    struct {
+        uint32_t total_elements;
+        uint32_t op_type;
+        uint32_t ndim;
+        uint32_t is_b_scalar;
+        float scalar_b;
+        uint32_t offsetA;
+        uint32_t offsetB;
+        uint32_t shape[6];
+        uint32_t strideA[6];
+        uint32_t strideB[6];
+    } pc{};
+
+    pc.total_elements = static_cast<uint32_t>(out->numel);
+    pc.op_type = op_type;
+    pc.ndim = static_cast<uint32_t>(max_ndim);
+    pc.is_b_scalar = 0;
+    pc.offsetA = static_cast<uint32_t>(a_ready->storage_offset);
+    pc.offsetB = static_cast<uint32_t>(b_ready->storage_offset);
+
+    for (size_t i = 0; i < max_ndim; ++i) {
+        pc.shape[i] = static_cast<uint32_t>(out_shape[i]);
+        pc.strideA[i] = static_cast<uint32_t>(plan.strides_a[i]);
+        pc.strideB[i] = static_cast<uint32_t>(plan.strides_b[i]);
+    }
+
+    uint32_t groups = (static_cast<uint32_t>(out->numel) + 255) / 256;
+    VulkanPipelineManager::instance().dispatch(
+        device_id, "elementwise_binary_broadcast",
+        {a_ready->gpu_buf(), b_ready->gpu_buf(), out->gpu_buf()},
+        &pc, sizeof(pc), groups);
 
     return out;
 }
 
-std::shared_ptr<NativeTensor> NativeTensor::unary_op(uint32_t op_type, float p1, float p2) {
+std::shared_ptr<NativeTensor> NativeTensor::binary_op_scalar(uint32_t op_type, float scalar_val, bool reverse) {
+    const bool is_comparison =
+        (op_type == 7u || op_type == 8u || op_type == 9u ||
+         op_type == 14u || op_type == 15u || op_type == 16u);
+
     if (device_id == -1) {
-        auto out = std::make_shared<NativeTensor>(shape, -1);
-        for (size_t i = 0; i < numel; ++i) {
-            out->cpu_data[i] = apply_unary_op(op_type, cpu_data[i], p1, p2);
+        const ScalarType out_dt = is_comparison ? ScalarType::Float32 : dtype;
+        auto out = std::make_shared<NativeTensor>(shape, -1, out_dt);
+        if (out->numel == 0) return out;
+
+        const size_t ndim = shape.size();
+        std::vector<int64_t> coord(ndim, 0);
+        int64_t ia = static_cast<int64_t>(storage_offset);
+        if (dtype == ScalarType::Float32) {
+            const float* a_ptr = cpu_f32();
+            float* out_ptr = out->cpu_f32();
+            for (size_t i = 0; i < numel; ++i) {
+                float a = reverse ? scalar_val : a_ptr[ia];
+                float b = reverse ? a_ptr[ia] : scalar_val;
+                out_ptr[i] = apply_binary_op(op_type, a, b);
+                advance_odometer(ndim, shape, strides, coord, ia);
+            }
+        } else {
+            const uint8_t* a_raw = cpu_raw_ptr();
+            uint8_t* out_raw = out->cpu_raw_ptr();
+            for (size_t i = 0; i < numel; ++i) {
+                float v = read_scalar_as_float(a_raw, static_cast<size_t>(ia), dtype);
+                float a = reverse ? scalar_val : v;
+                float b = reverse ? v : scalar_val;
+                float res = apply_binary_op(op_type, a, b);
+                write_scalar_from_double(out_raw, i, out_dt, static_cast<double>(res));
+                advance_odometer(ndim, shape, strides, coord, ia);
+            }
         }
         return out;
     }
 
-    auto out = std::make_shared<NativeTensor>(shape, device_id);
+    if (dtype != ScalarType::Float32) {
+        auto res32 = cast(ScalarType::Float32)->binary_op_scalar(op_type, scalar_val, reverse);
+        return is_comparison ? res32 : res32->cast(dtype);
+    }
+
+    if (reverse) {
+        if (op_type == 1u) {
+            auto src = is_dense_zero_offset() ? shared_from_this() : force_contiguous();
+            auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+            if (out->numel == 0) return out;
+            struct {
+                uint32_t total_elements;
+                uint32_t op_type;
+                float p1;
+                float p2;
+            } pc{static_cast<uint32_t>(numel), 15u, -1.0f, scalar_val};
+            uint32_t groups = (static_cast<uint32_t>(numel) + 255) / 256;
+            VulkanPipelineManager::instance().dispatch(
+                device_id, "elementwise_unary_scalar",
+                {src->gpu_buf(), out->gpu_buf()},
+                &pc, sizeof(pc), groups);
+            return out;
+        }
+        auto scalar_t = NativeTensor::from_float_array(&scalar_val, {1}, device_id);
+        return scalar_t->binary_op(op_type, shared_from_this());
+    }
+
+    auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+    if (out->numel == 0) return out;
+
+    if (is_dense_zero_offset()) {
+        uint32_t num_vec4 = static_cast<uint32_t>(numel / 4);
+        if (num_vec4 > 0) {
+            struct {
+                uint32_t num_vec4;
+                uint32_t op_type;
+                float scalar_b;
+                uint32_t is_b_scalar;
+            } pc{num_vec4, op_type, scalar_val, 1};
+
+            uint32_t groups = (num_vec4 + 255) / 256;
+            VulkanPipelineManager::instance().dispatch(
+                device_id, "elementwise_binary_vec4",
+                {gpu_buf(), gpu_buf(), out->gpu_buf()},
+                &pc, sizeof(pc), groups);
+        }
+
+        if ((numel % 4 != 0) || num_vec4 == 0) {
+            struct {
+                uint32_t total_elements;
+                uint32_t op_type;
+                uint32_t ndim;
+                uint32_t is_b_scalar;
+                float scalar_b;
+                uint32_t offsetA;
+                uint32_t offsetB;
+                uint32_t shape[6];
+                uint32_t strideA[6];
+                uint32_t strideB[6];
+            } b_pc{};
+            b_pc.total_elements = static_cast<uint32_t>(numel);
+            b_pc.op_type = op_type;
+            b_pc.ndim = 0;
+            b_pc.is_b_scalar = 1;
+            b_pc.scalar_b = scalar_val;
+
+            uint32_t groups = (static_cast<uint32_t>(numel) + 255) / 256;
+            VulkanPipelineManager::instance().dispatch(
+                device_id, "elementwise_binary_broadcast",
+                {gpu_buf(), gpu_buf(), out->gpu_buf()},
+                &b_pc, sizeof(b_pc), groups);
+        }
+        return out;
+    }
+
+    // Non-contiguous or storage_offset > 0 scalar op via broadcast shader
+    std::shared_ptr<NativeTensor> src = shared_from_this();
+    if (!is_contiguous() && (shape.size() > 6 || !all_strides_non_negative(strides))) {
+        src = force_contiguous();
+    }
+
+    struct {
+        uint32_t total_elements;
+        uint32_t op_type;
+        uint32_t ndim;
+        uint32_t is_b_scalar;
+        float scalar_b;
+        uint32_t offsetA;
+        uint32_t offsetB;
+        uint32_t shape[6];
+        uint32_t strideA[6];
+        uint32_t strideB[6];
+    } b_pc{};
+    b_pc.total_elements = static_cast<uint32_t>(numel);
+    b_pc.op_type = op_type;
+    b_pc.is_b_scalar = 1;
+    b_pc.scalar_b = scalar_val;
+    b_pc.offsetA = static_cast<uint32_t>(src->storage_offset);
+
+    if (src->is_contiguous()) {
+        b_pc.ndim = 0;
+    } else {
+        b_pc.ndim = static_cast<uint32_t>(src->shape.size());
+        for (size_t i = 0; i < src->shape.size(); ++i) {
+            b_pc.shape[i] = static_cast<uint32_t>(src->shape[i]);
+            b_pc.strideA[i] = static_cast<uint32_t>(src->strides[i]);
+        }
+    }
+
+    uint32_t groups = (static_cast<uint32_t>(numel) + 255) / 256;
+    VulkanPipelineManager::instance().dispatch(
+        device_id, "elementwise_binary_broadcast",
+        {src->gpu_buf(), src->gpu_buf(), out->gpu_buf()},
+        &b_pc, sizeof(b_pc), groups);
+    return out;
+}
+
+std::shared_ptr<NativeTensor> NativeTensor::unary_op(uint32_t op_type, float p1, float p2) {
+    if (dtype != ScalarType::Float32) {
+        return cast(ScalarType::Float32)->unary_op(op_type, p1, p2)->cast(dtype);
+    }
+
+    if (device_id == -1) {
+        auto out = std::make_shared<NativeTensor>(shape, -1, ScalarType::Float32);
+        if (out->numel == 0) return out;
+        const size_t ndim = shape.size();
+        std::vector<int64_t> coord(ndim, 0);
+        int64_t ia = static_cast<int64_t>(storage_offset);
+        const float* in_ptr = cpu_f32();
+        float* out_ptr = out->cpu_f32();
+        for (size_t i = 0; i < numel; ++i) {
+            out_ptr[i] = apply_unary_op(op_type, in_ptr[ia], p1, p2);
+            advance_odometer(ndim, shape, strides, coord, ia);
+        }
+        return out;
+    }
+
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->unary_op(op_type, p1, p2);
+    }
+
+    auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+    if (out->numel == 0) return out;
     uint32_t num_vec4 = static_cast<uint32_t>(numel / 4);
 
     if (num_vec4 > 0) {
@@ -921,7 +1575,7 @@ std::shared_ptr<NativeTensor> NativeTensor::unary_op(uint32_t op_type, float p1,
         uint32_t groups = (num_vec4 + 255) / 256;
         VulkanPipelineManager::instance().dispatch(
             device_id, "elementwise_unary_vec4",
-            {gpu_buffer, out->gpu_buffer},
+            {gpu_buf(), out->gpu_buf()},
             &pc, sizeof(pc), groups);
     }
 
@@ -937,7 +1591,7 @@ std::shared_ptr<NativeTensor> NativeTensor::unary_op(uint32_t op_type, float p1,
         uint32_t groups = (static_cast<uint32_t>(numel) + 255) / 256;
         VulkanPipelineManager::instance().dispatch(
             device_id, "elementwise_unary_scalar",
-            {gpu_buffer, out->gpu_buffer},
+            {gpu_buf(), out->gpu_buf()},
             &pc, sizeof(pc), groups);
     }
 
@@ -950,12 +1604,20 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
     if (device_id != other->device_id) {
         throw std::runtime_error("Matmul requires both tensors on the same device!");
     }
-
     if (shape.size() < 2 || other->shape.size() < 2) {
         throw std::runtime_error("Matmul requires at least 2-dimensional tensors");
     }
-    if (!is_contiguous() || !other->is_contiguous()) {
-        throw std::runtime_error("Matmul requires contiguous tensors");
+
+    ScalarType common = promote_dtype(dtype, other->dtype);
+    if (bias != nullptr) {
+        common = promote_dtype(common, bias->dtype);
+    }
+
+    if (device_id >= 0 && common != ScalarType::Float32 && common != ScalarType::Float16) {
+        auto a32 = cast(ScalarType::Float32);
+        auto b32 = other->cast(ScalarType::Float32);
+        auto bias32 = bias ? bias->cast(ScalarType::Float32) : nullptr;
+        return a32->matmul(b32, trans_a, trans_b, bias32)->cast(common);
     }
 
     const int64_t a_rows = shape[shape.size() - 2];
@@ -969,20 +1631,19 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
     uint32_t N = static_cast<uint32_t>(trans_b ? b_rows : b_cols);
 
     if (K1 != K2) {
-        throw std::runtime_error("Inner dimensions must match for matmul: " + std::to_string(K1) + " vs " + std::to_string(K2));
+        throw std::runtime_error("Inner dimensions must match for matmul: " + std::to_string(K1) +
+                                 " vs " + std::to_string(K2));
     }
 
     if (bias != nullptr) {
         if (bias->device_id != device_id) {
             throw std::runtime_error("Matmul bias must be on the same device");
         }
-        if (bias->numel != N || !bias->is_contiguous()) {
-            throw std::runtime_error("Matmul bias must be a contiguous tensor of length N");
+        if (bias->numel != N) {
+            throw std::runtime_error("Matmul bias must be a tensor of length N");
         }
     }
 
-    // Batch handling: B may either be unbatched (shared across every batch item,
-    // the `Linear`-on-3D case) or have exactly the same leading dimensions.
     const bool b_broadcast = (other->shape.size() == 2);
     if (!b_broadcast) {
         if (shape.size() != other->shape.size()) {
@@ -991,28 +1652,130 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
         }
         for (size_t i = 0; i + 2 < shape.size(); ++i) {
             if (shape[i] != other->shape[i]) {
-                throw std::runtime_error("Matmul batch dimensions must match (general batch broadcasting is not implemented)");
+                throw std::runtime_error("Matmul batch dimensions must match");
             }
         }
     }
 
-    // Calculate batch count
     size_t batch_count = 1;
-    for (size_t i = 0; i < shape.size() - 2; ++i) {
-        batch_count *= shape[i];
+    for (size_t i = 0; i + 2 < shape.size(); ++i) {
+        batch_count *= static_cast<size_t>(shape[i]);
     }
 
     std::vector<int64_t> out_shape = shape;
     out_shape[out_shape.size() - 2] = M;
     out_shape[out_shape.size() - 1] = N;
-    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
 
-    const uint32_t strideA_m = trans_a ? 1u : K1;
-    const uint32_t strideA_k = trans_a ? M : 1u;
-    const uint32_t strideB_k = trans_b ? 1u : N;
-    const uint32_t strideB_n = trans_b ? K1 : 1u;
+    auto is_uniform_batch_strides = [](const NativeTensor& t) {
+        if (!all_strides_non_negative(t.strides)) return false;
+        if (t.shape.size() <= 3) return true;
+        for (size_t i = 0; i + 3 < t.shape.size(); ++i) {
+            if (t.strides[i] != t.shape[i + 1] * t.strides[i + 1]) {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    auto a_in = (dtype == common) ? shared_from_this() : cast(common);
+    auto b_in = (other->dtype == common) ? other : other->cast(common);
+    auto bias_in = bias ? ((bias->dtype == common) ? bias : bias->cast(common)) : nullptr;
+
+    if (!is_uniform_batch_strides(*a_in)) a_in = a_in->force_contiguous();
+    if (!is_uniform_batch_strides(*b_in)) b_in = b_in->force_contiguous();
+    if (bias_in && !bias_in->is_dense_zero_offset()) bias_in = bias_in->force_contiguous();
+
+    const int64_t sa0 = a_in->strides[a_in->shape.size() - 2];
+    const int64_t sa1 = a_in->strides[a_in->shape.size() - 1];
+    const int64_t sb0 = b_in->strides[b_in->shape.size() - 2];
+    const int64_t sb1 = b_in->strides[b_in->shape.size() - 1];
+
+    const uint32_t strideA_m = static_cast<uint32_t>(trans_a ? sa1 : sa0);
+    const uint32_t strideA_k = static_cast<uint32_t>(trans_a ? sa0 : sa1);
+    const uint32_t strideB_k = static_cast<uint32_t>(trans_b ? sb1 : sb0);
+    const uint32_t strideB_n = static_cast<uint32_t>(trans_b ? sb0 : sb1);
+    const uint32_t strideA_b =
+        (a_in->shape.size() == 2) ? 0u : static_cast<uint32_t>(a_in->strides[a_in->shape.size() - 3]);
+    const uint32_t strideB_b =
+        b_broadcast ? 0u : ((b_in->shape.size() == 2) ? 0u : static_cast<uint32_t>(b_in->strides[b_in->shape.size() - 3]));
 
     if (device_id >= 0) {
+        if (common == ScalarType::Float16) {
+            auto dev = VulkanManager::instance_ref().get_device(static_cast<uint32_t>(device_id));
+            if (!dev->capabilities.float16_arithmetic || !dev->capabilities.storage_16bit) {
+                auto a32 = a_in->cast(ScalarType::Float32);
+                auto b32 = b_in->cast(ScalarType::Float32);
+                auto bias32 = bias_in ? bias_in->cast(ScalarType::Float32) : nullptr;
+                return a32->matmul(b32, trans_a, trans_b, bias32)->cast(ScalarType::Float16);
+            }
+
+            auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float16);
+            if (out->numel == 0) return out;
+
+            struct {
+                uint32_t M;
+                uint32_t N;
+                uint32_t K;
+                uint32_t batch_count;
+                uint32_t strideA_b;
+                uint32_t strideA_m;
+                uint32_t strideA_k;
+                uint32_t strideB_b;
+                uint32_t strideB_k;
+                uint32_t strideB_n;
+                uint32_t strideC_b;
+                uint32_t strideC_m;
+                uint32_t strideC_n;
+                uint32_t has_bias;
+                uint32_t offsetA;
+                uint32_t offsetB;
+                uint32_t offsetC;
+            } pc{};
+
+            pc.M = M;
+            pc.N = N;
+            pc.K = K1;
+            pc.batch_count = static_cast<uint32_t>(batch_count);
+            pc.strideA_b = strideA_b;
+            pc.strideA_m = strideA_m;
+            pc.strideA_k = strideA_k;
+            pc.strideB_b = strideB_b;
+            pc.strideB_k = strideB_k;
+            pc.strideB_n = strideB_n;
+            pc.strideC_b = static_cast<uint32_t>(M * N);
+            pc.strideC_m = static_cast<uint32_t>(N);
+            pc.strideC_n = 1u;
+            pc.has_bias = (bias_in != nullptr) ? 1u : 0u;
+            pc.offsetA = static_cast<uint32_t>(a_in->storage_offset);
+            pc.offsetB = static_cast<uint32_t>(b_in->storage_offset);
+            pc.offsetC = 0u;
+
+            std::shared_ptr<VulkanBuffer> bias_buf = bias_in ? bias_in->gpu_buf() : out->gpu_buf();
+            const bool can_coop =
+                dev->capabilities.fp16_coopmat_16x16 &&
+                (M % 16u == 0u) && (N % 16u == 0u) && (K1 % 16u == 0u) &&
+                strideA_k == 1u && strideB_n == 1u;
+
+            if (can_coop) {
+                VulkanPipelineManager::instance().dispatch(
+                    device_id, "matmul_coopmat_fp16",
+                    {a_in->gpu_buf(), b_in->gpu_buf(), out->gpu_buf(), bias_buf},
+                    &pc, sizeof(pc), N / 16u, M / 16u, static_cast<uint32_t>(batch_count));
+            } else {
+                const uint32_t gx = (N + 63u) / 64u;
+                const uint32_t gy = (M + 63u) / 64u;
+                VulkanPipelineManager::instance().dispatch(
+                    device_id, "gemm_fp16",
+                    {a_in->gpu_buf(), b_in->gpu_buf(), out->gpu_buf(), bias_buf},
+                    &pc, sizeof(pc), gx, gy, static_cast<uint32_t>(batch_count));
+            }
+            return out;
+        }
+
+        // Native GPU Float32 GEMM
+        auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
+        if (out->numel == 0) return out;
+
         struct {
             uint32_t M;
             uint32_t N;
@@ -1028,66 +1791,109 @@ std::shared_ptr<NativeTensor> NativeTensor::matmul(std::shared_ptr<NativeTensor>
             uint32_t strideC_m;
             uint32_t strideC_n;
             uint32_t has_bias;
+            uint32_t offsetA;
+            uint32_t offsetB;
+            uint32_t offsetC;
         } pc{};
 
         pc.M = M;
         pc.N = N;
         pc.K = K1;
         pc.batch_count = static_cast<uint32_t>(batch_count);
-        pc.strideA_b = static_cast<uint32_t>(M * K1);
+        pc.strideA_b = strideA_b;
         pc.strideA_m = strideA_m;
         pc.strideA_k = strideA_k;
-        pc.strideB_b = b_broadcast ? 0u : static_cast<uint32_t>(K1 * N);
+        pc.strideB_b = strideB_b;
         pc.strideB_k = strideB_k;
         pc.strideB_n = strideB_n;
         pc.strideC_b = static_cast<uint32_t>(M * N);
         pc.strideC_m = static_cast<uint32_t>(N);
-        pc.strideC_n = 1;
-        pc.has_bias = (bias != nullptr) ? 1u : 0u;
+        pc.strideC_n = 1u;
+        pc.has_bias = (bias_in != nullptr) ? 1u : 0u;
+        pc.offsetA = static_cast<uint32_t>(a_in->storage_offset);
+        pc.offsetB = static_cast<uint32_t>(b_in->storage_offset);
+        pc.offsetC = 0u;
 
-        std::shared_ptr<VulkanBuffer> bias_buf = bias ? bias->gpu_buffer : out->gpu_buffer;
+        std::shared_ptr<VulkanBuffer> bias_buf = bias_in ? bias_in->gpu_buf() : out->gpu_buf();
 
         auto run_variant = [&](const char* shader, uint32_t tile) {
             const uint32_t group_x = (N + tile - 1u) / tile;
             const uint32_t group_y = (M + tile - 1u) / tile;
             VulkanPipelineManager::instance().dispatch(
                 device_id, shader,
-                {gpu_buffer, other->gpu_buffer, out->gpu_buffer, bias_buf},
+                {a_in->gpu_buf(), b_in->gpu_buf(), out->gpu_buf(), bias_buf},
                 &pc, sizeof(pc), group_x, group_y, static_cast<uint32_t>(batch_count));
         };
 
+        const bool eff_ta = trans_a || (strideA_k != 1u);
+        const bool eff_tb = trans_b || (strideB_n != 1u);
         const MatmulChoice choice = select_matmul_shader(
-            static_cast<uint32_t>(device_id), M, N, K1, trans_a, trans_b, run_variant);
+            static_cast<uint32_t>(device_id), M, N, K1, eff_ta, eff_tb, run_variant);
         run_variant(choice.shader, choice.tile);
-    } else {
-        // CPU MatMul fallback
-        const size_t batch_stride_b = b_broadcast ? 0 : static_cast<size_t>(K1) * N;
-        for (size_t b = 0; b < batch_count; ++b) {
-            size_t offA = b * M * K1;
-            size_t offB = b * batch_stride_b;
-            size_t offC = b * M * N;
+        return out;
+    }
 
+    // CPU MatMul
+    auto out = std::make_shared<NativeTensor>(out_shape, -1, common);
+    if (out->numel == 0) return out;
+
+    if (common == ScalarType::Float32) {
+        const float* a_ptr = a_in->cpu_f32();
+        const float* b_ptr = b_in->cpu_f32();
+        const float* bias_ptr = bias_in ? bias_in->cpu_f32() : nullptr;
+        float* c_ptr = out->cpu_f32();
+        for (size_t b = 0; b < batch_count; ++b) {
+            size_t offA = a_in->storage_offset + b * strideA_b;
+            size_t offB = b_in->storage_offset + b * strideB_b;
+            size_t offC = b * M * N;
             for (uint32_t m = 0; m < M; ++m) {
                 for (uint32_t n = 0; n < N; ++n) {
-                    float sum = (bias != nullptr) ? bias->cpu_data[n] : 0.0f;
+                    float sum = bias_ptr ? bias_ptr[n] : 0.0f;
                     for (uint32_t k = 0; k < K1; ++k) {
-                        sum += cpu_data[offA + m * strideA_m + k * strideA_k] *
-                               other->cpu_data[offB + k * strideB_k + n * strideB_n];
+                        sum += a_ptr[offA + m * strideA_m + k * strideA_k] *
+                               b_ptr[offB + k * strideB_k + n * strideB_n];
                     }
-                    out->cpu_data[offC + m * N + n] = sum;
+                    c_ptr[offC + m * N + n] = sum;
                 }
             }
         }
+        return out;
     }
 
+    const uint8_t* a_raw = a_in->cpu_raw_ptr();
+    const uint8_t* b_raw = b_in->cpu_raw_ptr();
+    const uint8_t* bias_raw = bias_in ? bias_in->cpu_raw_ptr() : nullptr;
+    uint8_t* c_raw = out->cpu_raw_ptr();
+    for (size_t b = 0; b < batch_count; ++b) {
+        size_t offA = a_in->storage_offset + b * strideA_b;
+        size_t offB = b_in->storage_offset + b * strideB_b;
+        size_t offC = b * M * N;
+        for (uint32_t m = 0; m < M; ++m) {
+            for (uint32_t n = 0; n < N; ++n) {
+                double sum = bias_raw ? read_scalar_as_double(bias_raw, n, common) : 0.0;
+                for (uint32_t k = 0; k < K1; ++k) {
+                    sum += read_scalar_as_double(a_raw, offA + m * strideA_m + k * strideA_k, common) *
+                           read_scalar_as_double(b_raw, offB + k * strideB_k + n * strideB_n, common);
+                }
+                write_scalar_from_double(c_raw, offC + m * N + n, common, sum);
+            }
+        }
+    }
     return out;
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::reduce_sum(int64_t dim, bool keepdim) {
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->reduce_sum(dim, keepdim);
+    }
+    if (dtype != ScalarType::Float32) {
+        return cast(ScalarType::Float32)->reduce_sum(dim, keepdim)->cast(dtype);
+    }
+
     const int64_t TOTAL_DIM = -999999;
     if (dim == TOTAL_DIM) {
         std::vector<int64_t> out_shape = keepdim ? std::vector<int64_t>(shape.size(), 1) : std::vector<int64_t>{1};
-        auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+        auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
 
         if (device_id >= 0) {
             struct {
@@ -1098,19 +1904,19 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_sum(int64_t dim, bool keepdim
 
             VulkanPipelineManager::instance().dispatch(
                 device_id, "reduction",
-                {gpu_buffer, out->gpu_buffer},
+                {gpu_buf(), out->gpu_buf()},
                 &pc, sizeof(pc), 1, 1, 1);
         } else {
+            const float* in_ptr = cpu_f32();
             float sum = 0.0f;
-            for (float v : cpu_data) sum += v;
-            out->cpu_data[0] = sum;
+            for (size_t i = 0; i < numel; ++i) sum += in_ptr[i];
+            out->cpu_f32()[0] = sum;
         }
         return out;
     }
 
-    if (dim < 0) dim += shape.size();
+    if (dim < 0) dim += static_cast<int64_t>(shape.size());
 
-    // Determine output shape
     std::vector<int64_t> out_shape;
     for (size_t i = 0; i < shape.size(); ++i) {
         if (static_cast<int64_t>(i) == dim) {
@@ -1121,10 +1927,9 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_sum(int64_t dim, bool keepdim
     }
     if (out_shape.empty()) out_shape.push_back(1);
 
-    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+    auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
 
-    // Fast path: reduction along last dimension on GPU
-    if (device_id >= 0 && dim == static_cast<int64_t>(shape.size()) - 1 && is_contiguous()) {
+    if (device_id >= 0 && dim == static_cast<int64_t>(shape.size()) - 1) {
         uint32_t cols = static_cast<uint32_t>(shape.back());
         uint32_t rows = static_cast<uint32_t>(numel / cols);
 
@@ -1136,12 +1941,11 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_sum(int64_t dim, bool keepdim
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "reduction",
-            {gpu_buffer, out->gpu_buffer},
+            {gpu_buf(), out->gpu_buf()},
             &pc, sizeof(pc), 1, rows, 1);
         return out;
     }
 
-    // General reduction on GPU: contiguous tensor viewed as [outer, dim, inner].
     if (device_id >= 0) {
         uint32_t outer = 1;
         uint32_t inner = 1;
@@ -1160,34 +1964,35 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_sum(int64_t dim, bool keepdim
         if (inner >= 16u && outer <= 65535u) {
             VulkanPipelineManager::instance().dispatch(
                 device_id, "reduction_strided",
-                {gpu_buffer, out->gpu_buffer},
+                {gpu_buf(), out->gpu_buf()},
                 &pc, sizeof(pc), (inner + 31u) / 32u, outer);
         } else {
             VulkanPipelineManager::instance().dispatch(
                 device_id, "reduction_generic",
-                {gpu_buffer, out->gpu_buffer},
+                {gpu_buf(), out->gpu_buf()},
                 &pc, sizeof(pc), outer * inner);
         }
         return out;
     }
 
     // CPU fallback.
-    auto cpu_in = shared_from_this();
-    auto cpu_out = std::make_shared<NativeTensor>(out_shape, -1);
+    auto cpu_out = std::make_shared<NativeTensor>(out_shape, -1, ScalarType::Float32);
     cpu_out->zero_();
+    const float* in_ptr = cpu_f32();
+    float* out_ptr = cpu_out->cpu_f32();
 
     for (size_t i = 0; i < numel; ++i) {
         size_t rem_idx = i;
         size_t target_idx = 0;
         for (int d = static_cast<int>(shape.size()) - 1; d >= 0; --d) {
-            size_t c = rem_idx % shape[d];
-            rem_idx /= shape[d];
+            size_t c = rem_idx % static_cast<size_t>(shape[static_cast<size_t>(d)]);
+            rem_idx /= static_cast<size_t>(shape[static_cast<size_t>(d)]);
             if (d != dim) {
                 int out_d = (d < dim) ? d : (keepdim ? d : d - 1);
-                target_idx += c * cpu_out->strides[out_d];
+                target_idx += c * static_cast<size_t>(cpu_out->strides[static_cast<size_t>(out_d)]);
             }
         }
-        cpu_out->cpu_data[target_idx] += cpu_in->cpu_data[i];
+        out_ptr[target_idx] += in_ptr[i];
     }
 
     return cpu_out;
@@ -1195,16 +2000,29 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_sum(int64_t dim, bool keepdim
 
 std::shared_ptr<NativeTensor> NativeTensor::reduce_mean(int64_t dim, bool keepdim) {
     const int64_t TOTAL_DIM = -999999;
+    if (dtype != ScalarType::Float32) {
+        auto f32 = cast(ScalarType::Float32)->reduce_mean(dim, keepdim);
+        return is_floating_point(dtype) ? f32->cast(dtype) : f32;
+    }
     auto sum = reduce_sum(dim, keepdim);
-    float divisor = (dim == TOTAL_DIM) ? static_cast<float>(numel) : static_cast<float>(shape[dim < 0 ? dim + shape.size() : dim]);
+    float divisor = (dim == TOTAL_DIM)
+                        ? static_cast<float>(numel)
+                        : static_cast<float>(shape[static_cast<size_t>(dim < 0 ? dim + static_cast<int64_t>(shape.size()) : dim)]);
     return sum->binary_op_scalar(2, 1.0f / divisor);
 }
 
 std::shared_ptr<NativeTensor> NativeTensor::reduce_max(int64_t dim, bool keepdim) {
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->reduce_max(dim, keepdim);
+    }
+    if (dtype != ScalarType::Float32) {
+        return cast(ScalarType::Float32)->reduce_max(dim, keepdim)->cast(dtype);
+    }
+
     const int64_t TOTAL_DIM = -999999;
     if (dim == TOTAL_DIM) {
         std::vector<int64_t> out_shape = keepdim ? std::vector<int64_t>(shape.size(), 1) : std::vector<int64_t>{1};
-        auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+        auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
         if (device_id >= 0) {
             struct {
                 uint32_t num_rows;
@@ -1214,17 +2032,18 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_max(int64_t dim, bool keepdim
 
             VulkanPipelineManager::instance().dispatch(
                 device_id, "reduction",
-                {gpu_buffer, out->gpu_buffer},
+                {gpu_buf(), out->gpu_buf()},
                 &pc, sizeof(pc), 1, 1, 1);
         } else {
+            const float* in_ptr = cpu_f32();
             float max_v = -1e30f;
-            for (float v : cpu_data) max_v = std::max(max_v, v);
-            out->cpu_data[0] = max_v;
+            for (size_t i = 0; i < numel; ++i) max_v = std::max(max_v, in_ptr[i]);
+            out->cpu_f32()[0] = max_v;
         }
         return out;
     }
 
-    if (dim < 0) dim += shape.size();
+    if (dim < 0) dim += static_cast<int64_t>(shape.size());
 
     std::vector<int64_t> out_shape;
     for (size_t i = 0; i < shape.size(); ++i) {
@@ -1236,7 +2055,6 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_max(int64_t dim, bool keepdim
     }
     if (out_shape.empty()) out_shape.push_back(1);
 
-    // General reduction on GPU: contiguous tensor viewed as [outer, dim, inner].
     if (device_id >= 0) {
         uint32_t outer = 1;
         uint32_t inner = 1;
@@ -1245,7 +2063,7 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_max(int64_t dim, bool keepdim
             inner *= static_cast<uint32_t>(shape[i]);
         }
 
-        auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+        auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
 
         struct {
             uint32_t outer;
@@ -1257,34 +2075,34 @@ std::shared_ptr<NativeTensor> NativeTensor::reduce_max(int64_t dim, bool keepdim
         if (inner >= 16u && outer <= 65535u) {
             VulkanPipelineManager::instance().dispatch(
                 device_id, "reduction_strided",
-                {gpu_buffer, out->gpu_buffer},
+                {gpu_buf(), out->gpu_buf()},
                 &pc, sizeof(pc), (inner + 31u) / 32u, outer);
         } else {
             VulkanPipelineManager::instance().dispatch(
                 device_id, "reduction_generic",
-                {gpu_buffer, out->gpu_buffer},
+                {gpu_buf(), out->gpu_buf()},
                 &pc, sizeof(pc), outer * inner);
         }
         return out;
     }
 
-    // CPU fallback.
-    auto cpu_in = shared_from_this();
-    auto cpu_out = std::make_shared<NativeTensor>(out_shape, -1);
+    auto cpu_out = std::make_shared<NativeTensor>(out_shape, -1, ScalarType::Float32);
     cpu_out->fill_(-1e30f);
+    const float* in_ptr = cpu_f32();
+    float* out_ptr = cpu_out->cpu_f32();
 
     for (size_t i = 0; i < numel; ++i) {
         size_t rem_idx = i;
         size_t target_idx = 0;
         for (int d = static_cast<int>(shape.size()) - 1; d >= 0; --d) {
-            size_t c = rem_idx % shape[d];
-            rem_idx /= shape[d];
+            size_t c = rem_idx % static_cast<size_t>(shape[static_cast<size_t>(d)]);
+            rem_idx /= static_cast<size_t>(shape[static_cast<size_t>(d)]);
             if (d != dim) {
                 int out_d = (d < dim) ? d : (keepdim ? d : d - 1);
-                target_idx += c * cpu_out->strides[out_d];
+                target_idx += c * static_cast<size_t>(cpu_out->strides[static_cast<size_t>(out_d)]);
             }
         }
-        cpu_out->cpu_data[target_idx] = std::max(cpu_out->cpu_data[target_idx], cpu_in->cpu_data[i]);
+        out_ptr[target_idx] = std::max(out_ptr[target_idx], in_ptr[i]);
     }
 
     return cpu_out;
@@ -1299,8 +2117,17 @@ std::shared_ptr<NativeTensor> NativeTensor::softmax(int64_t dim, bool is_log) {
         throw std::runtime_error("softmax: dim " + std::to_string(dim) + " out of range for rank " +
                                  std::to_string(shape.size()));
     }
+    if (dtype != ScalarType::Float32) {
+        if (!is_floating_point(dtype)) {
+            throw std::runtime_error("softmax requires floating-point tensor");
+        }
+        return cast(ScalarType::Float32)->softmax(dim, is_log)->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->softmax(dim, is_log);
+    }
 
-    auto out = std::make_shared<NativeTensor>(shape, device_id);
+    auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
     const bool last_dim = (dim == static_cast<int64_t>(shape.size()) - 1);
 
     if (device_id >= 0 && last_dim) {
@@ -1315,14 +2142,16 @@ std::shared_ptr<NativeTensor> NativeTensor::softmax(int64_t dim, bool is_log) {
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "softmax",
-            {gpu_buffer, out->gpu_buffer},
+            {gpu_buf(), out->gpu_buf()},
             &pc, sizeof(pc), 1, rows, 1);
         return out;
     }
 
     // Dimension-aware path for any axis (and for CPU tensors).
     auto cpu_in = (device_id >= 0) ? to_device(-1) : shared_from_this();
-    auto cpu_out = std::make_shared<NativeTensor>(shape, -1);
+    auto cpu_out = std::make_shared<NativeTensor>(shape, -1, ScalarType::Float32);
+    const float* in_ptr = cpu_in->cpu_f32();
+    float* out_ptr = cpu_out->cpu_f32();
 
     int64_t inner = 1;
     for (size_t i = static_cast<size_t>(dim) + 1; i < shape.size(); ++i) {
@@ -1337,19 +2166,19 @@ std::shared_ptr<NativeTensor> NativeTensor::softmax(int64_t dim, bool is_log) {
 
             float m = -1e30f;
             for (int64_t d = 0; d < dim_size; ++d) {
-                m = std::max(m, cpu_in->cpu_data[base + d * inner]);
+                m = std::max(m, in_ptr[base + d * inner]);
             }
 
             float s = 0.0f;
             for (int64_t d = 0; d < dim_size; ++d) {
-                s += std::exp(cpu_in->cpu_data[base + d * inner] - m);
+                s += std::exp(in_ptr[base + d * inner] - m);
             }
 
             const float log_s = std::log(s);
             const float inv_s = 1.0f / s;
             for (int64_t d = 0; d < dim_size; ++d) {
-                const float v = cpu_in->cpu_data[base + d * inner] - m;
-                cpu_out->cpu_data[base + d * inner] = is_log ? (v - log_s) : (std::exp(v) * inv_s);
+                const float v = in_ptr[base + d * inner] - m;
+                out_ptr[base + d * inner] = is_log ? (v - log_s) : (std::exp(v) * inv_s);
             }
         }
     }
@@ -1368,11 +2197,23 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_per_row(
     if (targets->device_id != device_id) {
         throw std::runtime_error("cross_entropy: targets must be on the same device as logits");
     }
+    if (dtype != ScalarType::Float32) {
+        if (!is_floating_point(dtype)) {
+            throw std::runtime_error("cross_entropy requires floating-point logits");
+        }
+        return cast(ScalarType::Float32)->cross_entropy_per_row(targets)->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->cross_entropy_per_row(targets);
+    }
+    auto t_f32 = (targets->dtype == ScalarType::Float32)
+                     ? targets->force_contiguous()
+                     : targets->cast(ScalarType::Float32);
 
     const uint32_t rows = static_cast<uint32_t>(shape[0]);
     const uint32_t cols = static_cast<uint32_t>(shape[1]);
     auto out = std::make_shared<NativeTensor>(
-        std::vector<int64_t>{static_cast<int64_t>(rows)}, device_id);
+        std::vector<int64_t>{static_cast<int64_t>(rows)}, device_id, ScalarType::Float32);
 
     if (device_id >= 0) {
         struct {
@@ -1386,14 +2227,17 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_per_row(
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "softmax_cross_entropy",
-            {gpu_buffer, targets->gpu_buffer, out->gpu_buffer, out->gpu_buffer},
+            {gpu_buf(), t_f32->gpu_buf(), out->gpu_buf(), out->gpu_buf()},
             &pc, sizeof(pc), rows);
         return out;
     }
 
+    const float* logits_ptr = cpu_f32();
+    const float* t_ptr = t_f32->cpu_f32();
+    float* out_ptr = out->cpu_f32();
     for (uint32_t r = 0; r < rows; ++r) {
-        const float* row = &cpu_data[static_cast<size_t>(r) * cols];
-        const int64_t target = static_cast<int64_t>(targets->cpu_data[r]);
+        const float* row = &logits_ptr[static_cast<size_t>(r) * cols];
+        const int64_t target = static_cast<int64_t>(t_ptr[r]);
         if (target < 0 || target >= static_cast<int64_t>(cols)) {
             throw std::runtime_error("cross_entropy: target index out of range");
         }
@@ -1403,7 +2247,7 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_per_row(
         float s = 0.0f;
         for (uint32_t c = 0; c < cols; ++c) s += std::exp(row[c] - m);
 
-        out->cpu_data[r] = (m + std::log(s)) - row[target];
+        out_ptr[r] = (m + std::log(s)) - row[target];
     }
     return out;
 }
@@ -1433,8 +2277,26 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_grad(
             throw std::runtime_error("cross_entropy_grad: grad_out must have 1 or rows elements");
         }
     }
+    if (dtype != ScalarType::Float32) {
+        if (!is_floating_point(dtype)) {
+            throw std::runtime_error("cross_entropy_grad requires floating-point logits");
+        }
+        return cast(ScalarType::Float32)->cross_entropy_grad(targets, grad_out, scale)->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->cross_entropy_grad(targets, grad_out, scale);
+    }
+    auto t_f32 = (targets->dtype == ScalarType::Float32)
+                     ? targets->force_contiguous()
+                     : targets->cast(ScalarType::Float32);
+    std::shared_ptr<NativeTensor> g_f32 = nullptr;
+    if (grad_out != nullptr) {
+        g_f32 = (grad_out->dtype == ScalarType::Float32)
+                    ? grad_out->force_contiguous()
+                    : grad_out->cast(ScalarType::Float32);
+    }
 
-    auto out = std::make_shared<NativeTensor>(shape, device_id);
+    auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
 
     if (device_id >= 0) {
         struct {
@@ -1445,22 +2307,26 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_grad(
             uint32_t g_is_scalar;
             float scale;
         } pc{rows, cols, 1u,
-             (grad_out != nullptr) ? 1u : 0u,
-             (grad_out != nullptr && grad_out->numel == 1) ? 1u : 0u,
+             (g_f32 != nullptr) ? 1u : 0u,
+             (g_f32 != nullptr && g_f32->numel == 1) ? 1u : 0u,
              scale};
 
-        std::shared_ptr<VulkanBuffer> g_buf = grad_out ? grad_out->gpu_buffer : out->gpu_buffer;
+        std::shared_ptr<VulkanBuffer> g_buf = g_f32 ? g_f32->gpu_buf() : out->gpu_buf();
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "softmax_cross_entropy",
-            {gpu_buffer, targets->gpu_buffer, out->gpu_buffer, g_buf},
+            {gpu_buf(), t_f32->gpu_buf(), out->gpu_buf(), g_buf},
             &pc, sizeof(pc), rows);
         return out;
     }
 
+    const float* logits_ptr = cpu_f32();
+    const float* t_ptr = t_f32->cpu_f32();
+    const float* g_ptr = g_f32 ? g_f32->cpu_f32() : nullptr;
+    float* out_ptr = out->cpu_f32();
     for (uint32_t r = 0; r < rows; ++r) {
-        const float* row = &cpu_data[static_cast<size_t>(r) * cols];
-        const int64_t target = static_cast<int64_t>(targets->cpu_data[r]);
+        const float* row = &logits_ptr[static_cast<size_t>(r) * cols];
+        const int64_t target = static_cast<int64_t>(t_ptr[r]);
         if (target < 0 || target >= static_cast<int64_t>(cols)) {
             throw std::runtime_error("cross_entropy: target index out of range");
         }
@@ -1472,14 +2338,14 @@ std::shared_ptr<NativeTensor> NativeTensor::cross_entropy_grad(
         const float inv_s = 1.0f / s;
 
         float row_scale = scale;
-        if (grad_out != nullptr) {
-            row_scale *= grad_out->cpu_data[(grad_out->numel == 1) ? 0 : r];
+        if (g_f32 != nullptr) {
+            row_scale *= g_ptr[(g_f32->numel == 1) ? 0 : r];
         }
 
         for (uint32_t c = 0; c < cols; ++c) {
             const float probability = std::exp(row[c] - m) * inv_s;
             const float onehot = (static_cast<int64_t>(c) == target) ? 1.0f : 0.0f;
-            out->cpu_data[static_cast<size_t>(r) * cols + c] = (probability - onehot) * row_scale;
+            out_ptr[static_cast<size_t>(r) * cols + c] = (probability - onehot) * row_scale;
         }
     }
     return out;
@@ -1492,15 +2358,30 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d(std::shared_ptr<NativeTensor>
     if (shape.size() != 4 || weight->shape.size() != 4) {
         throw std::runtime_error("conv2d requires 4D tensors [N, C, H, W]");
     }
+    if (dtype != ScalarType::Float32 || weight->dtype != ScalarType::Float32 ||
+        (bias && bias->dtype != ScalarType::Float32)) {
+        if (!is_floating_point(dtype)) {
+            throw std::runtime_error("conv2d requires floating-point tensors");
+        }
+        auto in_f32 = (dtype == ScalarType::Float32) ? shared_from_this() : cast(ScalarType::Float32);
+        auto w_f32 = (weight->dtype == ScalarType::Float32) ? weight : weight->cast(ScalarType::Float32);
+        auto b_f32 = (bias && bias->dtype != ScalarType::Float32) ? bias->cast(ScalarType::Float32) : bias;
+        return in_f32->conv2d(w_f32, b_f32, stride_h, stride_w, pad_h, pad_w)->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->conv2d(weight, bias, stride_h, stride_w, pad_h, pad_w);
+    }
+    auto w = weight->force_contiguous();
+    auto bias_t = bias ? bias->force_contiguous() : nullptr;
 
     uint32_t N = static_cast<uint32_t>(shape[0]);
     uint32_t C_in = static_cast<uint32_t>(shape[1]);
     uint32_t H_in = static_cast<uint32_t>(shape[2]);
     uint32_t W_in = static_cast<uint32_t>(shape[3]);
 
-    uint32_t C_out = static_cast<uint32_t>(weight->shape[0]);
-    uint32_t kH = static_cast<uint32_t>(weight->shape[2]);
-    uint32_t kW = static_cast<uint32_t>(weight->shape[3]);
+    uint32_t C_out = static_cast<uint32_t>(w->shape[0]);
+    uint32_t kH = static_cast<uint32_t>(w->shape[2]);
+    uint32_t kW = static_cast<uint32_t>(w->shape[3]);
 
     uint32_t H_out = (H_in + 2 * pad_h - kH) / stride_h + 1;
     uint32_t W_out = (W_in + 2 * pad_w - kW) / stride_w + 1;
@@ -1509,7 +2390,7 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d(std::shared_ptr<NativeTensor>
                                       static_cast<int64_t>(C_out),
                                       static_cast<int64_t>(H_out),
                                       static_cast<int64_t>(W_out)};
-    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+    auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
 
     if (device_id >= 0) {
         struct {
@@ -1534,26 +2415,29 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d(std::shared_ptr<NativeTensor>
         pc.kH = kH; pc.kW = kW;
         pc.stride_h = stride_h; pc.stride_w = stride_w;
         pc.pad_h = pad_h; pc.pad_w = pad_w;
-        pc.has_bias = (bias != nullptr) ? 1u : 0u;
+        pc.has_bias = (bias_t != nullptr) ? 1u : 0u;
 
         uint32_t gx = (W_out + 7) / 8;
         uint32_t gy = (H_out + 7) / 8;
         uint32_t gz = N * ((C_out + 3) / 4);
 
-        std::shared_ptr<VulkanBuffer> b_bias = bias ? bias->gpu_buffer : out->gpu_buffer;
+        std::shared_ptr<VulkanBuffer> b_bias = bias_t ? bias_t->gpu_buf() : out->gpu_buf();
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "conv2d",
-            {gpu_buffer, weight->gpu_buffer, b_bias, out->gpu_buffer},
+            {gpu_buf(), w->gpu_buf(), b_bias, out->gpu_buf()},
             &pc, sizeof(pc), gx, gy, gz);
     } else {
-        // CPU conv2d
+        const float* in_ptr = cpu_f32();
+        const float* w_ptr = w->cpu_f32();
+        const float* b_ptr = bias_t ? bias_t->cpu_f32() : nullptr;
+        float* out_ptr = out->cpu_f32();
         for (uint32_t n = 0; n < N; ++n) {
             for (uint32_t oc = 0; oc < C_out; ++oc) {
-                float b = (bias != nullptr) ? bias->cpu_data[oc] : 0.0f;
+                float bias_val = b_ptr ? b_ptr[oc] : 0.0f;
                 for (uint32_t oh = 0; oh < H_out; ++oh) {
                     for (uint32_t ow = 0; ow < W_out; ++ow) {
-                        float acc = b;
+                        float acc = bias_val;
                         int in_h_base = int(oh * stride_h) - int(pad_h);
                         int in_w_base = int(ow * stride_w) - int(pad_w);
 
@@ -1564,14 +2448,14 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d(std::shared_ptr<NativeTensor>
                                     for (uint32_t kw = 0; kw < kW; ++kw) {
                                         int iw = in_w_base + int(kw);
                                         if (iw >= 0 && iw < int(W_in)) {
-                                            acc += cpu_data[n * (C_in*H_in*W_in) + ic * (H_in*W_in) + ih * W_in + iw] *
-                                                   weight->cpu_data[oc * (C_in*kH*kW) + ic * (kH*kW) + kh * kW + kw];
+                                            acc += in_ptr[n * (C_in*H_in*W_in) + ic * (H_in*W_in) + ih * W_in + iw] *
+                                                   w_ptr[oc * (C_in*kH*kW) + ic * (kH*kW) + kh * kW + kw];
                                         }
                                     }
                                 }
                             }
                         }
-                        out->cpu_data[n * (C_out*H_out*W_out) + oc * (H_out*W_out) + oh * W_out + ow] = acc;
+                        out_ptr[n * (C_out*H_out*W_out) + oc * (H_out*W_out) + oh * W_out + ow] = acc;
                     }
                 }
             }
@@ -1584,7 +2468,17 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d_backward_input(std::shared_pt
                                                                  const std::vector<int64_t>& in_shape,
                                                                  uint32_t stride_h, uint32_t stride_w,
                                                                  uint32_t pad_h, uint32_t pad_w) {
-    auto grad_in = std::make_shared<NativeTensor>(in_shape, device_id);
+    if (dtype != ScalarType::Float32 || weight->dtype != ScalarType::Float32) {
+        auto g_f32 = (dtype == ScalarType::Float32) ? shared_from_this() : cast(ScalarType::Float32);
+        auto w_f32 = (weight->dtype == ScalarType::Float32) ? weight : weight->cast(ScalarType::Float32);
+        return g_f32->conv2d_backward_input(w_f32, in_shape, stride_h, stride_w, pad_h, pad_w)->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->conv2d_backward_input(weight, in_shape, stride_h, stride_w, pad_h, pad_w);
+    }
+    auto w_t = weight->force_contiguous();
+
+    auto grad_in = std::make_shared<NativeTensor>(in_shape, device_id, ScalarType::Float32);
     grad_in->zero_();
 
     uint32_t N = static_cast<uint32_t>(in_shape[0]);
@@ -1592,9 +2486,9 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d_backward_input(std::shared_pt
     uint32_t H_in = static_cast<uint32_t>(in_shape[2]);
     uint32_t W_in = static_cast<uint32_t>(in_shape[3]);
 
-    uint32_t C_out = static_cast<uint32_t>(weight->shape[0]);
-    uint32_t kH = static_cast<uint32_t>(weight->shape[2]);
-    uint32_t kW = static_cast<uint32_t>(weight->shape[3]);
+    uint32_t C_out = static_cast<uint32_t>(w_t->shape[0]);
+    uint32_t kH = static_cast<uint32_t>(w_t->shape[2]);
+    uint32_t kW = static_cast<uint32_t>(w_t->shape[3]);
 
     uint32_t H_out = static_cast<uint32_t>(shape[2]);
     uint32_t W_out = static_cast<uint32_t>(shape[3]);
@@ -1628,16 +2522,17 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d_backward_input(std::shared_pt
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "conv2d_backward_input",
-            {gpu_buffer, weight->gpu_buffer, grad_in->gpu_buffer},
+            {gpu_buf(), w_t->gpu_buf(), grad_in->gpu_buf()},
             &pc, sizeof(pc), gx, gy, gz);
     } else {
-        // CPU fallback. Previously this branch was missing entirely and the
-        // function returned an all-zero gradient without raising.
+        const float* gout_ptr = cpu_f32();
+        const float* w_ptr = w_t->cpu_f32();
+        float* gin_ptr = grad_in->cpu_f32();
         for (uint32_t n = 0; n < N; ++n) {
             for (uint32_t oc = 0; oc < C_out; ++oc) {
                 for (uint32_t oh = 0; oh < H_out; ++oh) {
                     for (uint32_t ow = 0; ow < W_out; ++ow) {
-                        const float g = cpu_data[((n * C_out + oc) * H_out + oh) * W_out + ow];
+                        const float g = gout_ptr[((n * C_out + oc) * H_out + oh) * W_out + ow];
                         const int in_h_base = static_cast<int>(oh * stride_h) - static_cast<int>(pad_h);
                         const int in_w_base = static_cast<int>(ow * stride_w) - static_cast<int>(pad_w);
 
@@ -1648,8 +2543,8 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d_backward_input(std::shared_pt
                                 for (uint32_t kw = 0; kw < kW; ++kw) {
                                     const int iw = in_w_base + static_cast<int>(kw);
                                     if (iw < 0 || iw >= static_cast<int>(W_in)) continue;
-                                    const float w = weight->cpu_data[((oc * C_in + ic) * kH + kh) * kW + kw];
-                                    grad_in->cpu_data[((n * C_in + ic) * H_in + ih) * W_in + iw] += g * w;
+                                    const float wv = w_ptr[((oc * C_in + ic) * kH + kh) * kW + kw];
+                                    gin_ptr[((n * C_in + ic) * H_in + ih) * W_in + iw] += g * wv;
                                 }
                             }
                         }
@@ -1665,13 +2560,23 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d_backward_weight(std::shared_p
                                                                   const std::vector<int64_t>& weight_shape,
                                                                   uint32_t stride_h, uint32_t stride_w,
                                                                   uint32_t pad_h, uint32_t pad_w) {
-    auto grad_weight = std::make_shared<NativeTensor>(weight_shape, device_id);
+    if (dtype != ScalarType::Float32 || input->dtype != ScalarType::Float32) {
+        auto g_f32 = (dtype == ScalarType::Float32) ? shared_from_this() : cast(ScalarType::Float32);
+        auto in_f32 = (input->dtype == ScalarType::Float32) ? input : input->cast(ScalarType::Float32);
+        return g_f32->conv2d_backward_weight(in_f32, weight_shape, stride_h, stride_w, pad_h, pad_w)->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->conv2d_backward_weight(input, weight_shape, stride_h, stride_w, pad_h, pad_w);
+    }
+    auto in_t = input->force_contiguous();
+
+    auto grad_weight = std::make_shared<NativeTensor>(weight_shape, device_id, ScalarType::Float32);
     grad_weight->zero_();
 
-    uint32_t N = static_cast<uint32_t>(input->shape[0]);
-    uint32_t C_in = static_cast<uint32_t>(input->shape[1]);
-    uint32_t H_in = static_cast<uint32_t>(input->shape[2]);
-    uint32_t W_in = static_cast<uint32_t>(input->shape[3]);
+    uint32_t N = static_cast<uint32_t>(in_t->shape[0]);
+    uint32_t C_in = static_cast<uint32_t>(in_t->shape[1]);
+    uint32_t H_in = static_cast<uint32_t>(in_t->shape[2]);
+    uint32_t W_in = static_cast<uint32_t>(in_t->shape[3]);
 
     uint32_t C_out = static_cast<uint32_t>(weight_shape[0]);
     uint32_t kH = static_cast<uint32_t>(weight_shape[2]);
@@ -1706,15 +2611,17 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d_backward_weight(std::shared_p
         uint32_t total_pairs = C_out * C_in;
         VulkanPipelineManager::instance().dispatch(
             device_id, "conv2d_backward_weight",
-            {gpu_buffer, input->gpu_buffer, grad_weight->gpu_buffer},
+            {gpu_buf(), in_t->gpu_buf(), grad_weight->gpu_buf()},
             &pc, sizeof(pc), total_pairs, 1, 1);
     } else {
-        // CPU fallback: dL/dweight for a 4D NCHW convolution.
+        const float* gout_ptr = cpu_f32();
+        const float* in_ptr = in_t->cpu_f32();
+        float* gw_ptr = grad_weight->cpu_f32();
         for (uint32_t n = 0; n < N; ++n) {
             for (uint32_t oc = 0; oc < C_out; ++oc) {
                 for (uint32_t oh = 0; oh < H_out; ++oh) {
                     for (uint32_t ow = 0; ow < W_out; ++ow) {
-                        const float g = cpu_data[((n * C_out + oc) * H_out + oh) * W_out + ow];
+                        const float g = gout_ptr[((n * C_out + oc) * H_out + oh) * W_out + ow];
                         const int in_h_base = static_cast<int>(oh * stride_h) - static_cast<int>(pad_h);
                         const int in_w_base = static_cast<int>(ow * stride_w) - static_cast<int>(pad_w);
 
@@ -1725,8 +2632,8 @@ std::shared_ptr<NativeTensor> NativeTensor::conv2d_backward_weight(std::shared_p
                                 for (uint32_t kw = 0; kw < kW; ++kw) {
                                     const int iw = in_w_base + static_cast<int>(kw);
                                     if (iw < 0 || iw >= static_cast<int>(W_in)) continue;
-                                    const float x = input->cpu_data[((n * C_in + ic) * H_in + ih) * W_in + iw];
-                                    grad_weight->cpu_data[((oc * C_in + ic) * kH + kh) * kW + kw] += g * x;
+                                    const float x = in_ptr[((n * C_in + ic) * H_in + ih) * W_in + iw];
+                                    gw_ptr[((oc * C_in + ic) * kH + kh) * kW + kw] += g * x;
                                 }
                             }
                         }
@@ -1744,7 +2651,23 @@ std::shared_ptr<NativeTensor> NativeTensor::layernorm(std::shared_ptr<NativeTens
     if (norm_dims == 0 || norm_dims > shape.size()) {
         throw std::runtime_error("layernorm: invalid norm_dims");
     }
-    auto out = std::make_shared<NativeTensor>(shape, device_id);
+    if (dtype != ScalarType::Float32 || (gamma && gamma->dtype != ScalarType::Float32) ||
+        (beta && beta->dtype != ScalarType::Float32)) {
+        if (!is_floating_point(dtype)) {
+            throw std::runtime_error("layernorm requires floating-point tensor");
+        }
+        auto in_f32 = (dtype == ScalarType::Float32) ? shared_from_this() : cast(ScalarType::Float32);
+        auto g_f32 = (gamma && gamma->dtype != ScalarType::Float32) ? gamma->cast(ScalarType::Float32) : gamma;
+        auto b_f32 = (beta && beta->dtype != ScalarType::Float32) ? beta->cast(ScalarType::Float32) : beta;
+        return in_f32->layernorm(g_f32, b_f32, eps, norm_dims)->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->layernorm(gamma, beta, eps, norm_dims);
+    }
+    auto gamma_t = gamma ? gamma->force_contiguous() : nullptr;
+    auto beta_t = beta ? beta->force_contiguous() : nullptr;
+
+    auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
     uint32_t cols = 1;
     for (size_t i = shape.size() - norm_dims; i < shape.size(); ++i) {
         cols *= static_cast<uint32_t>(shape[i]);
@@ -1757,33 +2680,37 @@ std::shared_ptr<NativeTensor> NativeTensor::layernorm(std::shared_ptr<NativeTens
             uint32_t cols;
             float eps;
             uint32_t has_affine;
-        } pc{rows, cols, eps, (gamma != nullptr) ? 1u : 0u};
+        } pc{rows, cols, eps, (gamma_t != nullptr) ? 1u : 0u};
 
-        std::shared_ptr<VulkanBuffer> b_gamma = gamma ? gamma->gpu_buffer : out->gpu_buffer;
-        std::shared_ptr<VulkanBuffer> b_beta = beta ? beta->gpu_buffer : out->gpu_buffer;
+        std::shared_ptr<VulkanBuffer> b_gamma = gamma_t ? gamma_t->gpu_buf() : out->gpu_buf();
+        std::shared_ptr<VulkanBuffer> b_beta = beta_t ? beta_t->gpu_buf() : out->gpu_buf();
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "layernorm",
-            {gpu_buffer, b_gamma, b_beta, out->gpu_buffer},
+            {gpu_buf(), b_gamma, b_beta, out->gpu_buf()},
             &pc, sizeof(pc), 1, rows, 1);
     } else {
+        const float* in_ptr = cpu_f32();
+        const float* gam_ptr = gamma_t ? gamma_t->cpu_f32() : nullptr;
+        const float* bet_ptr = beta_t ? beta_t->cpu_f32() : nullptr;
+        float* out_ptr = out->cpu_f32();
         for (uint32_t r = 0; r < rows; ++r) {
             float mean = 0.0f;
-            for (uint32_t c = 0; c < cols; ++c) mean += cpu_data[r * cols + c];
+            for (uint32_t c = 0; c < cols; ++c) mean += in_ptr[r * cols + c];
             mean /= cols;
 
             float var = 0.0f;
             for (uint32_t c = 0; c < cols; ++c) {
-                float diff = cpu_data[r * cols + c] - mean;
+                float diff = in_ptr[r * cols + c] - mean;
                 var += diff * diff;
             }
             var /= cols;
             float inv_std = 1.0f / std::sqrt(var + eps);
 
             for (uint32_t c = 0; c < cols; ++c) {
-                float norm = (cpu_data[r * cols + c] - mean) * inv_std;
-                if (gamma) norm = norm * gamma->cpu_data[c] + (beta ? beta->cpu_data[c] : 0.0f);
-                out->cpu_data[r * cols + c] = norm;
+                float norm = (in_ptr[r * cols + c] - mean) * inv_std;
+                if (gam_ptr) norm = norm * gam_ptr[c] + (bet_ptr ? bet_ptr[c] : 0.0f);
+                out_ptr[r * cols + c] = norm;
             }
         }
     }
@@ -1795,6 +2722,26 @@ NativeTensor::layernorm_backward(std::shared_ptr<NativeTensor> grad_out,
                                  std::shared_ptr<NativeTensor> gamma,
                                  float eps, uint32_t norm_dims,
                                  bool need_dx, bool need_dgamma, bool need_dbeta) {
+    if (dtype != ScalarType::Float32 || grad_out->dtype != ScalarType::Float32 ||
+        (gamma && gamma->dtype != ScalarType::Float32)) {
+        auto in_f32 = (dtype == ScalarType::Float32) ? shared_from_this() : cast(ScalarType::Float32);
+        auto go_f32 = (grad_out->dtype == ScalarType::Float32) ? grad_out : grad_out->cast(ScalarType::Float32);
+        auto ga_f32 = (gamma && gamma->dtype != ScalarType::Float32) ? gamma->cast(ScalarType::Float32) : gamma;
+        auto [dx_f, dgam_f, dbe_f] =
+            in_f32->layernorm_backward(go_f32, ga_f32, eps, norm_dims, need_dx, need_dgamma, need_dbeta);
+        return {
+            dx_f ? dx_f->cast(dtype) : nullptr,
+            dgam_f ? dgam_f->cast(gamma ? gamma->dtype : dtype) : nullptr,
+            dbe_f ? dbe_f->cast(dtype) : nullptr,
+        };
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->layernorm_backward(
+            grad_out, gamma, eps, norm_dims, need_dx, need_dgamma, need_dbeta);
+    }
+    auto go_t = grad_out->force_contiguous();
+    auto gamma_t = gamma ? gamma->force_contiguous() : nullptr;
+
     uint32_t cols = 1;
     std::vector<int64_t> param_shape;
     for (size_t i = shape.size() - norm_dims; i < shape.size(); ++i) {
@@ -1808,7 +2755,7 @@ NativeTensor::layernorm_backward(std::shared_ptr<NativeTensor> grad_out,
     std::shared_ptr<NativeTensor> dbeta = nullptr;
 
     if (device_id >= 0) {
-        uint32_t flags = (gamma != nullptr ? 1u : 0u)
+        uint32_t flags = (gamma_t != nullptr ? 1u : 0u)
                        | (need_dx ? 2u : 0u)
                        | (need_dgamma ? 4u : 0u);
         struct {
@@ -1818,23 +2765,24 @@ NativeTensor::layernorm_backward(std::shared_ptr<NativeTensor> grad_out,
             uint32_t has_affine;
         } pc{rows, cols, eps, flags};
 
-        std::shared_ptr<VulkanBuffer> b_gamma = gamma ? gamma->gpu_buffer : gpu_buffer;
+        std::shared_ptr<VulkanBuffer> b_gamma = gamma_t ? gamma_t->gpu_buf() : gpu_buf();
         std::shared_ptr<NativeTensor> gy_xhat_2d = nullptr;
 
         if (need_dx) {
-            dx = std::make_shared<NativeTensor>(shape, device_id);
+            dx = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
         }
         if (need_dgamma) {
             gy_xhat_2d = std::make_shared<NativeTensor>(
-                std::vector<int64_t>{static_cast<int64_t>(rows), static_cast<int64_t>(cols)}, device_id);
+                std::vector<int64_t>{static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                device_id, ScalarType::Float32);
         }
 
         if (need_dx || need_dgamma) {
-            std::shared_ptr<VulkanBuffer> b_dx = dx ? dx->gpu_buffer : gpu_buffer;
-            std::shared_ptr<VulkanBuffer> b_aux = gy_xhat_2d ? gy_xhat_2d->gpu_buffer : gpu_buffer;
+            std::shared_ptr<VulkanBuffer> b_dx = dx ? dx->gpu_buf() : gpu_buf();
+            std::shared_ptr<VulkanBuffer> b_aux = gy_xhat_2d ? gy_xhat_2d->gpu_buf() : gpu_buf();
             VulkanPipelineManager::instance().dispatch(
                 device_id, "layernorm_backward_dx",
-                {gpu_buffer, grad_out->gpu_buffer, b_gamma, b_dx, b_aux},
+                {gpu_buf(), go_t->gpu_buf(), b_gamma, b_dx, b_aux},
                 &pc, sizeof(pc), 1, rows, 1);
         }
 
@@ -1843,24 +2791,37 @@ NativeTensor::layernorm_backward(std::shared_ptr<NativeTensor> grad_out,
         }
 
         if (need_dbeta) {
-            auto g_2d = grad_out->reshape_view(
+            auto g_2d = go_t->reshape_view(
                 std::vector<int64_t>{static_cast<int64_t>(rows), static_cast<int64_t>(cols)});
             dbeta = g_2d->reduce_sum(0, false)->reshape_view(param_shape);
         }
     } else {
-        if (need_dx) dx = std::make_shared<NativeTensor>(shape, -1);
-        if (need_dgamma) dgamma = std::make_shared<NativeTensor>(param_shape, -1);
-        if (need_dbeta) dbeta = std::make_shared<NativeTensor>(param_shape, -1);
+        if (need_dx) dx = std::make_shared<NativeTensor>(shape, -1, ScalarType::Float32);
+        if (need_dgamma) {
+            dgamma = std::make_shared<NativeTensor>(param_shape, -1, ScalarType::Float32);
+            dgamma->zero_();
+        }
+        if (need_dbeta) {
+            dbeta = std::make_shared<NativeTensor>(param_shape, -1, ScalarType::Float32);
+            dbeta->zero_();
+        }
+
+        const float* in_ptr = cpu_f32();
+        const float* go_ptr = go_t->cpu_f32();
+        const float* gam_ptr = gamma_t ? gamma_t->cpu_f32() : nullptr;
+        float* dx_ptr = dx ? dx->cpu_f32() : nullptr;
+        float* dgam_ptr = dgamma ? dgamma->cpu_f32() : nullptr;
+        float* dbe_ptr = dbeta ? dbeta->cpu_f32() : nullptr;
 
         const float inv_cols = 1.0f / static_cast<float>(cols);
         for (uint32_t r = 0; r < rows; ++r) {
             float mean = 0.0f;
-            for (uint32_t c = 0; c < cols; ++c) mean += cpu_data[r * cols + c];
+            for (uint32_t c = 0; c < cols; ++c) mean += in_ptr[r * cols + c];
             mean *= inv_cols;
 
             float var = 0.0f;
             for (uint32_t c = 0; c < cols; ++c) {
-                float diff = cpu_data[r * cols + c] - mean;
+                float diff = in_ptr[r * cols + c] - mean;
                 var += diff * diff;
             }
             float inv_std = 1.0f / std::sqrt(var * inv_cols + eps);
@@ -1868,21 +2829,21 @@ NativeTensor::layernorm_backward(std::shared_ptr<NativeTensor> grad_out,
             float sum_gy = 0.0f;
             float sum_gy_xhat = 0.0f;
             for (uint32_t c = 0; c < cols; ++c) {
-                float xhat = (cpu_data[r * cols + c] - mean) * inv_std;
-                float g = grad_out->cpu_data[r * cols + c];
-                float w = gamma ? gamma->cpu_data[c] : 1.0f;
+                float xhat = (in_ptr[r * cols + c] - mean) * inv_std;
+                float g = go_ptr[r * cols + c];
+                float w = gam_ptr ? gam_ptr[c] : 1.0f;
                 float gy = g * w;
                 sum_gy += gy;
                 sum_gy_xhat += gy * xhat;
-                if (need_dgamma) dgamma->cpu_data[c] += g * xhat;
-                if (need_dbeta) dbeta->cpu_data[c] += g;
+                if (dgam_ptr) dgam_ptr[c] += g * xhat;
+                if (dbe_ptr) dbe_ptr[c] += g;
             }
-            if (need_dx) {
+            if (dx_ptr) {
                 for (uint32_t c = 0; c < cols; ++c) {
-                    float xhat = (cpu_data[r * cols + c] - mean) * inv_std;
-                    float w = gamma ? gamma->cpu_data[c] : 1.0f;
-                    float gy = grad_out->cpu_data[r * cols + c] * w;
-                    dx->cpu_data[r * cols + c] =
+                    float xhat = (in_ptr[r * cols + c] - mean) * inv_std;
+                    float w = gam_ptr ? gam_ptr[c] : 1.0f;
+                    float gy = go_ptr[r * cols + c] * w;
+                    dx_ptr[r * cols + c] =
                         (gy - sum_gy * inv_cols - xhat * sum_gy_xhat * inv_cols) * inv_std;
                 }
             }
@@ -1896,7 +2857,20 @@ std::shared_ptr<NativeTensor> NativeTensor::rmsnorm(std::shared_ptr<NativeTensor
     if (norm_dims == 0 || norm_dims > shape.size()) {
         throw std::runtime_error("rmsnorm: invalid norm_dims");
     }
-    auto out = std::make_shared<NativeTensor>(shape, device_id);
+    if (dtype != ScalarType::Float32 || (gamma && gamma->dtype != ScalarType::Float32)) {
+        if (!is_floating_point(dtype)) {
+            throw std::runtime_error("rmsnorm requires floating-point tensor");
+        }
+        auto in_f32 = (dtype == ScalarType::Float32) ? shared_from_this() : cast(ScalarType::Float32);
+        auto g_f32 = (gamma && gamma->dtype != ScalarType::Float32) ? gamma->cast(ScalarType::Float32) : gamma;
+        return in_f32->rmsnorm(g_f32, eps, norm_dims)->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->rmsnorm(gamma, eps, norm_dims);
+    }
+    auto gamma_t = gamma ? gamma->force_contiguous() : nullptr;
+
+    auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
     uint32_t cols = 1;
     for (size_t i = shape.size() - norm_dims; i < shape.size(); ++i) {
         cols *= static_cast<uint32_t>(shape[i]);
@@ -1909,25 +2883,28 @@ std::shared_ptr<NativeTensor> NativeTensor::rmsnorm(std::shared_ptr<NativeTensor
             uint32_t cols;
             float eps;
             uint32_t has_affine;
-        } pc{rows, cols, eps, (gamma != nullptr) ? 1u : 0u};
+        } pc{rows, cols, eps, (gamma_t != nullptr) ? 1u : 0u};
 
-        std::shared_ptr<VulkanBuffer> b_gamma = gamma ? gamma->gpu_buffer : out->gpu_buffer;
+        std::shared_ptr<VulkanBuffer> b_gamma = gamma_t ? gamma_t->gpu_buf() : out->gpu_buf();
         VulkanPipelineManager::instance().dispatch(
             device_id, "rmsnorm",
-            {gpu_buffer, b_gamma, b_gamma, out->gpu_buffer},
+            {gpu_buf(), b_gamma, b_gamma, out->gpu_buf()},
             &pc, sizeof(pc), 1, rows, 1);
     } else {
+        const float* in_ptr = cpu_f32();
+        const float* gam_ptr = gamma_t ? gamma_t->cpu_f32() : nullptr;
+        float* out_ptr = out->cpu_f32();
         for (uint32_t r = 0; r < rows; ++r) {
             float sq_sum = 0.0f;
             for (uint32_t c = 0; c < cols; ++c) {
-                float v = cpu_data[r * cols + c];
+                float v = in_ptr[r * cols + c];
                 sq_sum += v * v;
             }
             float inv_rms = 1.0f / std::sqrt(sq_sum / static_cast<float>(cols) + eps);
             for (uint32_t c = 0; c < cols; ++c) {
-                float norm = cpu_data[r * cols + c] * inv_rms;
-                if (gamma) norm *= gamma->cpu_data[c];
-                out->cpu_data[r * cols + c] = norm;
+                float norm = in_ptr[r * cols + c] * inv_rms;
+                if (gam_ptr) norm *= gam_ptr[c];
+                out_ptr[r * cols + c] = norm;
             }
         }
     }
@@ -1939,6 +2916,25 @@ NativeTensor::rmsnorm_backward(std::shared_ptr<NativeTensor> grad_out,
                                std::shared_ptr<NativeTensor> gamma,
                                float eps, uint32_t norm_dims,
                                bool need_dx, bool need_dgamma) {
+    if (dtype != ScalarType::Float32 || grad_out->dtype != ScalarType::Float32 ||
+        (gamma && gamma->dtype != ScalarType::Float32)) {
+        auto in_f32 = (dtype == ScalarType::Float32) ? shared_from_this() : cast(ScalarType::Float32);
+        auto go_f32 = (grad_out->dtype == ScalarType::Float32) ? grad_out : grad_out->cast(ScalarType::Float32);
+        auto ga_f32 = (gamma && gamma->dtype != ScalarType::Float32) ? gamma->cast(ScalarType::Float32) : gamma;
+        auto [dx_f, dgam_f] =
+            in_f32->rmsnorm_backward(go_f32, ga_f32, eps, norm_dims, need_dx, need_dgamma);
+        return {
+            dx_f ? dx_f->cast(dtype) : nullptr,
+            dgam_f ? dgam_f->cast(gamma ? gamma->dtype : dtype) : nullptr,
+        };
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->rmsnorm_backward(
+            grad_out, gamma, eps, norm_dims, need_dx, need_dgamma);
+    }
+    auto go_t = grad_out->force_contiguous();
+    auto gamma_t = gamma ? gamma->force_contiguous() : nullptr;
+
     uint32_t cols = 1;
     std::vector<int64_t> param_shape;
     for (size_t i = shape.size() - norm_dims; i < shape.size(); ++i) {
@@ -1951,7 +2947,7 @@ NativeTensor::rmsnorm_backward(std::shared_ptr<NativeTensor> grad_out,
     std::shared_ptr<NativeTensor> dgamma = nullptr;
 
     if (device_id >= 0) {
-        uint32_t flags = (gamma != nullptr ? 1u : 0u)
+        uint32_t flags = (gamma_t != nullptr ? 1u : 0u)
                        | (need_dx ? 2u : 0u)
                        | (need_dgamma ? 4u : 0u);
         struct {
@@ -1961,23 +2957,24 @@ NativeTensor::rmsnorm_backward(std::shared_ptr<NativeTensor> grad_out,
             uint32_t has_affine;
         } pc{rows, cols, eps, flags};
 
-        std::shared_ptr<VulkanBuffer> b_gamma = gamma ? gamma->gpu_buffer : gpu_buffer;
+        std::shared_ptr<VulkanBuffer> b_gamma = gamma_t ? gamma_t->gpu_buf() : gpu_buf();
         std::shared_ptr<NativeTensor> gy_xhat_2d = nullptr;
 
         if (need_dx) {
-            dx = std::make_shared<NativeTensor>(shape, device_id);
+            dx = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
         }
         if (need_dgamma) {
             gy_xhat_2d = std::make_shared<NativeTensor>(
-                std::vector<int64_t>{static_cast<int64_t>(rows), static_cast<int64_t>(cols)}, device_id);
+                std::vector<int64_t>{static_cast<int64_t>(rows), static_cast<int64_t>(cols)},
+                device_id, ScalarType::Float32);
         }
 
         if (need_dx || need_dgamma) {
-            std::shared_ptr<VulkanBuffer> b_dx = dx ? dx->gpu_buffer : gpu_buffer;
-            std::shared_ptr<VulkanBuffer> b_aux = gy_xhat_2d ? gy_xhat_2d->gpu_buffer : gpu_buffer;
+            std::shared_ptr<VulkanBuffer> b_dx = dx ? dx->gpu_buf() : gpu_buf();
+            std::shared_ptr<VulkanBuffer> b_aux = gy_xhat_2d ? gy_xhat_2d->gpu_buf() : gpu_buf();
             VulkanPipelineManager::instance().dispatch(
                 device_id, "rmsnorm_backward_dx",
-                {gpu_buffer, grad_out->gpu_buffer, b_gamma, b_dx, b_aux},
+                {gpu_buf(), go_t->gpu_buf(), b_gamma, b_dx, b_aux},
                 &pc, sizeof(pc), 1, rows, 1);
         }
 
@@ -1985,33 +2982,42 @@ NativeTensor::rmsnorm_backward(std::shared_ptr<NativeTensor> grad_out,
             dgamma = gy_xhat_2d->reduce_sum(0, false)->reshape_view(param_shape);
         }
     } else {
-        if (need_dx) dx = std::make_shared<NativeTensor>(shape, -1);
-        if (need_dgamma) dgamma = std::make_shared<NativeTensor>(param_shape, -1);
+        if (need_dx) dx = std::make_shared<NativeTensor>(shape, -1, ScalarType::Float32);
+        if (need_dgamma) {
+            dgamma = std::make_shared<NativeTensor>(param_shape, -1, ScalarType::Float32);
+            dgamma->zero_();
+        }
+
+        const float* in_ptr = cpu_f32();
+        const float* go_ptr = go_t->cpu_f32();
+        const float* gam_ptr = gamma_t ? gamma_t->cpu_f32() : nullptr;
+        float* dx_ptr = dx ? dx->cpu_f32() : nullptr;
+        float* dgam_ptr = dgamma ? dgamma->cpu_f32() : nullptr;
 
         const float inv_cols = 1.0f / static_cast<float>(cols);
         for (uint32_t r = 0; r < rows; ++r) {
             float sq_sum = 0.0f;
             for (uint32_t c = 0; c < cols; ++c) {
-                float v = cpu_data[r * cols + c];
+                float v = in_ptr[r * cols + c];
                 sq_sum += v * v;
             }
             float inv_rms = 1.0f / std::sqrt(sq_sum * inv_cols + eps);
 
             float sum_gy_xhat = 0.0f;
             for (uint32_t c = 0; c < cols; ++c) {
-                float xhat = cpu_data[r * cols + c] * inv_rms;
-                float g = grad_out->cpu_data[r * cols + c];
-                float w = gamma ? gamma->cpu_data[c] : 1.0f;
+                float xhat = in_ptr[r * cols + c] * inv_rms;
+                float g = go_ptr[r * cols + c];
+                float w = gam_ptr ? gam_ptr[c] : 1.0f;
                 float gy = g * w;
                 sum_gy_xhat += gy * xhat;
-                if (need_dgamma) dgamma->cpu_data[c] += g * xhat;
+                if (dgam_ptr) dgam_ptr[c] += g * xhat;
             }
-            if (need_dx) {
+            if (dx_ptr) {
                 for (uint32_t c = 0; c < cols; ++c) {
-                    float xhat = cpu_data[r * cols + c] * inv_rms;
-                    float w = gamma ? gamma->cpu_data[c] : 1.0f;
-                    float gy = grad_out->cpu_data[r * cols + c] * w;
-                    dx->cpu_data[r * cols + c] = (gy - xhat * sum_gy_xhat * inv_cols) * inv_rms;
+                    float xhat = in_ptr[r * cols + c] * inv_rms;
+                    float w = gam_ptr ? gam_ptr[c] : 1.0f;
+                    float gy = go_ptr[r * cols + c] * w;
+                    dx_ptr[r * cols + c] = (gy - xhat * sum_gy_xhat * inv_cols) * inv_rms;
                 }
             }
         }
@@ -2026,28 +3032,56 @@ void NativeTensor::sgd_step_(const std::shared_ptr<NativeTensor>& grad,
     if (grad->device_id != device_id) {
         throw std::runtime_error("sgd_step_: grad must be on the same device");
     }
-    if (grad->numel != numel || !is_contiguous() || !grad->is_contiguous()) {
+    if (grad->numel != numel || !is_dense_zero_offset()) {
         throw std::runtime_error("sgd_step_: requires contiguous matching tensors");
     }
+    if (!is_floating_point(dtype)) {
+        throw std::runtime_error("sgd_step_: parameter must be floating-point");
+    }
+    if (dtype != ScalarType::Float32) {
+        auto p_f32 = cast(ScalarType::Float32);
+        auto g_f32 = (grad->dtype == ScalarType::Float32) ? grad->force_contiguous() : grad->cast(ScalarType::Float32);
+        std::shared_ptr<NativeTensor> m_f32 = nullptr;
+        if (momentum != 0.0f) {
+            if (!momentum_buf || momentum_buf->device_id != device_id || momentum_buf->numel != numel) {
+                throw std::runtime_error("sgd_step_: invalid momentum buffer");
+            }
+            m_f32 = (momentum_buf->dtype == ScalarType::Float32)
+                        ? momentum_buf->force_contiguous()
+                        : momentum_buf->cast(ScalarType::Float32);
+        }
+        p_f32->sgd_step_(g_f32, m_f32, lr, momentum, dampening, weight_decay, nesterov, first_step);
+        copy_from_native(p_f32->cast(dtype));
+        if (m_f32 && momentum_buf->dtype != ScalarType::Float32) {
+            momentum_buf->copy_from_native(m_f32->cast(momentum_buf->dtype));
+        }
+        return;
+    }
+    auto grad_t = grad->force_contiguous();
+    std::shared_ptr<NativeTensor> mom_t = nullptr;
     if (momentum != 0.0f) {
         if (!momentum_buf || momentum_buf->device_id != device_id ||
-            momentum_buf->numel != numel || !momentum_buf->is_contiguous()) {
+            momentum_buf->numel != numel || !momentum_buf->is_dense_zero_offset()) {
             throw std::runtime_error("sgd_step_: invalid momentum buffer");
         }
+        mom_t = momentum_buf;
     }
 
     if (device_id < 0) {
+        float* p_ptr = cpu_f32();
+        const float* g_ptr = grad_t->cpu_f32();
+        float* m_ptr = mom_t ? mom_t->cpu_f32() : nullptr;
         for (size_t i = 0; i < numel; ++i) {
-            float p = cpu_data[i];
-            float g = grad->cpu_data[i];
+            float p = p_ptr[i];
+            float g = g_ptr[i];
             if (weight_decay != 0.0f) g += weight_decay * p;
             float d_p = g;
             if (momentum != 0.0f) {
-                float buf = first_step ? g : (momentum * momentum_buf->cpu_data[i] + (1.0f - dampening) * g);
-                momentum_buf->cpu_data[i] = buf;
+                float buf = first_step ? g : (momentum * m_ptr[i] + (1.0f - dampening) * g);
+                m_ptr[i] = buf;
                 d_p = nesterov ? (g + momentum * buf) : buf;
             }
-            cpu_data[i] = p - lr * d_p;
+            p_ptr[i] = p - lr * d_p;
         }
         return;
     }
@@ -2068,10 +3102,10 @@ void NativeTensor::sgd_step_(const std::shared_ptr<NativeTensor>& grad,
     } pc{static_cast<uint32_t>(numel), groups_x, lr, momentum, dampening,
          weight_decay, nesterov ? 1u : 0u, first_step ? 1u : 0u};
 
-    std::shared_ptr<VulkanBuffer> b_mom = momentum_buf ? momentum_buf->gpu_buffer : gpu_buffer;
+    std::shared_ptr<VulkanBuffer> b_mom = mom_t ? mom_t->gpu_buf() : gpu_buf();
     VulkanPipelineManager::instance().dispatch(
         device_id, "sgd_step",
-        {gpu_buffer, grad->gpu_buffer, b_mom},
+        {gpu_buf(), grad_t->gpu_buf(), b_mom},
         &pc, sizeof(pc), groups_x, groups_y);
 }
 
@@ -2109,6 +3143,21 @@ void NativeTensor::random_philox_(uint32_t mode, float p1, float p2,
                                   uint64_t seed, uint32_t offset,
                                   const std::shared_ptr<NativeTensor>& src) {
     if (numel == 0) return;
+    if (!is_floating_point(dtype)) {
+        throw std::runtime_error("random_philox_: requires floating-point tensor");
+    }
+    if (dtype != ScalarType::Float32 || !is_dense_zero_offset() ||
+        (src && (src->dtype != ScalarType::Float32 || !src->is_dense_zero_offset()))) {
+        auto tmp = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+        std::shared_ptr<NativeTensor> src_f32 = nullptr;
+        if (src) {
+            src_f32 = (src->dtype == ScalarType::Float32) ? src->force_contiguous() : src->cast(ScalarType::Float32);
+        }
+        tmp->random_philox_(mode, p1, p2, seed, offset, src_f32);
+        copy_from_native(dtype == ScalarType::Float32 ? tmp : tmp->cast(dtype));
+        return;
+    }
+
     const uint32_t seed_lo = static_cast<uint32_t>(seed & 0xFFFFFFFFull);
     const uint32_t seed_hi = static_cast<uint32_t>(seed >> 32ull);
 
@@ -2125,14 +3174,15 @@ void NativeTensor::random_philox_(uint32_t mode, float p1, float p2,
 
         uint32_t num_threads = (static_cast<uint32_t>(numel) + 3u) / 4u;
         uint32_t groups = (num_threads + 255u) / 256u;
-        std::shared_ptr<VulkanBuffer> b_in = src ? src->gpu_buffer : gpu_buffer;
+        std::shared_ptr<VulkanBuffer> b_in = src ? src->gpu_buf() : gpu_buf();
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "philox_rng",
-            {b_in, gpu_buffer},
+            {b_in, gpu_buf()},
             &pc, sizeof(pc), groups, 1, 1);
     } else {
-        const float* in_ptr = src ? src->cpu_data.data() : cpu_data.data();
+        float* out_ptr = cpu_f32();
+        const float* in_ptr = src ? src->cpu_f32() : out_ptr;
         const size_t num_quads = (numel + 3u) / 4u;
         for (size_t q = 0; q < num_quads; ++q) {
             uint32_t ctr[4] = {static_cast<uint32_t>(q), offset, 0u, 0u};
@@ -2167,7 +3217,7 @@ void NativeTensor::random_philox_(uint32_t mode, float p1, float p2,
 
             for (int k = 0; k < 4; ++k) {
                 size_t idx = q * 4u + static_cast<size_t>(k);
-                if (idx < numel) cpu_data[idx] = vals[k];
+                if (idx < numel) out_ptr[idx] = vals[k];
             }
         }
     }
@@ -2180,6 +3230,17 @@ NativeTensor::maxpool2d(uint32_t kH, uint32_t kW,
     if (shape.size() != 4) {
         throw std::runtime_error("maxpool2d requires 4D input [N, C, H, W]");
     }
+    if (dtype != ScalarType::Float32) {
+        if (!is_floating_point(dtype)) {
+            throw std::runtime_error("maxpool2d requires floating-point tensor");
+        }
+        auto [out_f32, idx_f32] = cast(ScalarType::Float32)->maxpool2d(kH, kW, stride_h, stride_w, pad_h, pad_w);
+        return {out_f32->cast(dtype), idx_f32};
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->maxpool2d(kH, kW, stride_h, stride_w, pad_h, pad_w);
+    }
+
     uint32_t N = static_cast<uint32_t>(shape[0]);
     uint32_t C = static_cast<uint32_t>(shape[1]);
     uint32_t H_in = static_cast<uint32_t>(shape[2]);
@@ -2192,8 +3253,8 @@ NativeTensor::maxpool2d(uint32_t kH, uint32_t kW,
         static_cast<int64_t>(N), static_cast<int64_t>(C),
         static_cast<int64_t>(H_out), static_cast<int64_t>(W_out)
     };
-    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
-    auto indices = std::make_shared<NativeTensor>(out_shape, device_id);
+    auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
+    auto indices = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
 
     if (device_id >= 0) {
         struct {
@@ -2206,9 +3267,12 @@ NativeTensor::maxpool2d(uint32_t kH, uint32_t kW,
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "maxpool2d",
-            {gpu_buffer, out->gpu_buffer, indices->gpu_buffer},
+            {gpu_buf(), out->gpu_buf(), indices->gpu_buf()},
             &pc, sizeof(pc), gx, gy, gz);
     } else {
+        const float* in_ptr = cpu_f32();
+        float* out_ptr = out->cpu_f32();
+        float* idx_ptr = indices->cpu_f32();
         for (uint32_t nc = 0; nc < N * C; ++nc) {
             uint32_t in_nc_off = nc * H_in * W_in;
             uint32_t out_nc_off = nc * H_out * W_out;
@@ -2225,7 +3289,7 @@ NativeTensor::maxpool2d(uint32_t kH, uint32_t kW,
                                 int iw = iw_base + static_cast<int>(kw);
                                 if (iw >= 0 && iw < static_cast<int>(W_in)) {
                                     uint32_t cur = in_nc_off + static_cast<uint32_t>(ih) * W_in + static_cast<uint32_t>(iw);
-                                    float v = cpu_data[cur];
+                                    float v = in_ptr[cur];
                                     if (v > max_val) {
                                         max_val = v;
                                         max_idx = cur;
@@ -2235,10 +3299,10 @@ NativeTensor::maxpool2d(uint32_t kH, uint32_t kW,
                         }
                     }
                     uint32_t out_idx = out_nc_off + oh * W_out + ow;
-                    out->cpu_data[out_idx] = max_val;
+                    out_ptr[out_idx] = max_val;
                     float idx_bits = 0.0f;
                     std::memcpy(&idx_bits, &max_idx, sizeof(float));
-                    indices->cpu_data[out_idx] = idx_bits;
+                    idx_ptr[out_idx] = idx_bits;
                 }
             }
         }
@@ -2252,6 +3316,17 @@ std::shared_ptr<NativeTensor> NativeTensor::maxpool2d_backward(
     uint32_t kH, uint32_t kW,
     uint32_t stride_h, uint32_t stride_w,
     uint32_t pad_h, uint32_t pad_w) {
+    if (dtype != ScalarType::Float32) {
+        return cast(ScalarType::Float32)
+            ->maxpool2d_backward(indices, in_shape, kH, kW, stride_h, stride_w, pad_h, pad_w)
+            ->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->maxpool2d_backward(
+            indices, in_shape, kH, kW, stride_h, stride_w, pad_h, pad_w);
+    }
+    auto idx_t = indices->force_contiguous();
+
     uint32_t N = static_cast<uint32_t>(in_shape[0]);
     uint32_t C = static_cast<uint32_t>(in_shape[1]);
     uint32_t H_in = static_cast<uint32_t>(in_shape[2]);
@@ -2259,7 +3334,7 @@ std::shared_ptr<NativeTensor> NativeTensor::maxpool2d_backward(
     uint32_t H_out = static_cast<uint32_t>(shape[2]);
     uint32_t W_out = static_cast<uint32_t>(shape[3]);
 
-    auto grad_in = std::make_shared<NativeTensor>(in_shape, device_id);
+    auto grad_in = std::make_shared<NativeTensor>(in_shape, device_id, ScalarType::Float32);
 
     if (device_id >= 0) {
         struct {
@@ -2272,15 +3347,18 @@ std::shared_ptr<NativeTensor> NativeTensor::maxpool2d_backward(
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "maxpool2d_backward",
-            {gpu_buffer, indices->gpu_buffer, grad_in->gpu_buffer},
+            {gpu_buf(), idx_t->gpu_buf(), grad_in->gpu_buf()},
             &pc, sizeof(pc), gx, gy, gz);
     } else {
-        std::fill(grad_in->cpu_data.begin(), grad_in->cpu_data.end(), 0.0f);
+        grad_in->zero_();
+        const float* gout_ptr = cpu_f32();
+        const float* idx_ptr = idx_t->cpu_f32();
+        float* gin_ptr = grad_in->cpu_f32();
         for (size_t i = 0; i < numel; ++i) {
             uint32_t max_idx = 0u;
-            std::memcpy(&max_idx, &indices->cpu_data[i], sizeof(uint32_t));
+            std::memcpy(&max_idx, &idx_ptr[i], sizeof(uint32_t));
             if (max_idx < grad_in->numel) {
-                grad_in->cpu_data[max_idx] += cpu_data[i];
+                gin_ptr[max_idx] += gout_ptr[i];
             }
         }
     }
@@ -2294,6 +3372,21 @@ std::shared_ptr<NativeTensor> NativeTensor::avgpool2d(
     if (shape.size() != 4) {
         throw std::runtime_error("avgpool2d requires 4D input [N, C, H, W]");
     }
+    if (dtype != ScalarType::Float32) {
+        if (!is_floating_point(dtype)) {
+            throw std::runtime_error("avgpool2d requires floating-point tensor");
+        }
+        return cast(ScalarType::Float32)
+            ->avgpool2d(kH, kW, stride_h, stride_w, pad_h, pad_w,
+                        count_include_pad, is_adaptive, adaptive_out_h, adaptive_out_w)
+            ->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->avgpool2d(
+            kH, kW, stride_h, stride_w, pad_h, pad_w,
+            count_include_pad, is_adaptive, adaptive_out_h, adaptive_out_w);
+    }
+
     uint32_t N = static_cast<uint32_t>(shape[0]);
     uint32_t C = static_cast<uint32_t>(shape[1]);
     uint32_t H_in = static_cast<uint32_t>(shape[2]);
@@ -2306,7 +3399,7 @@ std::shared_ptr<NativeTensor> NativeTensor::avgpool2d(
         static_cast<int64_t>(N), static_cast<int64_t>(C),
         static_cast<int64_t>(H_out), static_cast<int64_t>(W_out)
     };
-    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+    auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
 
     if (device_id >= 0) {
         struct {
@@ -2321,9 +3414,11 @@ std::shared_ptr<NativeTensor> NativeTensor::avgpool2d(
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "avgpool2d",
-            {gpu_buffer, out->gpu_buffer},
+            {gpu_buf(), out->gpu_buf()},
             &pc, sizeof(pc), gx, gy, gz);
     } else {
+        const float* in_ptr = cpu_f32();
+        float* out_ptr = out->cpu_f32();
         for (uint32_t nc = 0; nc < N * C; ++nc) {
             uint32_t in_nc_off = nc * H_in * W_in;
             uint32_t out_nc_off = nc * H_out * W_out;
@@ -2349,13 +3444,13 @@ std::shared_ptr<NativeTensor> NativeTensor::avgpool2d(
                     float sum = 0.0f;
                     for (int ih = ih_cs; ih < ih_ce; ++ih) {
                         for (int iw = iw_cs; iw < iw_ce; ++iw) {
-                            sum += cpu_data[in_nc_off + static_cast<uint32_t>(ih) * W_in + static_cast<uint32_t>(iw)];
+                            sum += in_ptr[in_nc_off + static_cast<uint32_t>(ih) * W_in + static_cast<uint32_t>(iw)];
                         }
                     }
                     int denom = (is_adaptive || !count_include_pad)
                                     ? std::max(1, (ih_ce - ih_cs) * (iw_ce - iw_cs))
                                     : static_cast<int>(kH * kW);
-                    out->cpu_data[out_nc_off + oh * W_out + ow] = sum / static_cast<float>(denom);
+                    out_ptr[out_nc_off + oh * W_out + ow] = sum / static_cast<float>(denom);
                 }
             }
         }
@@ -2367,6 +3462,18 @@ std::shared_ptr<NativeTensor> NativeTensor::avgpool2d_backward(
     const std::vector<int64_t>& in_shape,
     uint32_t kH, uint32_t kW, uint32_t stride_h, uint32_t stride_w,
     uint32_t pad_h, uint32_t pad_w, bool count_include_pad, bool is_adaptive) {
+    if (dtype != ScalarType::Float32) {
+        return cast(ScalarType::Float32)
+            ->avgpool2d_backward(in_shape, kH, kW, stride_h, stride_w, pad_h, pad_w,
+                                 count_include_pad, is_adaptive)
+            ->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->avgpool2d_backward(
+            in_shape, kH, kW, stride_h, stride_w, pad_h, pad_w,
+            count_include_pad, is_adaptive);
+    }
+
     uint32_t N = static_cast<uint32_t>(in_shape[0]);
     uint32_t C = static_cast<uint32_t>(in_shape[1]);
     uint32_t H_in = static_cast<uint32_t>(in_shape[2]);
@@ -2374,7 +3481,7 @@ std::shared_ptr<NativeTensor> NativeTensor::avgpool2d_backward(
     uint32_t H_out = static_cast<uint32_t>(shape[2]);
     uint32_t W_out = static_cast<uint32_t>(shape[3]);
 
-    auto grad_in = std::make_shared<NativeTensor>(in_shape, device_id);
+    auto grad_in = std::make_shared<NativeTensor>(in_shape, device_id, ScalarType::Float32);
 
     if (device_id >= 0) {
         struct {
@@ -2389,10 +3496,12 @@ std::shared_ptr<NativeTensor> NativeTensor::avgpool2d_backward(
 
         VulkanPipelineManager::instance().dispatch(
             device_id, "avgpool2d_backward",
-            {gpu_buffer, grad_in->gpu_buffer},
+            {gpu_buf(), grad_in->gpu_buf()},
             &pc, sizeof(pc), gx, gy, gz);
     } else {
-        std::fill(grad_in->cpu_data.begin(), grad_in->cpu_data.end(), 0.0f);
+        grad_in->zero_();
+        const float* gout_ptr = cpu_f32();
+        float* gin_ptr = grad_in->cpu_f32();
         for (uint32_t nc = 0; nc < N * C; ++nc) {
             uint32_t in_nc_off = nc * H_in * W_in;
             uint32_t out_nc_off = nc * H_out * W_out;
@@ -2418,10 +3527,10 @@ std::shared_ptr<NativeTensor> NativeTensor::avgpool2d_backward(
                     int denom = (is_adaptive || !count_include_pad)
                                     ? std::max(1, (ih_ce - ih_cs) * (iw_ce - iw_cs))
                                     : static_cast<int>(kH * kW);
-                    float g = cpu_data[out_nc_off + oh * W_out + ow] / static_cast<float>(denom);
+                    float g = gout_ptr[out_nc_off + oh * W_out + ow] / static_cast<float>(denom);
                     for (int ih = ih_cs; ih < ih_ce; ++ih) {
                         for (int iw = iw_cs; iw < iw_ce; ++iw) {
-                            grad_in->cpu_data[in_nc_off + static_cast<uint32_t>(ih) * W_in + static_cast<uint32_t>(iw)] += g;
+                            gin_ptr[in_nc_off + static_cast<uint32_t>(ih) * W_in + static_cast<uint32_t>(iw)] += g;
                         }
                     }
                 }
@@ -2440,13 +3549,24 @@ std::shared_ptr<NativeTensor> NativeTensor::embedding(
         throw std::runtime_error("embedding indices and weight must be on the same device");
     }
 
+    const ScalarType out_dtype = weight->dtype;
+    if (dtype != ScalarType::Float32 || !is_dense_zero_offset() ||
+        weight->dtype != ScalarType::Float32 || !weight->is_dense_zero_offset()) {
+        auto idx_f32 = (dtype == ScalarType::Float32) ? force_contiguous() : cast(ScalarType::Float32);
+        auto w_f32 = (weight->dtype == ScalarType::Float32)
+                         ? weight->force_contiguous()
+                         : weight->cast(ScalarType::Float32);
+        auto res = idx_f32->embedding(w_f32, padding_idx);
+        return (out_dtype == ScalarType::Float32) ? res : res->cast(out_dtype);
+    }
+
     const uint32_t num_embeddings = static_cast<uint32_t>(weight->shape[0]);
     const uint32_t embedding_dim = static_cast<uint32_t>(weight->shape[1]);
     const uint32_t num_indices = static_cast<uint32_t>(numel);
 
     std::vector<int64_t> out_shape = shape;
     out_shape.push_back(static_cast<int64_t>(embedding_dim));
-    auto out = std::make_shared<NativeTensor>(out_shape, device_id);
+    auto out = std::make_shared<NativeTensor>(out_shape, device_id, ScalarType::Float32);
     if (out->numel == 0) return out;
 
     if (device_id >= 0) {
@@ -2460,17 +3580,20 @@ std::shared_ptr<NativeTensor> NativeTensor::embedding(
         uint32_t groups = (static_cast<uint32_t>(out->numel) + 255u) / 256u;
         VulkanPipelineManager::instance().dispatch(
             device_id, "embedding_forward",
-            {gpu_buffer, weight->gpu_buffer, out->gpu_buffer},
+            {gpu_buf(), weight->gpu_buf(), out->gpu_buf()},
             &pc, sizeof(pc), groups, 1, 1);
     } else {
+        const float* idx_ptr = cpu_f32();
+        const float* w_ptr = weight->cpu_f32();
+        float* out_ptr = out->cpu_f32();
         for (uint32_t i = 0; i < num_indices; ++i) {
-            int tok = static_cast<int>(cpu_data[i]);
+            int tok = static_cast<int>(idx_ptr[i]);
             for (uint32_t c = 0; c < embedding_dim; ++c) {
                 if (tok == static_cast<int>(padding_idx) || tok < 0 || static_cast<uint32_t>(tok) >= num_embeddings) {
-                    out->cpu_data[i * embedding_dim + c] = 0.0f;
+                    out_ptr[i * embedding_dim + c] = 0.0f;
                 } else {
-                    out->cpu_data[i * embedding_dim + c] =
-                        weight->cpu_data[static_cast<uint32_t>(tok) * embedding_dim + c];
+                    out_ptr[i * embedding_dim + c] =
+                        w_ptr[static_cast<uint32_t>(tok) * embedding_dim + c];
                 }
             }
         }
@@ -2483,12 +3606,25 @@ std::shared_ptr<NativeTensor> NativeTensor::embedding_backward(
     if (indices->device_id != device_id) {
         throw std::runtime_error("embedding_backward: device mismatch");
     }
+    if (dtype != ScalarType::Float32) {
+        return cast(ScalarType::Float32)
+            ->embedding_backward(indices, num_embeddings, padding_idx)
+            ->cast(dtype);
+    }
+    if (!is_dense_zero_offset()) {
+        return force_contiguous()->embedding_backward(indices, num_embeddings, padding_idx);
+    }
+    auto idx_f32 = (indices->dtype == ScalarType::Float32)
+                       ? indices->force_contiguous()
+                       : indices->cast(ScalarType::Float32);
+
     const uint32_t embedding_dim = static_cast<uint32_t>(shape.back());
-    const uint32_t num_indices = static_cast<uint32_t>(indices->numel);
+    const uint32_t num_indices = static_cast<uint32_t>(idx_f32->numel);
     const uint32_t num_emb = static_cast<uint32_t>(num_embeddings);
 
     auto grad_weight = std::make_shared<NativeTensor>(
-        std::vector<int64_t>{num_embeddings, static_cast<int64_t>(embedding_dim)}, device_id);
+        std::vector<int64_t>{num_embeddings, static_cast<int64_t>(embedding_dim)},
+        device_id, ScalarType::Float32);
 
     if (device_id >= 0) {
         struct {
@@ -2502,18 +3638,21 @@ std::shared_ptr<NativeTensor> NativeTensor::embedding_backward(
         uint32_t gy = (num_emb + 7u) / 8u;
         VulkanPipelineManager::instance().dispatch(
             device_id, "embedding_backward",
-            {indices->gpu_buffer, gpu_buffer, grad_weight->gpu_buffer},
+            {idx_f32->gpu_buf(), gpu_buf(), grad_weight->gpu_buf()},
             &pc, sizeof(pc), gx, gy, 1);
     } else {
-        std::fill(grad_weight->cpu_data.begin(), grad_weight->cpu_data.end(), 0.0f);
+        grad_weight->zero_();
+        const float* idx_ptr = idx_f32->cpu_f32();
+        const float* gout_ptr = cpu_f32();
+        float* gw_ptr = grad_weight->cpu_f32();
         for (uint32_t i = 0; i < num_indices; ++i) {
-            int tok = static_cast<int>(indices->cpu_data[i]);
+            int tok = static_cast<int>(idx_ptr[i]);
             if (tok == static_cast<int>(padding_idx) || tok < 0 || static_cast<uint32_t>(tok) >= num_emb) {
                 continue;
             }
             for (uint32_t c = 0; c < embedding_dim; ++c) {
-                grad_weight->cpu_data[static_cast<uint32_t>(tok) * embedding_dim + c] +=
-                    cpu_data[i * embedding_dim + c];
+                gw_ptr[static_cast<uint32_t>(tok) * embedding_dim + c] +=
+                    gout_ptr[i * embedding_dim + c];
             }
         }
     }

@@ -35,6 +35,9 @@ struct GemmParams {
     uint strideC_m;
     uint strideC_n;
     uint has_bias;
+    uint offsetA;
+    uint offsetB;
+    uint offsetC;
 };
 
 [[vk::push_constant]] GemmParams pc;
@@ -101,9 +104,9 @@ void gemm<let TILE : int, let BK : int, let R : int, E : IEpilogue>(uint3 lid, u
     const uint bn = gid.x * TILE;
     const uint batch = gid.z;
 
-    const uint baseA = batch * pc.strideA_b;
-    const uint baseB = batch * pc.strideB_b;
-    const uint baseC = batch * pc.strideC_b;
+    const uint baseA = pc.offsetA + batch * pc.strideA_b;
+    const uint baseB = pc.offsetB + batch * pc.strideB_b;
+    const uint baseC = pc.offsetC + batch * pc.strideC_b;
 
     float acc[R][R];
     [ForceUnroll] for (int i = 0; i < R; ++i)
@@ -257,9 +260,9 @@ void matmul_coopmat(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) {
         [ForceUnroll] for (int j = 0; j < 4; ++j)
             acc[i][j] = Accum(0.0);
 
-    const uint baseA = batch * pc.strideA_b;
-    const uint baseB = batch * pc.strideB_b;
-    const uint baseC = batch * pc.strideC_b;
+    const uint baseA = pc.offsetA + batch * pc.strideA_b;
+    const uint baseB = pc.offsetB + batch * pc.strideB_b;
+    const uint baseC = pc.offsetC + batch * pc.strideC_b;
     const uint num_k_tiles = (pc.K + CM_BK - 1u) / CM_BK;
 
     for (uint tile = 0; tile < num_k_tiles; ++tile) {

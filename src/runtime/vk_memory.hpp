@@ -6,7 +6,9 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <set>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace vultorch {
@@ -17,6 +19,11 @@ public:
     VkBuffer buffer = VK_NULL_HANDLE;
     VkDeviceMemory memory = VK_NULL_HANDLE;
     VkDeviceSize size = 0;
+    VkDeviceSize arena_offset = 0;
+    VkDeviceSize arena_block_size = 0;
+    uint32_t arena_index = 0;
+    bool from_arena = false;
+    uint64_t allocation_id = 0;
     void* mapped_data = nullptr;
     bool is_host_visible = false;
     // Recorded so the pool only hands a recycled buffer to a request with
@@ -24,8 +31,16 @@ public:
     VkBufferUsageFlags usage = 0;
     VkMemoryPropertyFlags memory_properties = 0;
 
+    // Standalone buffer owning its VkBuffer + VkDeviceMemory.
     VulkanBuffer(std::shared_ptr<VulkanDeviceContext> ctx, VkDeviceSize size_bytes,
                  VkBufferUsageFlags buffer_usage, VkMemoryPropertyFlags memory_flags);
+
+    // Arena sub-allocation borrowing a slice [offset_bytes, offset_bytes + block_size_bytes).
+    VulkanBuffer(std::shared_ptr<VulkanDeviceContext> ctx, VkBuffer shared_buffer,
+                 VkDeviceSize logical_size, VkDeviceSize offset_bytes, VkDeviceSize block_size_bytes,
+                 uint32_t arena_idx, VkBufferUsageFlags buffer_usage,
+                 VkMemoryPropertyFlags memory_flags, uint64_t alloc_id);
+
     ~VulkanBuffer();
 
     VulkanBuffer(const VulkanBuffer&) = delete;
@@ -33,21 +48,11 @@ public:
 
     void* map();
     void unmap();
-    void flush(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
-    void invalidate(VkDeviceSize offset = 0, VkDeviceSize size = VK_WHOLE_SIZE);
+    void flush(VkDeviceSize byte_offset = 0, VkDeviceSize byte_size = VK_WHOLE_SIZE);
+    void invalidate(VkDeviceSize byte_offset = 0, VkDeviceSize byte_size = VK_WHOLE_SIZE);
 };
 
-// Caching allocator.
-//
-// Buffers come from per-device free lists and return to the pool when the last
-// reference drops, instead of being created and destroyed per tensor. Requests
-// are rounded to 4 KiB buckets, so the repeated shapes of a training loop reuse
-// the same allocations. This also keeps the process well under the driver's
-// maxMemoryAllocationCount (typically 4096).
-//
-// Reuse safety: every write into a device-local buffer is GPU-ordered (uploads
-// go through staging), and every host read/write flushes and waits first, so a
-// recycled buffer cannot be written by the CPU while the GPU still reads it.
+// Two-level Arena Sub-Allocator + Caching Pool + Persistent Mapped Staging Ring.
 class VulkanMemoryManager {
 public:
     static VulkanMemoryManager& instance();
@@ -79,8 +84,11 @@ public:
     // Diagnostics and tests.
     size_t pooled_buffer_count() const;
     size_t live_allocation_count() const { return live_allocations.load(); }
+    size_t driver_allocation_count(int device_id = -1) const;
+    size_t active_arena_bytes(int device_id = -1) const;
+    size_t reserved_arena_bytes(int device_id = -1) const;
 
-    // Destroys pooled buffers. Must run before the logical devices go away;
+    // Destroys pooled buffers, arenas, and staging rings. Must run before the logical devices go away;
     // afterwards recycle() frees immediately instead of pooling.
     void shutdown();
 
@@ -97,19 +105,64 @@ private:
         }
     };
 
+    struct ArenaBlock {
+        std::shared_ptr<VulkanDeviceContext> device_ctx;
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize total_size = 0;
+        VkDeviceSize used_bytes = 0;
+        VkBufferUsageFlags usage = 0;
+        VkMemoryPropertyFlags properties = 0;
+        std::map<VkDeviceSize, VkDeviceSize> free_by_offset;
+        std::set<std::pair<VkDeviceSize, VkDeviceSize>> free_by_size;
+
+        ArenaBlock() = default;
+        ~ArenaBlock();
+        ArenaBlock(const ArenaBlock&) = delete;
+        ArenaBlock& operator=(const ArenaBlock&) = delete;
+
+        bool allocate_slice(VkDeviceSize aligned_size, VkDeviceSize& out_offset);
+        void free_slice(VkDeviceSize slice_offset, VkDeviceSize slice_size);
+    };
+
+    struct StagingRing {
+        VkBuffer buffer = VK_NULL_HANDLE;
+        VkDeviceMemory memory = VK_NULL_HANDLE;
+        VkDeviceSize capacity = 0;
+        VkDeviceSize head = 0;
+        void* mapped = nullptr;
+        std::shared_ptr<VulkanDeviceContext> device_ctx;
+
+        StagingRing() = default;
+        ~StagingRing();
+        StagingRing(const StagingRing&) = delete;
+        StagingRing& operator=(const StagingRing&) = delete;
+    };
+
     struct DevicePool {
         std::map<PoolKey, std::vector<std::unique_ptr<VulkanBuffer>>> free_lists;
         VkDeviceSize free_bytes = 0;
+        std::vector<std::unique_ptr<ArenaBlock>> arenas;
+        std::unique_ptr<StagingRing> staging_ring;
+        std::mutex staging_mutex;
+        size_t driver_alloc_count = 0;
     };
 
     mutable std::mutex pool_mutex;
-    std::unordered_map<uint32_t, DevicePool> pools;
+    std::unordered_map<uint32_t, std::unique_ptr<DevicePool>> pools;
     std::atomic<size_t> live_allocations{0};
+    std::atomic<uint64_t> next_alloc_id{1};
     bool shutting_down = false;
 
     VulkanMemoryManager() = default;
     ~VulkanMemoryManager() = default;
 
+    DevicePool& get_or_create_pool_locked(uint32_t device_id);
+    StagingRing& ensure_staging_ring(uint32_t device_id, DevicePool& pool);
+    std::unique_ptr<ArenaBlock> create_arena_block(std::shared_ptr<VulkanDeviceContext> ctx,
+                                                   VkDeviceSize requested_bytes,
+                                                   VkBufferUsageFlags usage,
+                                                   VkMemoryPropertyFlags properties);
     void recycle(VulkanBuffer* buffer);
     static VkDeviceSize bucket_size(VkDeviceSize size_bytes);
 };

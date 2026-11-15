@@ -16,6 +16,10 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
     // Subgroup data is a *property* struct and must be chained to
     // vkGetPhysicalDeviceProperties2; chaining it to the features query leaves
     // it silently zero-initialised.
+    bool supported_shader_int64 = false;
+    bool supported_shader_int16 = false;
+    bool supported_uniform_storage_16bit = false;
+    bool supported_shader_int8 = false;
     {
         VkPhysicalDeviceSubgroupProperties subgroup{};
         subgroup.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_PROPERTIES;
@@ -48,6 +52,11 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
             (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_BASIC_BIT) != 0;
         capabilities.subgroup_arithmetic =
             (subgroup.supportedOperations & VK_SUBGROUP_FEATURE_ARITHMETIC_BIT) != 0;
+
+        supported_shader_int64 = features2.features.shaderInt64 == VK_TRUE;
+        supported_shader_int16 = features2.features.shaderInt16 == VK_TRUE;
+        supported_uniform_storage_16bit = storage_16bit.uniformAndStorageBuffer16BitAccess == VK_TRUE;
+        supported_shader_int8 = float16.shaderInt8 == VK_TRUE;
     }
 
     // Find compute queue family
@@ -98,6 +107,20 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
     coop_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_COOPERATIVE_MATRIX_FEATURES_KHR;
     coop_features.cooperativeMatrix = VK_TRUE;
 
+    VkPhysicalDeviceShaderFloat16Int8Features enabled_float16{};
+    enabled_float16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
+    enabled_float16.shaderFloat16 = capabilities.float16_arithmetic ? VK_TRUE : VK_FALSE;
+    enabled_float16.shaderInt8 = supported_shader_int8 ? VK_TRUE : VK_FALSE;
+    if (has_cooperative_matrix) {
+        enabled_float16.pNext = &coop_features;
+    }
+
+    VkPhysicalDevice16BitStorageFeatures enabled_16bit{};
+    enabled_16bit.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_16BIT_STORAGE_FEATURES;
+    enabled_16bit.storageBuffer16BitAccess = capabilities.storage_16bit ? VK_TRUE : VK_FALSE;
+    enabled_16bit.uniformAndStorageBuffer16BitAccess = supported_uniform_storage_16bit ? VK_TRUE : VK_FALSE;
+    enabled_16bit.pNext = &enabled_float16;
+
     float queue_priority = 1.0f;
     VkDeviceQueueCreateInfo queue_create_info{};
     queue_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_QUEUE_CREATE_INFO;
@@ -107,12 +130,12 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
 
     VkPhysicalDeviceFeatures device_features{};
     device_features.shaderFloat64 = VK_FALSE;
+    device_features.shaderInt64 = supported_shader_int64 ? VK_TRUE : VK_FALSE;
+    device_features.shaderInt16 = supported_shader_int16 ? VK_TRUE : VK_FALSE;
 
     VkDeviceCreateInfo device_create_info{};
     device_create_info.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
-    if (has_cooperative_matrix) {
-        device_create_info.pNext = &coop_features;
-    }
+    device_create_info.pNext = &enabled_16bit;
     device_create_info.queueCreateInfoCount = 1;
     device_create_info.pQueueCreateInfos = &queue_create_info;
     device_create_info.pEnabledFeatures = &device_features;
