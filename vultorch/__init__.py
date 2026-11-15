@@ -121,6 +121,17 @@ def rand(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.boo
     t._native.random_philox_(0, 0.0, 1.0, seed, offset, None)
     return t
 
+def randint(low: _builtins.int, high: Optional[_builtins.int] = None, size: Union[_builtins.int, Sequence[_builtins.int]] = (), device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    if high is None:
+        high = low
+        low = 0
+    if isinstance(size, _builtins.int):
+        size = (size,)
+    dt = parse_dtype(dtype) if dtype is not None else int64
+    np_dt = dt.numpy_dtype if dt.numpy_dtype is not None else np.int64
+    arr = np.random.randint(low, high, size=size, dtype=np_dt)
+    return tensor(arr, device=device, requires_grad=requires_grad, dtype=dt)
+
 def arange(start, end=None, step=1, device: Union[str, Device] = "vk", dtype=None) -> Tensor:
     dt = parse_dtype(dtype) if dtype is not None else float32
     np_dt = dt.numpy_dtype if dt.numpy_dtype is not None else np.float32
