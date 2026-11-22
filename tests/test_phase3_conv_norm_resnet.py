@@ -219,3 +219,223 @@ def test_resnet18_multi_gpu_dataparallel():
     assert all(s > 0 for s in dp.last_split_sizes)
     assert losses[1] < losses[0]
 
+
+@pytest.mark.parametrize("dev", DEVICES)
+def test_snake_scalar_and_module_gradcheck(dev):
+    x_np = _rand_np((2, 4, 16), seed=101)
+    x = torch.tensor(x_np, device=dev, requires_grad=True)
+
+    # 1. Scalar functional Snake: x + (1/a) * sin^2(a * x)
+    a = 2.0
+    y = x.snake(a=a)
+    expected = x_np + (1.0 / a) * (np.sin(a * x_np) ** 2)
+    np.testing.assert_allclose(y.numpy(), expected, rtol=1e-4, atol=1e-4)
+
+    w = torch.tensor(_rand_np((2, 4, 16), seed=102), device=dev)
+    assert torch.gradcheck(
+        lambda t: (t.snake(a=2.0) * w).sum(),
+        x, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
+    )
+
+    # 2. Per-channel trainable nn.Snake (linear and log-scale)
+    for log_scale in (False, True):
+        snake = nn.Snake(4, a=1.5, trainable=True, alpha_logscale=log_scale, device=dev)
+        x_in = torch.tensor(x_np, device=dev, requires_grad=True)
+        out = snake(x_in)
+        loss = (out * w).sum()
+        loss.backward()
+
+        assert x_in.grad is not None and np.isfinite(x_in.grad.numpy()).all()
+        assert snake.alpha.grad is not None and np.isfinite(snake.alpha.grad.numpy()).all()
+
+        # Verify alpha gradient via finite difference
+        eps_fd = 1e-3
+        alpha_orig = snake.alpha.numpy().copy()
+        analytic_da = snake.alpha.grad.numpy().copy()
+        num_da = np.zeros_like(alpha_orig)
+        for c in range(4):
+            ap = alpha_orig.copy()
+            am = alpha_orig.copy()
+            ap[c] += eps_fd
+            am[c] -= eps_fd
+            with torch.no_grad():
+                snake.alpha.copy_(torch.tensor(ap, device=dev))
+                lp = (snake(x_in) * w).sum().item()
+                snake.alpha.copy_(torch.tensor(am, device=dev))
+                lm = (snake(x_in) * w).sum().item()
+                snake.alpha.copy_(torch.tensor(alpha_orig, device=dev))
+            num_da[c] = (lp - lm) / (2.0 * eps_fd)
+        np.testing.assert_allclose(analytic_da, num_da, rtol=2e-2, atol=5e-3)
+
+
+@pytest.mark.parametrize("dev", DEVICES)
+def test_snake_beta_and_signal_processing_conv1d_net(dev):
+    x_np = _rand_np((3, 4, 24), seed=202)
+    w_np = _rand_np((3, 4, 24), seed=203)
+    x = torch.tensor(x_np, device=dev, requires_grad=True)
+    w = torch.tensor(w_np, device=dev)
+
+    sb = nn.SnakeBeta(4, a=1.2, trainable=True, alpha_logscale=True, device=dev)
+    y = sb(x)
+    (y * w).sum().backward()
+
+    assert x.grad is not None and np.isfinite(x.grad.numpy()).all()
+    assert sb.alpha.grad is not None and np.isfinite(sb.alpha.grad.numpy()).all()
+    assert sb.beta.grad is not None and np.isfinite(sb.beta.grad.numpy()).all()
+
+    # Finite difference check on both alpha and beta
+    eps_fd = 1e-3
+    for param, analytic in [(sb.alpha, sb.alpha.grad.numpy().copy()),
+                            (sb.beta, sb.beta.grad.numpy().copy())]:
+        p_orig = param.numpy().copy()
+        num_dp = np.zeros_like(p_orig)
+        for c in range(4):
+            pp = p_orig.copy()
+            pm = p_orig.copy()
+            pp[c] += eps_fd
+            pm[c] -= eps_fd
+            with torch.no_grad():
+                param.copy_(torch.tensor(pp, device=dev))
+                lp = (sb(x) * w).sum().item()
+                param.copy_(torch.tensor(pm, device=dev))
+                lm = (sb(x) * w).sum().item()
+                param.copy_(torch.tensor(p_orig, device=dev))
+            num_dp[c] = (lp - lm) / (2.0 * eps_fd)
+        np.testing.assert_allclose(analytic, num_dp, rtol=2e-2, atol=5e-3)
+
+    # Train a miniature non-linear harmonic synthesizer (Conv1d + SnakeBeta)
+    net = nn.Sequential(
+        nn.Conv1d(1, 8, kernel_size=5, padding=2, device=dev),
+        nn.SnakeBeta(8, a=1.0, alpha_logscale=True, device=dev),
+        nn.Conv1d(8, 1, kernel_size=5, padding=2, device=dev),
+    )
+    opt = optim.AdamW(net.parameters(), lr=1e-2)
+    t = np.linspace(0, 2 * np.pi, 64, dtype=np.float32).reshape(1, 1, 64)
+    sig_in = torch.tensor(np.sin(t), device=dev)
+    sig_target = torch.tensor(np.sin(t) + 0.5 * np.sin(3 * t), device=dev)
+
+    loss0 = None
+    loss_last = None
+    for step in range(8):
+        opt.zero_grad()
+        pred = net(sig_in)
+        loss = ((pred - sig_target) ** 2).mean()
+        loss.backward()
+        opt.step()
+        val = loss.item()
+        if step == 0:
+            loss0 = val
+        loss_last = val
+    assert loss_last < loss0
+
+
+@pytest.mark.parametrize("dev", DEVICES)
+def test_snake_gamma_cos_rational_sinc_gradcheck(dev):
+    x_np = _rand_np((2, 3, 12), seed=301)
+    w_np = _rand_np((2, 3, 12), seed=302)
+    x = torch.tensor(x_np, device=dev, requires_grad=True)
+    w = torch.tensor(w_np, device=dev)
+
+    # 1. Functional scalar variants gradcheck w.r.t. x
+    for fn in [
+        lambda t: (t.snake_gamma(a=1.7, gamma=0.4) * w).sum(),
+        lambda t: (t.snake_cos(a=1.5) * w).sum(),
+        lambda t: (t.snake_rational(a=1.8) * w).sum(),
+        lambda t: (t.snake_sinc(a=2.0) * w).sum(),
+    ]:
+        assert torch.gradcheck(fn, x, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev)
+
+    # 2. Module variants: verify parameter gradients (alpha, beta, and gamma) via finite difference
+    modules = [
+        nn.SnakeGamma(3, a=1.4, gamma=0.35, alpha_logscale=True, device=dev),
+        nn.SnakeCos(3, a=1.3, alpha_logscale=False, device=dev),
+        nn.SnakeRational(3, a=1.5, alpha_logscale=True, device=dev),
+        nn.SnakeSinc(3, a=1.6, alpha_logscale=False, device=dev),
+    ]
+    eps_fd = 1e-3
+    for mod in modules:
+        x_in = torch.tensor(x_np, device=dev, requires_grad=True)
+        out = mod(x_in)
+        (out * w).sum().backward()
+        assert x_in.grad is not None and np.isfinite(x_in.grad.numpy()).all()
+
+        for _, param in mod.named_parameters():
+            assert param.grad is not None and np.isfinite(param.grad.numpy()).all()
+            analytic = param.grad.numpy().copy()
+            p_orig = param.numpy().copy()
+            num_dp = np.zeros_like(p_orig)
+            for c in range(len(p_orig)):
+                pp = p_orig.copy()
+                pm = p_orig.copy()
+                pp[c] += eps_fd
+                pm[c] -= eps_fd
+                with torch.no_grad():
+                    param.copy_(torch.tensor(pp, device=dev))
+                    lp = (mod(x_in) * w).sum().item()
+                    param.copy_(torch.tensor(pm, device=dev))
+                    lm = (mod(x_in) * w).sum().item()
+                    param.copy_(torch.tensor(p_orig, device=dev))
+                num_dp[c] = (lp - lm) / (2.0 * eps_fd)
+            np.testing.assert_allclose(analytic, num_dp, rtol=2e-2, atol=5e-3)
+
+
+@pytest.mark.parametrize("dev", DEVICES)
+def test_mamba_selective_scan_and_block(dev):
+    B_sz, D_sz, L_sz, N_sz = 2, 3, 6, 4
+    u_np = _rand_np((B_sz, D_sz, L_sz), seed=401)
+    dt_np = np.abs(_rand_np((B_sz, D_sz, L_sz), seed=402)) + 0.1
+    A_np = -np.abs(_rand_np((D_sz, N_sz), seed=403)) - 0.1
+    B_np = _rand_np((B_sz, N_sz, L_sz), seed=404)
+    C_np = _rand_np((B_sz, N_sz, L_sz), seed=405)
+    D_np = _rand_np((D_sz,), seed=406)
+    w_np = _rand_np((B_sz, D_sz, L_sz), seed=407)
+
+    u = torch.tensor(u_np, device=dev, requires_grad=True)
+    dt = torch.tensor(dt_np, device=dev, requires_grad=True)
+    A = torch.tensor(A_np, device=dev, requires_grad=True)
+    B_t = torch.tensor(B_np, device=dev, requires_grad=True)
+    C_t = torch.tensor(C_np, device=dev, requires_grad=True)
+    D_t = torch.tensor(D_np, device=dev, requires_grad=True)
+    w = torch.tensor(w_np, device=dev)
+
+    y = torch.selective_scan(u, dt, A, B_t, C_t, D_t)
+    assert y.shape == (B_sz, D_sz, L_sz)
+    (y * w).sum().backward()
+
+    for t_param in (u, dt, A, B_t, C_t, D_t):
+        assert t_param.grad is not None and np.isfinite(t_param.grad.numpy()).all()
+
+    # Gradcheck on u, dt, B, C
+    assert torch.gradcheck(
+        lambda u_in: (torch.selective_scan(u_in, dt, A, B_t, C_t, D_t) * w).sum(),
+        u, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
+    )
+    assert torch.gradcheck(
+        lambda dt_in: (torch.selective_scan(u, dt_in, A, B_t, C_t, D_t) * w).sum(),
+        dt, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
+    )
+
+    # Full Mamba block (both standard SiLU and SnakeBeta front-end)
+    for use_snake in (False, True):
+        mamba = nn.Mamba(d_model=8, d_state=4, d_conv=3, expand=2, use_snake=use_snake, device=dev)
+        opt = optim.AdamW(mamba.parameters(), lr=1e-2)
+        seq_in = torch.tensor(_rand_np((2, 10, 8), seed=410), device=dev)
+        seq_target = torch.tensor(_rand_np((2, 10, 8), seed=411), device=dev)
+
+        loss_first = None
+        loss_final = None
+        for step in range(5):
+            opt.zero_grad()
+            out = mamba(seq_in)
+            assert out.shape == (2, 10, 8)
+            loss = ((out - seq_target) ** 2).mean()
+            loss.backward()
+            opt.step()
+            val = loss.item()
+            if step == 0:
+                loss_first = val
+            loss_final = val
+        assert loss_final < loss_first
+
+
+

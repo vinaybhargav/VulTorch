@@ -143,6 +143,11 @@ set(SLANG_KERNELS
     groupnorm:groupnorm_forward
     groupnorm:groupnorm_backward_dx
     groupnorm:groupnorm_backward_gamma_beta
+    snake:snake_forward
+    snake:snake_backward_dx
+    snake:snake_backward_params
+    ssm_scan:ssm_scan_forward
+    ssm_scan:ssm_scan_backward
 )
 
 set(SPV_OUTPUTS)

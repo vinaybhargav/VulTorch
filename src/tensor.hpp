@@ -224,6 +224,41 @@ public:
                        std::shared_ptr<NativeTensor> gamma = nullptr,
                        bool need_dx = true, bool need_dgamma = true, bool need_dbeta = true);
 
+    std::shared_ptr<NativeTensor> snake(
+        std::shared_ptr<NativeTensor> alpha = nullptr,
+        std::shared_ptr<NativeTensor> beta = nullptr,
+        int64_t channel_dim = 1, bool log_scale = false,
+        float scalar_a = 1.0f, float eps = 1e-9f,
+        uint32_t mode = 0, std::shared_ptr<NativeTensor> gamma = nullptr,
+        float scalar_gamma = 0.0f);
+    std::tuple<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>,
+               std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    snake_backward(std::shared_ptr<NativeTensor> grad_out,
+                   std::shared_ptr<NativeTensor> alpha = nullptr,
+                   std::shared_ptr<NativeTensor> beta = nullptr,
+                   int64_t channel_dim = 1, bool log_scale = false,
+                   float scalar_a = 1.0f, float eps = 1e-9f,
+                   bool need_dx = true, bool need_dalpha = false, bool need_dbeta = false,
+                   uint32_t mode = 0, std::shared_ptr<NativeTensor> gamma = nullptr,
+                   float scalar_gamma = 0.0f, bool need_dgamma = false);
+
+    std::shared_ptr<NativeTensor> selective_scan(
+        std::shared_ptr<NativeTensor> delta,
+        std::shared_ptr<NativeTensor> A,
+        std::shared_ptr<NativeTensor> B_mat,
+        std::shared_ptr<NativeTensor> C_mat,
+        std::shared_ptr<NativeTensor> D_vec = nullptr);
+    std::tuple<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>,
+               std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>,
+               std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    selective_scan_backward(
+        std::shared_ptr<NativeTensor> grad_out,
+        std::shared_ptr<NativeTensor> delta,
+        std::shared_ptr<NativeTensor> A,
+        std::shared_ptr<NativeTensor> B_mat,
+        std::shared_ptr<NativeTensor> C_mat,
+        std::shared_ptr<NativeTensor> D_vec = nullptr);
+
     std::shared_ptr<NativeTensor> layernorm(std::shared_ptr<NativeTensor> gamma = nullptr,
                                             std::shared_ptr<NativeTensor> beta = nullptr,
                                             float eps = 1e-5f, uint32_t norm_dims = 1);

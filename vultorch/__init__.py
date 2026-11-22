@@ -317,6 +317,25 @@ def topk(x: Tensor, k: _builtins.int, dim: _builtins.int = -1,
          largest: _builtins.bool = True, sorted: _builtins.bool = True):
     return x.topk(k, dim=dim, largest=largest, sorted=sorted)
 
+def snake(x: Tensor, a: _builtins.float = 1.0, eps: _builtins.float = 1e-9) -> Tensor:
+    return x.snake(a=a, eps=eps)
+
+def snake_gamma(x: Tensor, a: _builtins.float = 1.0, gamma: _builtins.float = 0.0, eps: _builtins.float = 1e-9) -> Tensor:
+    return x.snake_gamma(a=a, gamma=gamma, eps=eps)
+
+def snake_cos(x: Tensor, a: _builtins.float = 1.0, eps: _builtins.float = 1e-9) -> Tensor:
+    return x.snake_cos(a=a, eps=eps)
+
+def snake_rational(x: Tensor, a: _builtins.float = 1.0, eps: _builtins.float = 1e-9) -> Tensor:
+    return x.snake_rational(a=a, eps=eps)
+
+def snake_sinc(x: Tensor, a: _builtins.float = 1.0, eps: _builtins.float = 1e-9) -> Tensor:
+    return x.snake_sinc(a=a, eps=eps)
+
+def selective_scan(u: Tensor, delta: Tensor, A: Tensor, B: Tensor, C: Tensor, D: Optional[Tensor] = None) -> Tensor:
+    from .nn import functional as _F
+    return _F.selective_scan(u, delta, A, B, C, D)
+
 def cat(tensors: List[Tensor], dim: _builtins.int = 0, device: Optional[Union[str, Device]] = None) -> Tensor:
     if not tensors:
         raise ValueError("cat expects a non-empty list of tensors")

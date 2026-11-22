@@ -850,6 +850,292 @@ class SiLU(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.silu()
 
+
+class _SnakeBase(Module):
+    """
+    Unified base class for the Snake family of periodic non-linear activations:
+      - mode 0 (Snake / SnakeBeta):   x + (1 / b) * sin^2(a * x)
+      - mode 1 (SnakeGamma):          x + (1 / b) * sin^2(a * x + gamma)
+      - mode 2 (SnakeCos):            x + (1 / b) * cos^2(a * x)
+      - mode 3 (SnakeRational):       x + (1 / b) * sin^2(a * x) / (1 + (a * x)^2)
+      - mode 4 (SnakeSinc):           x + (1 / b) * (sin(a * x) / (a * x))^2
+    """
+    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
+                 alpha_logscale: bool = False, channel_dim: int = 1,
+                 eps: float = 1e-9, mode: int = 0, has_beta: bool = False,
+                 has_gamma: bool = False, init_gamma: float = 0.0, device="vk"):
+        super().__init__()
+        self.in_features = in_features
+        self.alpha_logscale = alpha_logscale
+        self.channel_dim = channel_dim
+        self.eps = eps
+        self.mode = int(mode)
+        self.has_beta = bool(has_beta)
+        self.has_gamma = bool(has_gamma)
+
+        init_val = math.log(a) if alpha_logscale else float(a)
+        alpha_t = vultorch.full((in_features,), init_val, device=device)
+        if trainable:
+            self.alpha = Parameter(alpha_t, requires_grad=True)
+        else:
+            self.register_buffer("alpha", alpha_t)
+
+        if self.has_beta:
+            beta_t = vultorch.full((in_features,), init_val, device=device)
+            if trainable:
+                self.beta = Parameter(beta_t, requires_grad=True)
+            else:
+                self.register_buffer("beta", beta_t)
+        else:
+            self.beta = None
+
+        if self.has_gamma:
+            gamma_t = vultorch.full((in_features,), float(init_gamma), device=device)
+            if trainable:
+                self.gamma = Parameter(gamma_t, requires_grad=True)
+            else:
+                self.register_buffer("gamma", gamma_t)
+        else:
+            self.gamma = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        cd = self.channel_dim if x.ndim > 1 else 0
+        b_nat = self.beta._native if self.beta is not None else None
+        g_nat = self.gamma._native if self.gamma is not None else None
+        y_nat = x._native.snake(
+            self.alpha._native, b_nat, cd, self.alpha_logscale, 1.0, self.eps,
+            self.mode, g_nat, 0.0
+        )
+        req_grad = (
+            x.requires_grad
+            or self.alpha.requires_grad
+            or (self.beta is not None and self.beta.requires_grad)
+            or (self.gamma is not None and self.gamma.requires_grad)
+        ) and is_grad_enabled()
+        out = Tensor(y_nat, device=x.device, requires_grad=req_grad)
+        if not req_grad:
+            return out
+
+        out.is_leaf = False
+        alpha_ref = self.alpha
+        beta_ref = self.beta
+        gamma_ref = self.gamma
+        log_sc = self.alpha_logscale
+        eps_val = self.eps
+        mode_val = self.mode
+        dev = x.device
+
+        inputs = [x]
+        if isinstance(alpha_ref, Parameter):
+            inputs.append(alpha_ref)
+        if isinstance(beta_ref, Parameter):
+            inputs.append(beta_ref)
+        if isinstance(gamma_ref, Parameter):
+            inputs.append(gamma_ref)
+
+        def snake_family_backward(g: Tensor):
+            need_dx = x.requires_grad
+            need_da = isinstance(alpha_ref, Parameter) and alpha_ref.requires_grad
+            need_db = isinstance(beta_ref, Parameter) and beta_ref.requires_grad
+            need_dg = isinstance(gamma_ref, Parameter) and gamma_ref.requires_grad
+            dx_nat, da_nat, db_nat, dg_nat = x._native.snake_backward(
+                g.contiguous()._native, alpha_ref._native, b_nat,
+                cd, log_sc, 1.0, eps_val, need_dx, need_da, need_db,
+                mode_val, g_nat, 0.0, need_dg
+            )
+            grads = [Tensor(dx_nat, device=dev) if dx_nat is not None else None]
+            if isinstance(alpha_ref, Parameter):
+                grads.append(Tensor(da_nat, device=dev) if da_nat is not None else None)
+            if isinstance(beta_ref, Parameter):
+                grads.append(Tensor(db_nat, device=dev) if db_nat is not None else None)
+            if isinstance(gamma_ref, Parameter):
+                grads.append(Tensor(dg_nat, device=dev) if dg_nat is not None else None)
+            return grads[0] if len(grads) == 1 else tuple(grads)
+
+        out.grad_fn = Node("SnakeFamilyBackward", snake_family_backward, inputs)
+        return out
+
+
+class Snake(_SnakeBase):
+    """
+    Snake periodic non-linear activation (Ziyin et al. 2020):
+        Snake_a(x) = x + (1 / a) * sin^2(a * x)
+    """
+    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
+                 alpha_logscale: bool = False, channel_dim: int = 1,
+                 eps: float = 1e-9, device="vk"):
+        super().__init__(
+            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim, eps=eps, mode=0, has_beta=False, has_gamma=False,
+            device=device
+        )
+
+
+class SnakeBeta(_SnakeBase):
+    """
+    SnakeBeta periodic activation (BigVGAN / Descript Audio Codec) with decoupled
+    frequency `alpha` and inverse-magnitude `beta`:
+        SnakeBeta_{a, b}(x) = x + (1 / b) * sin^2(a * x)
+    """
+    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
+                 alpha_logscale: bool = False, channel_dim: int = 1,
+                 eps: float = 1e-9, device="vk"):
+        super().__init__(
+            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim, eps=eps, mode=0, has_beta=True, has_gamma=False,
+            device=device
+        )
+
+
+class SnakeGamma(_SnakeBase):
+    """
+    SnakeGamma phase-shifted periodic activation with trainable frequency `alpha`,
+    inverse-magnitude `beta`, and phase shift `gamma`:
+        SnakeGamma_{a, b, gamma}(x) = x + (1 / b) * sin^2(a * x + gamma)
+    """
+    def __init__(self, in_features: int, a: float = 1.0, gamma: float = 0.0,
+                 trainable: bool = True, alpha_logscale: bool = False,
+                 channel_dim: int = 1, eps: float = 1e-9, device="vk"):
+        super().__init__(
+            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim, eps=eps, mode=1, has_beta=True, has_gamma=True,
+            init_gamma=gamma, device=device
+        )
+
+
+class SnakeCos(_SnakeBase):
+    """
+    SnakeCos cosine-squared periodic activation:
+        SnakeCos_{a, b}(x) = x + (1 / b) * cos^2(a * x)
+    """
+    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
+                 alpha_logscale: bool = False, has_beta: bool = True,
+                 channel_dim: int = 1, eps: float = 1e-9, device="vk"):
+        super().__init__(
+            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim, eps=eps, mode=2, has_beta=has_beta, has_gamma=False,
+            device=device
+        )
+
+
+class SnakeRational(_SnakeBase):
+    """
+    SnakeRational damped periodic activation:
+        SnakeRational_{a, b}(x) = x + (1 / b) * sin^2(a * x) / (1 + (a * x)^2)
+    """
+    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
+                 alpha_logscale: bool = False, has_beta: bool = True,
+                 channel_dim: int = 1, eps: float = 1e-9, device="vk"):
+        super().__init__(
+            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim, eps=eps, mode=3, has_beta=has_beta, has_gamma=False,
+            device=device
+        )
+
+
+class SnakeSinc(_SnakeBase):
+    """
+    SnakeSinc wavepacket periodic activation:
+        SnakeSinc_{a, b}(x) = x + (1 / b) * (sin(a * x) / (a * x))^2
+    """
+    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
+                 alpha_logscale: bool = False, has_beta: bool = True,
+                 channel_dim: int = 1, eps: float = 1e-9, device="vk"):
+        super().__init__(
+            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim, eps=eps, mode=4, has_beta=has_beta, has_gamma=False,
+            device=device
+        )
+
+
+class Mamba(Module):
+    """
+    Mamba Selective State Space Model (S6) block (Gu & Dao 2023):
+      - Input projection `in_proj`: d_model -> 2 * d_inner (splits into x and gate z)
+      - Causal depthwise 1D convolution `conv1d` (groups = d_inner) + SiLU
+      - Selective state-space projection `x_proj`: d_inner -> (dt_rank + 2 * d_state)
+      - Time-step projection `dt_proj`: dt_rank -> d_inner + softplus
+      - Fused Slang selective scan (`ssm_scan_forward` / `ssm_scan_backward`)
+      - Gated output `(y * SiLU(z))` + `out_proj`: d_inner -> d_model
+    """
+    def __init__(
+        self,
+        d_model: int,
+        d_state: int = 16,
+        d_conv: int = 4,
+        expand: int = 2,
+        dt_rank: Optional[int] = None,
+        bias: bool = False,
+        conv_bias: bool = True,
+        use_snake: bool = False,
+        device="vk",
+    ):
+        super().__init__()
+        if d_state > 32:
+            raise ValueError("Mamba d_state up to 32 is supported by the register scan kernel")
+        self.d_model = d_model
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.d_inner = int(expand * d_model)
+        self.dt_rank = dt_rank if dt_rank is not None else max(1, math.ceil(d_model / 16))
+
+        self.in_proj = Linear(d_model, self.d_inner * 2, bias=bias, device=device)
+        self.conv1d = Conv1d(
+            self.d_inner,
+            self.d_inner,
+            kernel_size=d_conv,
+            padding=d_conv - 1,
+            groups=self.d_inner,
+            bias=conv_bias,
+            device=device,
+        )
+        self.act = SnakeBeta(self.d_inner, alpha_logscale=True, device=device) if use_snake else SiLU()
+        self.x_proj = Linear(self.d_inner, self.dt_rank + 2 * d_state, bias=False, device=device)
+        self.dt_proj = Linear(self.dt_rank, self.d_inner, bias=True, device=device)
+
+        # Initialize A_log = log(1..d_state) repeated across d_inner
+        a_init = np.tile(np.arange(1, d_state + 1, dtype=np.float32), (self.d_inner, 1))
+        self.A_log = Parameter(vultorch.tensor(np.log(a_init), device=device), requires_grad=True)
+        self.D = Parameter(vultorch.ones((self.d_inner,), device=device), requires_grad=True)
+        self.out_proj = Linear(self.d_inner, d_model, bias=bias, device=device)
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        """
+        Args:
+            hidden_states: [B, L, d_model]
+        Returns:
+            out: [B, L, d_model]
+        """
+        B_sz, L_sz, _ = hidden_states.shape
+        xz = self.in_proj(hidden_states)  # [B, L, 2 * d_inner]
+        x, z = xz.chunk(2, dim=-1)        # each [B, L, d_inner]
+
+        # Depthwise causal Conv1d on [B, d_inner, L]
+        x_conv = self.conv1d(x.transpose(1, 2))
+        if self.d_conv > 1:
+            x_conv = x_conv.narrow(2, 0, L_sz)
+        x_act = self.act(x_conv)          # [B, d_inner, L]
+
+        # Selective state space parameters from x_act^T: [B, L, d_inner]
+        x_Flat = x_act.transpose(1, 2)    # [B, L, d_inner]
+        x_dbl = self.x_proj(x_Flat)       # [B, L, dt_rank + 2 * d_state]
+        dt_raw, B_sel, C_sel = x_dbl.split(
+            [self.dt_rank, self.d_state, self.d_state], dim=-1
+        )
+        # Project delta: [B, L, dt_rank] -> [B, L, d_inner] -> [B, d_inner, L]
+        delta = functional.softplus(self.dt_proj(dt_raw).transpose(1, 2))
+        A = -(self.A_log.exp())           # [d_inner, d_state]
+        B_mat = B_sel.transpose(1, 2)     # [B, d_state, L]
+        C_mat = C_sel.transpose(1, 2)     # [B, d_state, L]
+
+        y = functional.selective_scan(x_act, delta, A, B_mat, C_mat, self.D)  # [B, d_inner, L]
+        y_gated = y.transpose(1, 2) * z.silu()                                # [B, L, d_inner]
+        return self.out_proj(y_gated)
+
+
+MambaBlock = Mamba
+
 class Sigmoid(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.sigmoid()

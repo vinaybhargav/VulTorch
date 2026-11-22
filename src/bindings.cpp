@@ -301,6 +301,29 @@ PYBIND11_MODULE(_vultorch_backend, m) {
              py::arg("gamma") = nullptr,
              py::arg("need_dx") = true, py::arg("need_dgamma") = true, py::arg("need_dbeta") = true,
              py::call_guard<py::gil_scoped_release>())
+        .def("snake", &NativeTensor::snake,
+             py::arg("alpha") = nullptr, py::arg("beta") = nullptr,
+             py::arg("channel_dim") = 1, py::arg("log_scale") = false,
+             py::arg("scalar_a") = 1.0f, py::arg("eps") = 1e-9f,
+             py::arg("mode") = 0, py::arg("gamma") = nullptr,
+             py::arg("scalar_gamma") = 0.0f,
+             py::call_guard<py::gil_scoped_release>())
+        .def("snake_backward", &NativeTensor::snake_backward,
+             py::arg("grad_out"), py::arg("alpha") = nullptr, py::arg("beta") = nullptr,
+             py::arg("channel_dim") = 1, py::arg("log_scale") = false,
+             py::arg("scalar_a") = 1.0f, py::arg("eps") = 1e-9f,
+             py::arg("need_dx") = true, py::arg("need_dalpha") = false, py::arg("need_dbeta") = false,
+             py::arg("mode") = 0, py::arg("gamma") = nullptr,
+             py::arg("scalar_gamma") = 0.0f, py::arg("need_dgamma") = false,
+             py::call_guard<py::gil_scoped_release>())
+        .def("selective_scan", &NativeTensor::selective_scan,
+             py::arg("delta"), py::arg("A"), py::arg("B_mat"), py::arg("C_mat"),
+             py::arg("D_vec") = nullptr,
+             py::call_guard<py::gil_scoped_release>())
+        .def("selective_scan_backward", &NativeTensor::selective_scan_backward,
+             py::arg("grad_out"), py::arg("delta"), py::arg("A"),
+             py::arg("B_mat"), py::arg("C_mat"), py::arg("D_vec") = nullptr,
+             py::call_guard<py::gil_scoped_release>())
         .def("layernorm", &NativeTensor::layernorm, py::arg("gamma") = nullptr, py::arg("beta") = nullptr,
              py::arg("eps") = 1e-5f, py::arg("norm_dims") = 1,
              py::call_guard<py::gil_scoped_release>())

@@ -237,11 +237,21 @@ Training or running inference on modern Transformers (GPT-2, LLaMA, ViT, Whisper
 - **Python API:**
   - Expose `vultorch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)` and `nn.MultiheadAttention(embed_dim, num_heads, ...)`.
 
-### 4.2 Fused Transformer Building Blocks (`RoPE`, `SwiGLU`, GEMM Epilogues)
+### 4.2 Fused Transformer, State-Space (`Mamba`), & Periodic Signal-Processing Building Blocks (`RoPE`, `SwiGLU`, `Snake` Family, `Mamba`, GEMM Epilogues)
 - **Rotary Position Embeddings (`shaders/rope.slang`):**
   - Fused `rope_forward` and `rope_backward` applying complex rotation `(cos, sin)` tables to `Q` and `K` in-place or out-of-place in a single pass.
 - **Fused Gated Linear Units (`shaders/glu.slang`):**
   - `swiglu_forward` ($\text{SiLU}(a) \odot b$) and `swiglu_backward`, `geglu_forward` and `geglu_backward`.
+- **Complete Periodic Signal-Processing Activation Family (`shaders/snake.slang` — Implemented):**
+  - Fused `snake_forward`, `snake_backward_dx`, and workgroup channel-reduced `snake_backward_params` supporting linear and `alpha_logscale=True` ($a = e^{\alpha}, b = e^{\beta}$) parameterizations across all 5 periodic activations:
+    1. **`Snake`** ($\text{Snake}_a(x) = x + \frac{1}{a}\sin^2(ax)$ — Ziyin et al. 2020)
+    2. **`SnakeBeta`** ($\text{SnakeBeta}_{a,b}(x) = x + \frac{1}{b}\sin^2(ax)$ — BigVGAN / Descript Audio Codec)
+    3. **`SnakeGamma`** ($\text{SnakeGamma}_{a,b,\gamma}(x) = x + \frac{1}{b}\sin^2(ax + \gamma)$ — phase-shifted periodic activation with trainable per-channel phase $\gamma$)
+    4. **`SnakeCos`** ($\text{SnakeCos}_{a,b}(x) = x + \frac{1}{b}\cos^2(ax)$ — complementary cosine-squared activation)
+    5. **`SnakeRational`** ($\text{SnakeRational}_{a,b}(x) = x + \frac{\sin^2(ax)}{b(1 + (ax)^2)}$ — rational damped periodic activation)
+    6. **`SnakeSinc`** ($\text{SnakeSinc}_{a,b}(x) = x + \frac{1}{b}\operatorname{sinc}^2(ax)$ — unnormalized wavepacket periodic activation with analytic Taylor continuation at $ax \to 0$)
+- **Mamba Selective State Space Model (S6) Parallel Scan (`shaders/ssm_scan.slang` — Implemented):**
+  - Fused `ssm_scan_forward` and reverse-time adjoint `ssm_scan_backward` computing the discretized Selective State Space recurrence $h_t = \exp(\Delta_t A) h_{t-1} + \Delta_t B_t u_t$, $y_t = C_t^\top h_t + D u_t$, exposed as `vultorch.selective_scan`, `F.selective_scan`, and `nn.Mamba` / `nn.MambaBlock` (supporting both standard `SiLU` and `use_snake=True` `SnakeBeta` convolutional front-ends).
 - **Slang GEMM `IEpilogue` Specializations (`shaders/gemm.slang`):**
   - Implement `struct ReLUEpilogue : IEpilogue`, `struct GELUEpilogue : IEpilogue`, and `struct SiLUEpilogue : IEpilogue` in `shaders/gemm.slang` so `Linear + Bias + Activation` executes in a single GEMM dispatch during inference.
 

@@ -1692,6 +1692,43 @@ class Tensor:
             vals.grad_fn = Node("TopkBackward", topk_backward, [self])
         return TopkResult(vals, inds)
 
+    def _snake_mode(self, mode: int, a: float = 1.0, gamma: float = 0.0, eps: float = 1e-9) -> 'Tensor':
+        native_out = self._native.snake(
+            None, None, 1, False, float(a), float(eps), int(mode), None, float(gamma)
+        )
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            a_val = float(a)
+            g_val = float(gamma)
+            eps_val = float(eps)
+            mode_val = int(mode)
+            dev = self.device
+            def snake_scalar_backward(g: 'Tensor'):
+                dx_nat, _, _, _ = self._native.snake_backward(
+                    g.contiguous()._native, None, None, 1, False, a_val, eps_val,
+                    True, False, False, mode_val, None, g_val, False
+                )
+                return Tensor._from_native(dx_nat, dev, False)
+            out.grad_fn = Node("SnakeBackward", snake_scalar_backward, [self])
+        return out
+
+    def snake(self, a: float = 1.0, eps: float = 1e-9) -> 'Tensor':
+        return self._snake_mode(0, a=a, eps=eps)
+
+    def snake_gamma(self, a: float = 1.0, gamma: float = 0.0, eps: float = 1e-9) -> 'Tensor':
+        return self._snake_mode(1, a=a, gamma=gamma, eps=eps)
+
+    def snake_cos(self, a: float = 1.0, eps: float = 1e-9) -> 'Tensor':
+        return self._snake_mode(2, a=a, eps=eps)
+
+    def snake_rational(self, a: float = 1.0, eps: float = 1e-9) -> 'Tensor':
+        return self._snake_mode(3, a=a, eps=eps)
+
+    def snake_sinc(self, a: float = 1.0, eps: float = 1e-9) -> 'Tensor':
+        return self._snake_mode(4, a=a, eps=eps)
+
     def __setitem__(self, idx, val):
         arr = self.numpy()
         arr[idx] = val.numpy() if isinstance(val, Tensor) else val
