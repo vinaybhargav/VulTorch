@@ -236,11 +236,86 @@ def where(condition: Tensor, x, y) -> Tensor:
     dev = condition.device
     xt = x if isinstance(x, Tensor) else Tensor(x, device=dev)
     yt = y if isinstance(y, Tensor) else Tensor(y, device=dev, dtype=xt.dtype)
-    cond_f = condition.float()
-    res = (cond_f * xt) + ((1.0 - cond_f) * yt)
-    if xt.dtype != res.dtype and xt.dtype == yt.dtype:
-        res = res.to(xt.dtype)
-    return res
+    if xt.device != dev:
+        xt = xt.to(dev)
+    if yt.device != dev:
+        yt = yt.to(dev)
+    native_out = _backend.NativeTensor.where_op(condition._native, xt._native, yt._native)
+    req_grad = (xt.requires_grad or yt.requires_grad) and is_grad_enabled()
+    out = Tensor._from_native(native_out, dev, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        cond_ref = condition.detach()
+        def where_backward(g: Tensor):
+            z = zeros_like(g)
+            gx = where(cond_ref, g, z) if xt.requires_grad else None
+            gy = where(cond_ref, z, g) if yt.requires_grad else None
+            return gx, gy
+        from .autograd import Node
+        out.grad_fn = Node("WhereBackward", where_backward, [xt, yt])
+    return out
+
+def gather(x: Tensor, dim: _builtins.int, index: Tensor) -> Tensor:
+    return x.gather(dim, index)
+
+def index_select(x: Tensor, dim: _builtins.int, index: Tensor) -> Tensor:
+    return x.index_select(dim, index)
+
+def split(x: Tensor, split_size_or_sections, dim: _builtins.int = 0):
+    return x.split(split_size_or_sections, dim=dim)
+
+def chunk(x: Tensor, chunks: _builtins.int, dim: _builtins.int = 0):
+    return x.chunk(chunks, dim=dim)
+
+def tril(x: Tensor, diagonal: _builtins.int = 0) -> Tensor:
+    return x.tril(diagonal=diagonal)
+
+def triu(x: Tensor, diagonal: _builtins.int = 0) -> Tensor:
+    return x.triu(diagonal=diagonal)
+
+def flip(x: Tensor, dims) -> Tensor:
+    return x.flip(dims)
+
+def roll(x: Tensor, shifts, dims=None) -> Tensor:
+    return x.roll(shifts, dims=dims)
+
+def repeat_interleave(x: Tensor, repeats: _builtins.int, dim: Optional[_builtins.int] = None) -> Tensor:
+    return x.repeat_interleave(repeats, dim=dim)
+
+def argmax(x: Tensor, dim: Optional[_builtins.int] = None, keepdim: _builtins.bool = False) -> Tensor:
+    return x.argmax(dim=dim, keepdim=keepdim)
+
+def argmin(x: Tensor, dim: Optional[_builtins.int] = None, keepdim: _builtins.bool = False) -> Tensor:
+    return x.argmin(dim=dim, keepdim=keepdim)
+
+def prod(x: Tensor, dim: Optional[_builtins.int] = None, keepdim: _builtins.bool = False) -> Tensor:
+    return x.prod(dim=dim, keepdim=keepdim)
+
+def var(x: Tensor, dim: Optional[Union[_builtins.int, Tuple[_builtins.int, ...]]] = None,
+        unbiased: _builtins.bool = True, keepdim: _builtins.bool = False) -> Tensor:
+    return x.var(dim=dim, unbiased=unbiased, keepdim=keepdim)
+
+def std(x: Tensor, dim: Optional[Union[_builtins.int, Tuple[_builtins.int, ...]]] = None,
+        unbiased: _builtins.bool = True, keepdim: _builtins.bool = False) -> Tensor:
+    return x.std(dim=dim, unbiased=unbiased, keepdim=keepdim)
+
+def norm(x: Tensor, p: _builtins.float = 2.0,
+         dim: Optional[Union[_builtins.int, Tuple[_builtins.int, ...]]] = None,
+         keepdim: _builtins.bool = False) -> Tensor:
+    return x.norm(p=p, dim=dim, keepdim=keepdim)
+
+def cumsum(x: Tensor, dim: _builtins.int) -> Tensor:
+    return x.cumsum(dim)
+
+def cumprod(x: Tensor, dim: _builtins.int) -> Tensor:
+    return x.cumprod(dim)
+
+def sort(x: Tensor, dim: _builtins.int = -1, descending: _builtins.bool = False):
+    return x.sort(dim=dim, descending=descending)
+
+def topk(x: Tensor, k: _builtins.int, dim: _builtins.int = -1,
+         largest: _builtins.bool = True, sorted: _builtins.bool = True):
+    return x.topk(k, dim=dim, largest=largest, sorted=sorted)
 
 def cat(tensors: List[Tensor], dim: _builtins.int = 0, device: Optional[Union[str, Device]] = None) -> Tensor:
     if not tensors:
@@ -249,30 +324,20 @@ def cat(tensors: List[Tensor], dim: _builtins.int = 0, device: Optional[Union[st
     ndim = tensors[0].ndim
     norm_dim = dim if dim >= 0 else dim + ndim
     req_grad = any(t.requires_grad for t in tensors) and is_grad_enabled()
-    first_dt = tensors[0].dtype
-    same_dt = all(t.dtype == first_dt for t in tensors)
 
-    if norm_dim == 0 and ndim >= 1 and same_dt and all(t._native.is_dense_zero_offset() for t in tensors):
-        target_dev_id = -1 if dev.type == "cpu" else dev.index
-        native_out = _backend.NativeTensor.cat_dim0([t._native for t in tensors], target_dev_id)
-        out = Tensor(native_out, device=dev, requires_grad=req_grad)
-    else:
-        target_dt = first_dt if same_dt else float32
-        arrs = [t.numpy() for t in tensors]
-        res = np.concatenate(arrs, axis=dim)
-        out = Tensor(res, device=dev, requires_grad=req_grad, dtype=target_dt)
+    target_dev_id = -1 if dev.type == "cpu" else dev.index
+    native_out = _backend.NativeTensor.cat([t._native for t in tensors], norm_dim, target_dev_id)
+    out = Tensor._from_native(native_out, dev, req_grad)
 
     if req_grad:
         out.is_leaf = False
-        split_sizes = [t.shape[dim] for t in tensors]
+        split_sizes = [t.shape[norm_dim] for t in tensors]
         src_devices = [t.device for t in tensors]
         def cat_backward(grad_out: Tensor):
             grads = []
             curr = 0
             for sz, sdev in zip(split_sizes, src_devices):
-                idx = [slice(None)] * grad_out.ndim
-                idx[dim] = slice(curr, curr + sz)
-                g_chunk = grad_out[tuple(idx)]
+                g_chunk = grad_out.narrow(norm_dim, curr, sz)
                 if g_chunk.device != sdev:
                     g_chunk = g_chunk.to(sdev)
                 grads.append(g_chunk)

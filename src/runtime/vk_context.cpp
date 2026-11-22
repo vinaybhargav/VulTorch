@@ -9,6 +9,12 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
     : device_id(id), physical_device(pdev) {
     vkGetPhysicalDeviceProperties(physical_device, &properties);
     vkGetPhysicalDeviceMemoryProperties(physical_device, &memory_properties);
+    total_vram_bytes = 0;
+    for (uint32_t i = 0; i < memory_properties.memoryHeapCount; ++i) {
+        if (memory_properties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+            total_vram_bytes += memory_properties.memoryHeaps[i].size;
+        }
+    }
 
     // Capabilities consulted by kernel selection: a variant is only considered
     // when the device reports it can run it.
@@ -288,11 +294,14 @@ void VulkanDeviceContext::add_compute_barrier(VkCommandBuffer cmd) {
 }
 
 void VulkanDeviceContext::record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize size_bytes,
-                                      VkDeviceSize src_offset, VkDeviceSize dst_offset) {
+                                      VkDeviceSize src_offset, VkDeviceSize dst_offset,
+                                      std::shared_ptr<VulkanBuffer> src_keep,
+                                      std::shared_ptr<VulkanBuffer> dst_keep) {
     std::lock_guard<std::mutex> lock(submit_mutex);
 
     open_batch_locked();
-    VkCommandBuffer cmd = slots[static_cast<size_t>(open_slot)].cmd;
+    Slot& slot = slots[static_cast<size_t>(open_slot)];
+    VkCommandBuffer cmd = slot.cmd;
 
     VkBufferCopy copy_region{};
     copy_region.srcOffset = src_offset;
@@ -302,10 +311,13 @@ void VulkanDeviceContext::record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize s
 
     add_compute_barrier(cmd);
 
+    if (src_keep) slot.pending_buffers.push_back(std::move(src_keep));
+    if (dst_keep) slot.pending_buffers.push_back(std::move(dst_keep));
+
     ++ops_in_batch;
     dispatches_recorded.fetch_add(1, std::memory_order_relaxed);
 
-    if (ops_in_batch >= kMaxOpsPerBatch) {
+    if (ops_in_batch >= effective_max_ops_per_batch()) {
         flush_locked();
     }
 }
@@ -313,11 +325,20 @@ void VulkanDeviceContext::record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize s
 void VulkanDeviceContext::open_batch_locked() {
     if (open_slot >= 0) return;
 
+    // Reclaim any finished slots first so temporary buffers return to the arena promptly.
+    for (auto& s : slots) {
+        if (s.in_use && vkGetFenceStatus(device, s.fence) == VK_SUCCESS) {
+            s.in_use = false;
+            s.pending_buffers.clear();
+        }
+    }
+
     Slot& slot = slots[next_slot];
     if (slot.in_use) {
         // Reusing a slot: wait for its previous submission to drain.
         vkWaitForFences(device, 1, &slot.fence, VK_TRUE, UINT64_MAX);
         slot.in_use = false;
+        slot.pending_buffers.clear();
     }
 
     // The fence is unsignalled at this point, so resetting is safe.
@@ -358,7 +379,8 @@ void VulkanDeviceContext::flush_locked() {
 
     res = vkQueueSubmit(compute_queue, 1, &submit_info, slot.fence);
     if (res != VK_SUCCESS) {
-        throw std::runtime_error("vkQueueSubmit failed on device " + std::to_string(device_id));
+        throw std::runtime_error("vkQueueSubmit failed on device " + std::to_string(device_id) +
+                                 " (VkResult=" + std::to_string(static_cast<int>(res)) + ")");
     }
 
     slot.in_use = true;
@@ -366,6 +388,32 @@ void VulkanDeviceContext::flush_locked() {
     open_slot = -1;
     ops_in_batch = 0;
     batches_submitted.fetch_add(1, std::memory_order_relaxed);
+
+    // If in-flight slots hold large temporary working sets (> 48 MiB of standalone/arena
+    // slices across slots), drain the just-submitted batch so 2 GB GPUs neither OOM
+    // nor trip the 5s kernel watchdog across back-to-back multi-second submissions.
+    VkDeviceSize in_flight_bytes = 0;
+    for (const auto& s : slots) {
+        if (s.in_use) {
+            for (const auto& b : s.pending_buffers) {
+                if (b) in_flight_bytes += b->size;
+            }
+        }
+    }
+    if (in_flight_bytes > max_in_flight_temp_bytes()) {
+        vkWaitForFences(device, 1, &slot.fence, VK_TRUE, UINT64_MAX);
+        for (auto& s : slots) {
+            s.in_use = false;
+            s.pending_buffers.clear();
+        }
+        last_submitted_slot = -1;
+        for (const auto& descriptor : pending_descriptors) {
+            if (descriptor.set != VK_NULL_HANDLE) {
+                vkFreeDescriptorSets(device, descriptor.pool, 1, &descriptor.set);
+            }
+        }
+        pending_descriptors.clear();
+    }
 }
 
 void VulkanDeviceContext::synchronize_locked() {
@@ -377,6 +425,7 @@ void VulkanDeviceContext::synchronize_locked() {
         // FIFO on a single queue: every earlier submission has completed too.
         for (auto& s : slots) {
             s.in_use = false;
+            s.pending_buffers.clear();
         }
         last_submitted_slot = -1;
     }
@@ -456,6 +505,7 @@ void VulkanDeviceContext::submit_transfer(const std::function<void(VkCommandBuff
     // This wait also covers the batch flushed above, so reclamation is safe.
     for (auto& s : slots) {
         s.in_use = false;
+        s.pending_buffers.clear();
     }
     last_submitted_slot = -1;
 

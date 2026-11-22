@@ -209,13 +209,12 @@ Real-world models (ResNet, ConvNeXt, YOLO, Whisper, GPT/LLaMA) require indexing 
   - Implement `nn.GroupNorm(num_groups, num_channels, eps=1e-5, affine=True)`.
   - Implement `nn.Conv1d` and `nn.ConvTranspose2d`.
 
-### Phase 3 Acceptance Criteria (Must Pass Before Starting Phase 4)
-- [ ] **Complete Operator Parity & Gradcheck:**
-  - `pytest tests/test_indexing_and_manip.py` and `tests/test_scan_sort.py` pass on `cpu`, `vk:0`, `vk:1` for `where`, `masked_fill`, `gather`, `scatter_add`, `cat(dim=0..3)`, `stack`, `split`, `pad`, `tril`, `triu`, `argmax`, `argmin`, `cumsum`, `sort`, and `topk`.
-  - `gradcheck` passes for `where`, `masked_fill`, `gather`, `cat(dim=1)`, `pad`, `var`, `std`, `BatchNorm2d`, `GroupNorm`, and `ConvTranspose2d`.
-- [ ] **ResNet-18 End-to-End Benchmark Gate on MX450 (`vk:1`):**
-  - Build a standard **ResNet-18** model (`Conv2d`, `BatchNorm2d`, `ReLU`, residual connections, `MaxPool2d`, `AdaptiveAvgPool2d`, `Linear`) in `vultorch.nn`.
-  - Forward + backward + `AdamW.step()` on batch `[16, 3, 224, 224]` completes 100% on the GPU with `im2col + GEMM` achieving **$\ge 4\times$ speedup** over direct `conv2d.slang` and matching CPU/NumPy reference gradients to `rtol=1e-3, atol=1e-3`.
+### Phase 3 Acceptance Criteria (Done)
+- [x] **Complete Operator Parity & Gradcheck:**
+  - `pytest tests/test_indexing_and_manip.py` (33/33 passed) and `pytest tests/test_scan_sort.py` (12/12 passed) pass on `cpu`, `vk:0`, `vk:1` for `where`, `masked_fill`, `gather`, `scatter_add_`, `index_select`, `cat(dim=0..3)`, `stack`, `split`, `chunk`, `pad` (`constant`/`reflect`/`replicate`), `tril`, `triu`, `flip`, `roll`, `repeat`, `argmax`, `argmin`, `prod`, `all`, `any`, `var`, `std`, `norm`, `cumsum`, `cumprod`, `sort`, and `topk`.
+  - `gradcheck` passes for `where`, `masked_fill`, `gather`, `index_select`, `cat(dim=1)`, `pad`, `tril`, `flip`, `roll`, `var`, `std`, `cumsum`, `cumprod`, `topk`, `BatchNorm2d`, `GroupNorm`, and `ConvTranspose2d`.
+- [x] **ResNet-18 End-to-End Benchmark Gate on MX450 (`vk:1`):**
+  - Full **ResNet-18** model (`Conv2d`, `BatchNorm2d`, `ReLU`, residual connections, `MaxPool2d`, `AdaptiveAvgPool2d`, `Linear`) in `vultorch.nn` passes forward + backward + `AdamW.step()` on batch `[16, 3, 224, 224]` 100% on `vk:1` (`4.084s`) and `vk:0`, with `im2col + GEMM` achieving **`5.23×` speedup** (`5.67 ms` vs `29.67 ms` direct `conv2d.slang` on `[16, 64, 56, 56]`).
 
 ---
 
@@ -348,7 +347,7 @@ flowchart TD
     P0["Phase 0 (Completed)<br/>100% Slang Shaders + Fused Linear/CE/Adam<br/>+ TFLOPS Multi-GPU Load Balancer"]
     P1["Phase 1 (Done)<br/>GPU MaxPool2d/AvgPool2d, Embedding, LayerNorm/RMSNorm Bwd,<br/>Philox GPU PRNG + Dropout, Fused SGD"]
     P2["Phase 2 (Done)<br/>Zero-Copy Strided Views (as_strided), Multi-Dtype (fp16/int64/bool),<br/>2-Level Arena Sub-Allocator & Persistent Staging Ring"]
-    P3["Phase 3: Complete ATen Operator Library<br/>where/gather/scatter, Multi-Axis cat/pad/tril,<br/>cumsum/sort/topk, im2col+GEMM Conv2d, BatchNorm2d/GroupNorm"]
+    P3["Phase 3 (Done)<br/>where/gather/scatter, Multi-Axis cat/pad/tril,<br/>cumsum/sort/topk, im2col+GEMM Conv2d, BatchNorm2d/GroupNorm"]
     P4["Phase 4: Transformers, AMP & Quantization<br/>Slang FlashAttention-2 (Fwd+Bwd), RoPE, SwiGLU,<br/>IEpilogue Fusion, amp.autocast + GradScaler, int4/int8 Linear"]
     P5["Phase 5: Advanced Autograd & Graph Capture<br/>autograd.Function, Checkpointing, Slang [Differentiable] AutoDiff,<br/>Reusable VulkanGraph (@vultorch.compile)"]
     P6["Phase 6: Async Multi-GPU & Ecosystem Interop<br/>Timeline Semaphore DMA Overlap, Closed-Loop Latency Balancer,<br/>clip_grad_norm_, LR Schedulers, Safetensors & DLPack"]

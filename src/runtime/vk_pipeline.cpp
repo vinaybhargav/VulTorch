@@ -265,7 +265,7 @@ void VulkanPipelineManager::dispatch(
 
     vkCmdDispatch(cmd, group_count_x, group_count_y, group_count_z);
     return DescriptorAllocation{rec.desc_pool, desc_set};
-  });
+  }, buffers);
 }
 
 } // namespace vultorch

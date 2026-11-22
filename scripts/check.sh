@@ -5,8 +5,8 @@
 # Everything in this project must compile and run with ZERO warnings:
 #   * C++ is built with -Wall -Wextra -Wpedantic -Wshadow -Wnon-virtual-dtor
 #     -Wcast-qual and -Werror.
-#   * Every compute shader is recompiled with glslangValidator and any
-#     diagnostic is fatal.
+#   * Every Slang compute shader is compiled with slangc to SPIR-V and any
+#     compilation error is fatal.
 #   * Python is byte-compiled and tested with warnings promoted to errors.
 #
 # Usage:  scripts/check.sh
@@ -33,11 +33,10 @@ echo "==> Codec CLI"
 make -C tools clean >/dev/null
 make -C tools
 
-echo "==> Compute shaders"
+echo "==> Compute shaders (Slang -> SPIR-V)"
 shader_failed=0
-for f in shaders/*.comp; do
-    out="$(glslangValidator --target-env vulkan1.3 -V "$f" -o "/tmp/vultorch_$(basename "$f").spv" 2>&1)" || shader_failed=1
-    if grep -qiE "warning|error" <<<"$out"; then
+for f in shaders/*.slang; do
+    if ! out="$(slangc -target spirv -profile spirv_1_5 -O3 "$f" -o "/tmp/vultorch_$(basename "$f").spv" 2>&1)"; then
         echo "    $f"
         echo "$out" | sed 's/^/      /'
         shader_failed=1

@@ -105,6 +105,50 @@ public:
     std::shared_ptr<NativeTensor> slice_dim0(int64_t start, int64_t end) const;
     static std::shared_ptr<NativeTensor> cat_dim0(
         const std::vector<std::shared_ptr<NativeTensor>>& tensors, int target_device_id);
+    static std::shared_ptr<NativeTensor> cat(
+        const std::vector<std::shared_ptr<NativeTensor>>& tensors, int64_t dim, int target_device_id);
+
+    // Phase 3.1: Indexing & Conditional
+    static std::shared_ptr<NativeTensor> where_op(
+        const std::shared_ptr<NativeTensor>& cond,
+        const std::shared_ptr<NativeTensor>& a,
+        const std::shared_ptr<NativeTensor>& b);
+    std::shared_ptr<NativeTensor> masked_fill(
+        const std::shared_ptr<NativeTensor>& mask, float value) const;
+    std::shared_ptr<NativeTensor> gather(
+        int64_t dim, const std::shared_ptr<NativeTensor>& index) const;
+    std::shared_ptr<NativeTensor> scatter(
+        int64_t dim, const std::shared_ptr<NativeTensor>& index,
+        const std::shared_ptr<NativeTensor>& src,
+        float scalar_val = 0.0f, bool use_scalar = false, bool accumulate = false) const;
+    std::shared_ptr<NativeTensor> index_select(
+        int64_t dim, const std::shared_ptr<NativeTensor>& index) const;
+    void index_add_(
+        int64_t dim, const std::shared_ptr<NativeTensor>& index,
+        const std::shared_ptr<NativeTensor>& src, float alpha = 1.0f);
+
+    // Phase 3.2: Manipulation (Pad, Tril/Triu, Flip, Roll)
+    std::shared_ptr<NativeTensor> pad_nd(
+        const std::vector<int64_t>& pad_before,
+        const std::vector<int64_t>& pad_after,
+        uint32_t mode = 0, float pad_value = 0.0f) const;
+    std::shared_ptr<NativeTensor> pad_nd_backward(
+        const std::vector<int64_t>& in_shape,
+        const std::vector<int64_t>& pad_before,
+        uint32_t mode = 0) const;
+    std::shared_ptr<NativeTensor> tril_triu(bool is_upper, int64_t diagonal = 0) const;
+    std::shared_ptr<NativeTensor> flip(const std::vector<int64_t>& dims) const;
+    std::shared_ptr<NativeTensor> roll(const std::vector<int64_t>& shifts,
+                                       const std::vector<int64_t>& dims) const;
+
+    // Phase 3.3: Extended Reductions, Prefix Scans, Sort / Top-K
+    std::shared_ptr<NativeTensor> argmax_argmin(int64_t dim = -999999, bool keepdim = false,
+                                                bool is_min = false) const;
+    std::shared_ptr<NativeTensor> reduce_prod_all_any(int64_t dim = -999999, bool keepdim = false,
+                                                      uint32_t mode = 0) const;
+    std::shared_ptr<NativeTensor> scan_op(int64_t dim, uint32_t mode) const;
+    std::pair<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    sort_topk(int64_t dim, int64_t k = -1, bool descending = true) const;
 
     void fill_(float val);
     void zero_();
@@ -141,15 +185,44 @@ public:
     std::shared_ptr<NativeTensor> conv2d(std::shared_ptr<NativeTensor> weight,
                                          std::shared_ptr<NativeTensor> bias = nullptr,
                                          uint32_t stride_h = 1, uint32_t stride_w = 1,
-                                         uint32_t pad_h = 0, uint32_t pad_w = 0);
+                                         uint32_t pad_h = 0, uint32_t pad_w = 0,
+                                         uint32_t groups = 1, bool use_im2col = true);
     std::shared_ptr<NativeTensor> conv2d_backward_input(std::shared_ptr<NativeTensor> weight,
                                                         const std::vector<int64_t>& in_shape,
                                                         uint32_t stride_h = 1, uint32_t stride_w = 1,
-                                                        uint32_t pad_h = 0, uint32_t pad_w = 0);
+                                                        uint32_t pad_h = 0, uint32_t pad_w = 0,
+                                                        uint32_t groups = 1, bool use_im2col = true);
     std::shared_ptr<NativeTensor> conv2d_backward_weight(std::shared_ptr<NativeTensor> input,
                                                          const std::vector<int64_t>& weight_shape,
                                                          uint32_t stride_h = 1, uint32_t stride_w = 1,
-                                                         uint32_t pad_h = 0, uint32_t pad_w = 0);
+                                                         uint32_t pad_h = 0, uint32_t pad_w = 0,
+                                                         uint32_t groups = 1, bool use_im2col = true);
+
+    std::tuple<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    batchnorm(std::shared_ptr<NativeTensor> running_mean,
+              std::shared_ptr<NativeTensor> running_var,
+              std::shared_ptr<NativeTensor> gamma = nullptr,
+              std::shared_ptr<NativeTensor> beta = nullptr,
+              bool training = true, float momentum = 0.1f, float eps = 1e-5f);
+    std::tuple<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    batchnorm_backward(std::shared_ptr<NativeTensor> grad_out,
+                       std::shared_ptr<NativeTensor> save_mean,
+                       std::shared_ptr<NativeTensor> save_invstd,
+                       std::shared_ptr<NativeTensor> gamma = nullptr,
+                       float eps = 1e-5f,
+                       bool need_dx = true, bool need_dgamma = true, bool need_dbeta = true);
+
+    std::pair<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    groupnorm(uint32_t num_groups,
+              std::shared_ptr<NativeTensor> gamma = nullptr,
+              std::shared_ptr<NativeTensor> beta = nullptr,
+              float eps = 1e-5f);
+    std::tuple<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+    groupnorm_backward(std::shared_ptr<NativeTensor> grad_out,
+                       std::shared_ptr<NativeTensor> mean_invstd,
+                       uint32_t num_groups,
+                       std::shared_ptr<NativeTensor> gamma = nullptr,
+                       bool need_dx = true, bool need_dgamma = true, bool need_dbeta = true);
 
     std::shared_ptr<NativeTensor> layernorm(std::shared_ptr<NativeTensor> gamma = nullptr,
                                             std::shared_ptr<NativeTensor> beta = nullptr,

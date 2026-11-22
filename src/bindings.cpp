@@ -272,12 +272,34 @@ PYBIND11_MODULE(_vultorch_backend, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("conv2d", &NativeTensor::conv2d, py::arg("weight"), py::arg("bias") = nullptr,
              py::arg("stride_h") = 1, py::arg("stride_w") = 1, py::arg("pad_h") = 0, py::arg("pad_w") = 0,
+             py::arg("groups") = 1, py::arg("use_im2col") = true,
              py::call_guard<py::gil_scoped_release>())
         .def("conv2d_backward_input", &NativeTensor::conv2d_backward_input, py::arg("weight"),
              py::arg("in_shape"), py::arg("stride_h") = 1, py::arg("stride_w") = 1, py::arg("pad_h") = 0, py::arg("pad_w") = 0,
+             py::arg("groups") = 1, py::arg("use_im2col") = true,
              py::call_guard<py::gil_scoped_release>())
         .def("conv2d_backward_weight", &NativeTensor::conv2d_backward_weight, py::arg("input"),
              py::arg("weight_shape"), py::arg("stride_h") = 1, py::arg("stride_w") = 1, py::arg("pad_h") = 0, py::arg("pad_w") = 0,
+             py::arg("groups") = 1, py::arg("use_im2col") = true,
+             py::call_guard<py::gil_scoped_release>())
+        .def("batchnorm", &NativeTensor::batchnorm,
+             py::arg("running_mean"), py::arg("running_var"),
+             py::arg("gamma") = nullptr, py::arg("beta") = nullptr,
+             py::arg("training") = true, py::arg("momentum") = 0.1f, py::arg("eps") = 1e-5f,
+             py::call_guard<py::gil_scoped_release>())
+        .def("batchnorm_backward", &NativeTensor::batchnorm_backward,
+             py::arg("grad_out"), py::arg("save_mean"), py::arg("save_invstd"),
+             py::arg("gamma") = nullptr, py::arg("eps") = 1e-5f,
+             py::arg("need_dx") = true, py::arg("need_dgamma") = true, py::arg("need_dbeta") = true,
+             py::call_guard<py::gil_scoped_release>())
+        .def("groupnorm", &NativeTensor::groupnorm,
+             py::arg("num_groups"), py::arg("gamma") = nullptr, py::arg("beta") = nullptr,
+             py::arg("eps") = 1e-5f,
+             py::call_guard<py::gil_scoped_release>())
+        .def("groupnorm_backward", &NativeTensor::groupnorm_backward,
+             py::arg("grad_out"), py::arg("mean_invstd"), py::arg("num_groups"),
+             py::arg("gamma") = nullptr,
+             py::arg("need_dx") = true, py::arg("need_dgamma") = true, py::arg("need_dbeta") = true,
              py::call_guard<py::gil_scoped_release>())
         .def("layernorm", &NativeTensor::layernorm, py::arg("gamma") = nullptr, py::arg("beta") = nullptr,
              py::arg("eps") = 1e-5f, py::arg("norm_dims") = 1,
@@ -317,6 +339,47 @@ PYBIND11_MODULE(_vultorch_backend, m) {
              py::call_guard<py::gil_scoped_release>())
         .def("embedding_backward", &NativeTensor::embedding_backward,
              py::arg("indices"), py::arg("num_embeddings"), py::arg("padding_idx") = -1,
+             py::call_guard<py::gil_scoped_release>())
+        .def_static("cat", &NativeTensor::cat, py::arg("tensors"), py::arg("dim") = 0,
+                    py::arg("target_device_id") = 0,
+                    py::call_guard<py::gil_scoped_release>())
+        .def_static("where_op", &NativeTensor::where_op, py::arg("cond"), py::arg("a"), py::arg("b"),
+                    py::call_guard<py::gil_scoped_release>())
+        .def("masked_fill", &NativeTensor::masked_fill, py::arg("mask"), py::arg("value"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("gather", &NativeTensor::gather, py::arg("dim"), py::arg("index"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("scatter", &NativeTensor::scatter, py::arg("dim"), py::arg("index"),
+             py::arg("src") = nullptr, py::arg("scalar_val") = 0.0f,
+             py::arg("use_scalar") = false, py::arg("accumulate") = false,
+             py::call_guard<py::gil_scoped_release>())
+        .def("index_select", &NativeTensor::index_select, py::arg("dim"), py::arg("index"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("index_add_", &NativeTensor::index_add_, py::arg("dim"), py::arg("index"),
+             py::arg("src"), py::arg("alpha") = 1.0f,
+             py::call_guard<py::gil_scoped_release>())
+        .def("pad_nd", &NativeTensor::pad_nd, py::arg("pad_before"), py::arg("pad_after"),
+             py::arg("mode") = 0, py::arg("pad_value") = 0.0f,
+             py::call_guard<py::gil_scoped_release>())
+        .def("pad_nd_backward", &NativeTensor::pad_nd_backward, py::arg("in_shape"),
+             py::arg("pad_before"), py::arg("mode") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("tril_triu", &NativeTensor::tril_triu, py::arg("is_upper"), py::arg("diagonal") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("flip", &NativeTensor::flip, py::arg("dims"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("roll", &NativeTensor::roll, py::arg("shifts"), py::arg("dims"),
+             py::call_guard<py::gil_scoped_release>())
+        .def("argmax_argmin", &NativeTensor::argmax_argmin, py::arg("dim") = -999999,
+             py::arg("keepdim") = false, py::arg("is_min") = false,
+             py::call_guard<py::gil_scoped_release>())
+        .def("reduce_prod_all_any", &NativeTensor::reduce_prod_all_any, py::arg("dim") = -999999,
+             py::arg("keepdim") = false, py::arg("mode") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("scan_op", &NativeTensor::scan_op, py::arg("dim"), py::arg("mode") = 0,
+             py::call_guard<py::gil_scoped_release>())
+        .def("sort_topk", &NativeTensor::sort_topk, py::arg("dim"), py::arg("k") = -1,
+             py::arg("descending") = true,
              py::call_guard<py::gil_scoped_release>())
         .def("to_numpy", [](std::shared_ptr<NativeTensor> self) -> py::array {
             std::vector<ssize_t> py_shape(self->shape.begin(), self->shape.end());

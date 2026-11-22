@@ -8,10 +8,7 @@ namespace vultorch {
 
 namespace {
 
-// Pool memory budget for large fallback allocations that bypass the arena.
-constexpr VkDeviceSize kPoolByteBudgetPerDevice = 512ULL * 1024ULL * 1024ULL;
 constexpr VkDeviceSize kStagingRingBytes = 16ULL * 1024ULL * 1024ULL;
-constexpr VkDeviceSize kDefaultArenaSlabLarge = 256ULL * 1024ULL * 1024ULL;
 constexpr VkDeviceSize kDefaultArenaSlabSmall = 64ULL * 1024ULL * 1024ULL;
 constexpr VkDeviceSize kArenaMinAlign = 256ULL;
 
@@ -31,17 +28,6 @@ bool has_memory_type(const VulkanDeviceContext &ctx, uint32_t type_filter,
 
 VkDeviceSize align_up(VkDeviceSize value, VkDeviceSize alignment) {
   return (value + alignment - 1ULL) & ~(alignment - 1ULL);
-}
-
-VkDeviceSize query_device_local_vram(const VulkanDeviceContext &ctx) {
-  VkDeviceSize total = 0;
-  for (uint32_t i = 0; i < ctx.memory_properties.memoryHeapCount; ++i) {
-    if (ctx.memory_properties.memoryHeaps[i].flags &
-        VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
-      total += ctx.memory_properties.memoryHeaps[i].size;
-    }
-  }
-  return total;
 }
 
 } // namespace
@@ -440,10 +426,7 @@ VulkanMemoryManager::allocate(uint32_t device_id, VkDeviceSize size_bytes,
       kArenaMinAlign, ctx->properties.limits.minStorageBufferOffsetAlignment);
   VkDeviceSize aligned_size = align_up(size_bytes, alignment);
 
-  const VkDeviceSize total_vram = query_device_local_vram(*ctx);
-  const VkDeviceSize preferred_slab =
-      (total_vram > 0 && total_vram <= (4ULL << 30)) ? kDefaultArenaSlabSmall
-                                                     : kDefaultArenaSlabLarge;
+  const VkDeviceSize preferred_slab = ctx->preferred_arena_slab_bytes();
 
   const bool arena_eligible =
       ((properties & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) != 0) &&
@@ -523,7 +506,18 @@ VulkanMemoryManager::allocate(uint32_t device_id, VkDeviceSize size_bytes,
       }
 
       if (!raw) {
-        raw = new VulkanBuffer(ctx, bucket, usage, properties);
+        try {
+          raw = new VulkanBuffer(ctx, bucket, usage, properties);
+        } catch (const std::runtime_error &) {
+          if (!shutting_down) {
+            auto pool_it = pools.find(device_id);
+            if (pool_it != pools.end()) {
+              pool_it->second->free_lists.clear();
+              pool_it->second->free_bytes = 0;
+            }
+          }
+          raw = new VulkanBuffer(ctx, bucket, usage, properties);
+        }
         raw->allocation_id =
             next_alloc_id.fetch_add(1, std::memory_order_relaxed);
         if (!shutting_down) {
@@ -564,7 +558,7 @@ void VulkanMemoryManager::recycle(VulkanBuffer *buffer) {
     return;
   }
 
-  if (pool.free_bytes + owned->size > kPoolByteBudgetPerDevice) {
+  if (pool.free_bytes + owned->size > owned->device_ctx->pool_byte_budget()) {
     return;
   }
   PoolKey key{owned->size, owned->usage, owned->memory_properties};
@@ -751,7 +745,7 @@ void VulkanMemoryManager::copy_buffer_to_buffer(
   auto ctx = VulkanManager::instance_ref().get_device(device_id);
   ctx->record_copy(src->buffer, dst->buffer, size_bytes,
                    src->arena_offset + src_offset,
-                   dst->arena_offset + dst_offset);
+                   dst->arena_offset + dst_offset, src, dst);
 }
 
 void VulkanMemoryManager::copy_cross_device(

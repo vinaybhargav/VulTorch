@@ -1360,6 +1360,338 @@ class Tensor:
             out.grad_fn = Node("GetItemBackward", getitem_backward, [self])
         return out
 
+    # ------------------------------------------------------------------------
+    # Phase 3.1 & 3.2: Indexing, Conditional, Pad, Tril/Triu, Flip, Roll, Repeat
+    # ------------------------------------------------------------------------
+
+    def where(self, condition: 'Tensor', other) -> 'Tensor':
+        import vultorch
+        return vultorch.where(condition, self, other)
+
+    def masked_fill(self, mask: 'Tensor', value: float) -> 'Tensor':
+        if self.device != mask.device:
+            mask = mask.to(self.device)
+        native_out = self._native.masked_fill(mask._native, float(value))
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            m_ref = mask.detach()
+            def masked_fill_backward(g: 'Tensor'):
+                return g.masked_fill(m_ref, 0.0)
+            out.grad_fn = Node("MaskedFillBackward", masked_fill_backward, [self])
+        return out
+
+    def masked_fill_(self, mask: 'Tensor', value: float) -> 'Tensor':
+        if self.device != mask.device:
+            mask = mask.to(self.device)
+        native_out = self._native.masked_fill(mask._native, float(value))
+        self._native.copy_from_native(native_out)
+        return self
+
+    def gather(self, dim: int, index: 'Tensor') -> 'Tensor':
+        if self.device != index.device:
+            index = index.to(self.device)
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        native_out = self._native.gather(norm_dim, index._native)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            src_shape = self.shape
+            src_dtype = self.dtype
+            dev = self.device
+            idx_ref = index.detach()
+            def gather_backward(g: 'Tensor'):
+                z = backend.NativeTensor(list(src_shape), g._native.device_id, g._native.dtype)
+                z.zero_()
+                grad_nat = z.scatter(norm_dim, idx_ref._native, g._native, 0.0, False, True)
+                return Tensor._from_native(grad_nat, dev, False)
+            out.grad_fn = Node("GatherBackward", gather_backward, [self])
+        return out
+
+    def scatter(self, dim: int, index: 'Tensor', src_or_val, reduce: Optional[str] = None) -> 'Tensor':
+        if self.device != index.device:
+            index = index.to(self.device)
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        acc = (reduce == "add")
+        if isinstance(src_or_val, Tensor):
+            src_t = src_or_val if src_or_val.device == self.device else src_or_val.to(self.device)
+            native_out = self._native.scatter(norm_dim, index._native, src_t._native, 0.0, False, acc)
+        else:
+            native_out = self._native.scatter(norm_dim, index._native, None, float(src_or_val), True, acc)
+        return Tensor._from_native(native_out, self.device, False)
+
+    def scatter_(self, dim: int, index: 'Tensor', src_or_val, reduce: Optional[str] = None) -> 'Tensor':
+        res = self.scatter(dim, index, src_or_val, reduce=reduce)
+        self._native.copy_from_native(res._native)
+        return self
+
+    def scatter_add(self, dim: int, index: 'Tensor', src: 'Tensor') -> 'Tensor':
+        return self.scatter(dim, index, src, reduce="add")
+
+    def scatter_add_(self, dim: int, index: 'Tensor', src: 'Tensor') -> 'Tensor':
+        return self.scatter_(dim, index, src, reduce="add")
+
+    def index_select(self, dim: int, index: 'Tensor') -> 'Tensor':
+        if self.device != index.device:
+            index = index.to(self.device)
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        native_out = self._native.index_select(norm_dim, index._native)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            src_shape = self.shape
+            dev = self.device
+            idx_ref = index.detach()
+            def index_select_backward(g: 'Tensor'):
+                z = backend.NativeTensor(list(src_shape), g._native.device_id, g._native.dtype)
+                z.zero_()
+                z.index_add_(norm_dim, idx_ref._native, g._native, 1.0)
+                return Tensor._from_native(z, dev, False)
+            out.grad_fn = Node("IndexSelectBackward", index_select_backward, [self])
+        return out
+
+    def index_add_(self, dim: int, index: 'Tensor', source: 'Tensor', alpha: float = 1.0) -> 'Tensor':
+        if self.device != index.device:
+            index = index.to(self.device)
+        if self.device != source.device:
+            source = source.to(self.device)
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        self._native.index_add_(norm_dim, index._native, source._native, float(alpha))
+        return self
+
+    def tril(self, diagonal: int = 0) -> 'Tensor':
+        native_out = self._native.tril_triu(False, int(diagonal))
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            diag = int(diagonal)
+            out.grad_fn = Node("TrilBackward", lambda g: g.tril(diag), [self])
+        return out
+
+    def triu(self, diagonal: int = 0) -> 'Tensor':
+        native_out = self._native.tril_triu(True, int(diagonal))
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            diag = int(diagonal)
+            out.grad_fn = Node("TriuBackward", lambda g: g.triu(diag), [self])
+        return out
+
+    def flip(self, dims: Union[int, Tuple[int, ...], List[int]]) -> 'Tensor':
+        dim_list = [int(dims)] if isinstance(dims, int) else [int(d) for d in dims]
+        native_out = self._native.flip(dim_list)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            out.grad_fn = Node("FlipBackward", lambda g: g.flip(dim_list), [self])
+        return out
+
+    def roll(self, shifts: Union[int, Tuple[int, ...], List[int]],
+             dims: Optional[Union[int, Tuple[int, ...], List[int]]] = None) -> 'Tensor':
+        if dims is None:
+            flat = self.reshape(-1)
+            sh = int(shifts) if isinstance(shifts, int) else int(shifts[0])
+            rolled = Tensor._from_native(flat._native.roll([sh], [0]), self.device, False)
+            out = rolled.reshape(self.shape)
+            if self.requires_grad and is_grad_enabled():
+                out.requires_grad = True
+                out.is_leaf = False
+                out.grad_fn = Node("RollBackward", lambda g: g.roll(-sh), [self])
+            return out
+        sh_list = [int(shifts)] if isinstance(shifts, int) else [int(s) for s in shifts]
+        d_list = [int(dims)] if isinstance(dims, int) else [int(d) for d in dims]
+        native_out = self._native.roll(sh_list, d_list)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            neg_sh = [-s for s in sh_list]
+            out.grad_fn = Node("RollBackward", lambda g: g.roll(neg_sh, d_list), [self])
+        return out
+
+    def split(self, split_size_or_sections: Union[int, List[int], Tuple[int, ...]], dim: int = 0) -> Tuple['Tensor', ...]:
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        dim_sz = self.shape[norm_dim]
+        if isinstance(split_size_or_sections, int):
+            step = split_size_or_sections
+            if step <= 0:
+                raise ValueError("split_size must be > 0")
+            sizes = [step] * (dim_sz // step)
+            rem = dim_sz % step
+            if rem > 0:
+                sizes.append(rem)
+        else:
+            sizes = [int(s) for s in split_size_or_sections]
+            if sum(sizes) != dim_sz:
+                raise ValueError(f"split_with_sizes expects sum(sizes)=={dim_sz}, got {sum(sizes)}")
+        res = []
+        offset = 0
+        for sz in sizes:
+            res.append(self.narrow(norm_dim, offset, sz))
+            offset += sz
+        return tuple(res)
+
+    def chunk(self, chunks: int, dim: int = 0) -> Tuple['Tensor', ...]:
+        if chunks <= 0:
+            raise ValueError("chunks must be > 0")
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        dim_sz = self.shape[norm_dim]
+        chunk_sz = (dim_sz + chunks - 1) // chunks
+        if chunk_sz == 0:
+            return ()
+        return self.split(chunk_sz, dim=norm_dim)
+
+    def repeat(self, *sizes: int) -> 'Tensor':
+        if len(sizes) == 1 and isinstance(sizes[0], (tuple, list)):
+            sizes = tuple(sizes[0])
+        if len(sizes) < self.ndim:
+            raise RuntimeError("Number of dimensions of repeat dims can not be smaller than number of dimensions of tensor")
+        diff = len(sizes) - self.ndim
+        x = self
+        for _ in range(diff):
+            x = x.unsqueeze(0)
+        # Interleave unsqueeze + expand + reshape for each repeated dimension
+        cur_shape = list(x.shape)
+        inter_shape = []
+        exp_shape = []
+        final_shape = []
+        for d, rep in enumerate(sizes):
+            inter_shape.extend([1, cur_shape[d]])
+            exp_shape.extend([int(rep), cur_shape[d]])
+            final_shape.append(int(rep) * cur_shape[d])
+        return x.reshape(*inter_shape).expand(*exp_shape).contiguous().reshape(*final_shape)
+
+    def repeat_interleave(self, repeats: int, dim: Optional[int] = None) -> 'Tensor':
+        if dim is None:
+            return self.reshape(-1).repeat_interleave(repeats, dim=0)
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        x = self.unsqueeze(norm_dim + 1)
+        exp_shape = list(x.shape)
+        exp_shape[norm_dim + 1] = int(repeats)
+        out_shape = list(self.shape)
+        out_shape[norm_dim] *= int(repeats)
+        return x.expand(*exp_shape).contiguous().reshape(*out_shape)
+
+    # ------------------------------------------------------------------------
+    # Phase 3.3: Extended Reductions, Prefix Scans, Sort / Top-K
+    # ------------------------------------------------------------------------
+
+    def argmax(self, dim: Optional[int] = None, keepdim: bool = False) -> 'Tensor':
+        native_dim = -999999 if dim is None else int(dim)
+        return Tensor._from_native(self._native.argmax_argmin(native_dim, keepdim, False), self.device, False)
+
+    def argmin(self, dim: Optional[int] = None, keepdim: bool = False) -> 'Tensor':
+        native_dim = -999999 if dim is None else int(dim)
+        return Tensor._from_native(self._native.argmax_argmin(native_dim, keepdim, True), self.device, False)
+
+    def prod(self, dim: Optional[int] = None, keepdim: bool = False) -> 'Tensor':
+        native_dim = -999999 if dim is None else int(dim)
+        native_out = self._native.reduce_prod_all_any(native_dim, keepdim, 0)
+        return Tensor._from_native(native_out, self.device, False)
+
+    def all(self, dim: Optional[int] = None, keepdim: bool = False) -> 'Tensor':
+        native_dim = -999999 if dim is None else int(dim)
+        return Tensor._from_native(self._native.reduce_prod_all_any(native_dim, keepdim, 1), self.device, False)
+
+    def any(self, dim: Optional[int] = None, keepdim: bool = False) -> 'Tensor':
+        native_dim = -999999 if dim is None else int(dim)
+        return Tensor._from_native(self._native.reduce_prod_all_any(native_dim, keepdim, 2), self.device, False)
+
+    def var(self, dim: Optional[Union[int, Tuple[int, ...]]] = None,
+            unbiased: bool = True, keepdim: bool = False) -> 'Tensor':
+        m = self.mean(dim=dim, keepdim=True)
+        diff = self - m
+        sq_sum = (diff * diff).sum(dim=dim, keepdim=keepdim)
+        if dim is None:
+            n = int(self.numel)
+        elif isinstance(dim, int):
+            n = int(self.shape[dim])
+        else:
+            n = int(np.prod([self.shape[d] for d in dim]))
+        denom = max(n - 1, 1) if unbiased else max(n, 1)
+        return sq_sum * (1.0 / denom)
+
+    def std(self, dim: Optional[Union[int, Tuple[int, ...]]] = None,
+            unbiased: bool = True, keepdim: bool = False) -> 'Tensor':
+        return self.var(dim=dim, unbiased=unbiased, keepdim=keepdim).sqrt()
+
+    def norm(self, p: float = 2.0, dim: Optional[Union[int, Tuple[int, ...]]] = None,
+             keepdim: bool = False) -> 'Tensor':
+        return (self.abs() ** p).sum(dim=dim, keepdim=keepdim) ** (1.0 / p)
+
+    def cumsum(self, dim: int) -> 'Tensor':
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        native_out = self._native.scan_op(norm_dim, 0)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            out.grad_fn = Node("CumsumBackward", lambda g: g.flip([norm_dim]).cumsum(norm_dim).flip([norm_dim]), [self])
+        return out
+
+    def cumprod(self, dim: int) -> 'Tensor':
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        native_out = self._native.scan_op(norm_dim, 1)
+        req_grad = self.requires_grad and is_grad_enabled()
+        out = Tensor._from_native(native_out, self.device, req_grad)
+        if req_grad:
+            out.is_leaf = False
+            out_ref = out.detach()
+            x_ref = self.detach()
+            def cumprod_backward(g: 'Tensor'):
+                rev = (g * out_ref).flip([norm_dim]).cumsum(norm_dim).flip([norm_dim])
+                return rev / x_ref
+            out.grad_fn = Node("CumprodBackward", cumprod_backward, [self])
+        return out
+
+    def sort(self, dim: int = -1, descending: bool = False):
+        from collections import namedtuple
+        SortResult = namedtuple("SortResult", ["values", "indices"])
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        val_nat, idx_nat = self._native.sort_topk(norm_dim, -1, bool(descending))
+        req_grad = self.requires_grad and is_grad_enabled()
+        vals = Tensor._from_native(val_nat, self.device, req_grad)
+        inds = Tensor._from_native(idx_nat, self.device, False)
+        if req_grad:
+            vals.is_leaf = False
+            src_shape = self.shape
+            dev = self.device
+            idx_ref = inds
+            def sort_backward(g: 'Tensor'):
+                z = backend.NativeTensor(list(src_shape), g._native.device_id, g._native.dtype)
+                z.zero_()
+                grad_nat = z.scatter(norm_dim, idx_ref._native, g._native, 0.0, False, True)
+                return Tensor._from_native(grad_nat, dev, False)
+            vals.grad_fn = Node("SortBackward", sort_backward, [self])
+        return SortResult(vals, inds)
+
+    def topk(self, k: int, dim: int = -1, largest: bool = True, sorted: bool = True):
+        from collections import namedtuple
+        TopkResult = namedtuple("TopkResult", ["values", "indices"])
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        val_nat, idx_nat = self._native.sort_topk(norm_dim, int(k), bool(largest))
+        req_grad = self.requires_grad and is_grad_enabled()
+        vals = Tensor._from_native(val_nat, self.device, req_grad)
+        inds = Tensor._from_native(idx_nat, self.device, False)
+        if req_grad:
+            vals.is_leaf = False
+            src_shape = self.shape
+            dev = self.device
+            idx_ref = inds
+            def topk_backward(g: 'Tensor'):
+                z = backend.NativeTensor(list(src_shape), g._native.device_id, g._native.dtype)
+                z.zero_()
+                grad_nat = z.scatter(norm_dim, idx_ref._native, g._native, 0.0, False, True)
+                return Tensor._from_native(grad_nat, dev, False)
+            vals.grad_fn = Node("TopkBackward", topk_backward, [self])
+        return TopkResult(vals, inds)
+
     def __setitem__(self, idx, val):
         arr = self.numpy()
         arr[idx] = val.numpy() if isinstance(val, Tensor) else val

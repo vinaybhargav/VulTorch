@@ -115,6 +115,34 @@ set(SLANG_KERNELS
     gemm_fp16:gemm_fp16
     gemm_fp16:matmul_coopmat_fp16
     cast:cast_dtype
+    indexing:where_kernel
+    indexing:masked_fill_kernel
+    indexing:gather_kernel
+    indexing:scatter_kernel
+    indexing:scatter_add_kernel
+    indexing:index_select_kernel
+    indexing:index_add_kernel
+    manip:copy_into_slice
+    manip:pad_nd_kernel
+    manip:pad_nd_backward_kernel
+    manip:tril_triu_kernel
+    manip:flip_roll_kernel
+    scan_sort:argmax_argmin_kernel
+    scan_sort:prod_all_any_kernel
+    scan_sort:scan_kernel
+    scan_sort:sort_topk_kernel
+    conv2d_im2col:im2col_kernel
+    conv2d_im2col:col2im_kernel
+    conv2d_depthwise:conv2d_grouped_forward
+    conv2d_depthwise:conv2d_grouped_backward_input
+    conv2d_depthwise:conv2d_grouped_backward_weight
+    batchnorm:batchnorm_stats
+    batchnorm:batchnorm_forward
+    batchnorm:batchnorm_backward_reduce
+    batchnorm:batchnorm_backward_dx
+    groupnorm:groupnorm_forward
+    groupnorm:groupnorm_backward_dx
+    groupnorm:groupnorm_backward_gamma_beta
 )
 
 set(SPV_OUTPUTS)
