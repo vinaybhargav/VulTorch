@@ -189,7 +189,20 @@ set(SOURCES
     src/runtime/vk_context.cpp
     src/runtime/vk_memory.cpp
     src/runtime/vk_pipeline.cpp
-    src/tensor.cpp
+    src/tensor/core.cpp
+    src/tensor/views.cpp
+    src/tensor/elementwise.cpp
+    src/tensor/optim_rng.cpp
+    src/tensor/matmul.cpp
+    src/tensor/reductions.cpp
+    src/tensor/scan_sort.cpp
+    src/tensor/indexing.cpp
+    src/tensor/manip.cpp
+    src/tensor/conv_pool.cpp
+    src/tensor/normalization.cpp
+    src/tensor/loss_embed.cpp
+    src/tensor/snake_mamba.cpp
+    src/tensor/attention_quant.cpp
     src/bindings.cpp
 )
 
