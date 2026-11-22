@@ -6,9 +6,39 @@ Hardware-accelerated tensor abstraction backed by Vulkan SPIR-V compute.
 import numpy as np
 from typing import Union, Tuple, List, Optional, Any
 import os
+import threading
 
 from . import _vultorch_backend as backend
 from .autograd import is_grad_enabled, Node, backward
+
+_device_state = threading.local()
+_global_default_device: str = "vk"
+
+
+def get_default_device() -> 'Device':
+    override = getattr(_device_state, "default_device", None)
+    return Device(override if override is not None else _global_default_device)
+
+
+def set_default_device(device: Union[str, 'Device']):
+    global _global_default_device
+    _global_default_device = str(Device(device))
+    _device_state.default_device = _global_default_device
+
+
+def resolve_device(device: Optional[Union[str, 'Device']] = None) -> 'Device':
+    if device is None:
+        return get_default_device()
+    return Device(device)
+
+
+def _check_same_device(a: 'Tensor', b: 'Tensor', op_name: str = "operation"):
+    if a.device != b.device:
+        raise RuntimeError(
+            f"Expected all tensors to be on the same device for {op_name}, "
+            f"but found '{a.device}' and '{b.device}'. "
+            f"Call tensor.to('{a.device}') or model.to('{a.device}') to move them to the same device."
+        )
 
 # Shader lookup.
 #
@@ -77,6 +107,15 @@ class Device:
 
     def __hash__(self):
         return hash((self.type, self.index))
+
+    def __enter__(self):
+        self._prev_dev = getattr(_device_state, "default_device", None)
+        _device_state.default_device = str(self)
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _device_state.default_device = self._prev_dev
+        return False
 
 
 def _canonical_dtype_name(name: str) -> str:
@@ -192,11 +231,11 @@ class Tensor:
     def __init__(
         self,
         data,
-        device: Union[str, Device] = "vk",
+        device: Optional[Union[str, Device]] = None,
         requires_grad: bool = False,
         dtype: Union[str, DType, np.dtype, type, None] = None,
     ):
-        dev = Device(device)
+        dev = resolve_device(device)
         self.device = dev
         self.requires_grad = requires_grad
         self.grad: Optional['Tensor'] = None
@@ -464,6 +503,7 @@ class Tensor:
             return out
 
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        _check_same_device(self, other, "add")
         native_out = self._native.binary_op(0, other._native)
         req_grad = (self.requires_grad or other.requires_grad) and is_grad_enabled()
         out = Tensor(native_out, device=self.device, requires_grad=req_grad)
@@ -487,6 +527,7 @@ class Tensor:
             return out
 
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        _check_same_device(self, other, "sub")
         native_out = self._native.binary_op(1, other._native)
         req_grad = (self.requires_grad or other.requires_grad) and is_grad_enabled()
         out = Tensor(native_out, device=self.device, requires_grad=req_grad)
@@ -520,6 +561,7 @@ class Tensor:
             return out
 
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        _check_same_device(self, other, "mul")
         native_out = self._native.binary_op(2, other._native)
         req_grad = (self.requires_grad or other.requires_grad) and is_grad_enabled()
         out = Tensor(native_out, device=self.device, requires_grad=req_grad)
@@ -538,6 +580,7 @@ class Tensor:
             return self.__mul__(1.0 / val)
 
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
+        _check_same_device(self, other, "div")
         native_out = self._native.binary_op(3, other._native)
         req_grad = (self.requires_grad or other.requires_grad) and is_grad_enabled()
         out = Tensor(native_out, device=self.device, requires_grad=req_grad)
@@ -560,32 +603,106 @@ class Tensor:
             out.grad_fn = Node("NegBackward", lambda g: -g, [self])
         return out
 
-    def __matmul__(self, other) -> 'Tensor':
+    def matmul(
+        self,
+        other: 'Tensor',
+        trans_a: bool = False,
+        trans_b: bool = False,
+        bias: Optional['Tensor'] = None,
+        epilogue: int = 0,
+    ) -> 'Tensor':
         other = other if isinstance(other, Tensor) else Tensor(other, device=self.device)
-        native_out = self._native.matmul(other._native, False, False, None)
-        req_grad = (self.requires_grad or other.requires_grad) and is_grad_enabled()
+        _check_same_device(self, other, "matmul")
+        if bias is not None:
+            _check_same_device(self, bias, "matmul bias")
+
+        from .amp import is_autocast_enabled, get_autocast_dtype
+        a_in = self
+        b_in = other
+        bias_in = bias
+        if is_autocast_enabled():
+            amp_dt = get_autocast_dtype()
+            if a_in.dtype.is_floating_point and a_in.dtype != amp_dt:
+                a_in = a_in.to(amp_dt)
+            if b_in.dtype.is_floating_point and b_in.dtype != amp_dt:
+                b_in = b_in.to(amp_dt)
+            if bias_in is not None and bias_in.dtype.is_floating_point and bias_in.dtype != amp_dt:
+                bias_in = bias_in.to(amp_dt)
+
+        b_nat = bias_in._native if bias_in is not None else None
+        native_out = a_in._native.matmul(b_in._native, bool(trans_a), bool(trans_b), b_nat, int(epilogue))
+        req_grad = (
+            self.requires_grad
+            or other.requires_grad
+            or (bias is not None and bias.requires_grad)
+        ) and is_grad_enabled()
         out = Tensor(native_out, device=self.device, requires_grad=req_grad)
 
         if req_grad:
             out.is_leaf = False
+            inputs = [self, other] + ([bias] if bias is not None else [])
+
             def matmul_backward(grad_out: 'Tensor'):
+                g_work = grad_out
+                if g_work.dtype != a_in.dtype:
+                    g_work = g_work.to(a_in.dtype)
                 g_self = None
                 g_other = None
+                g_bias = None
                 if self.requires_grad:
-                    g_self = Tensor(grad_out._native.matmul(other._native, False, True, None), device=self.device)
-                if other.requires_grad:
-                    if self.ndim > 2 and other.ndim == 2:
-                        k = self.shape[-1]
-                        n = grad_out.shape[-1]
-                        m_total = self.numel // k
-                        x_2d = self.contiguous()._native.reshape_view([m_total, k])
-                        g_2d = grad_out.contiguous()._native.reshape_view([m_total, n])
-                        g_other = Tensor(x_2d.matmul(g_2d, True, False, None), device=self.device)
+                    if not trans_a and not trans_b:
+                        g_self = Tensor(g_work._native.matmul(b_in._native, False, True, None), device=self.device)
+                    elif not trans_a and trans_b:
+                        g_self = Tensor(g_work._native.matmul(b_in._native, False, False, None), device=self.device)
+                    elif trans_a and not trans_b:
+                        g_self = Tensor(b_in._native.matmul(g_work._native, False, True, None), device=self.device)
                     else:
-                        g_other = Tensor(self._native.matmul(grad_out._native, True, False, None), device=self.device)
+                        g_self = Tensor(b_in._native.matmul(g_work._native, True, True, None), device=self.device)
+                    if g_self.dtype != self.dtype:
+                        g_self = g_self.to(self.dtype)
+                if other.requires_grad:
+                    if not trans_a and not trans_b:
+                        if a_in.ndim > 2 and b_in.ndim == 2:
+                            k = a_in.shape[-1]
+                            n = g_work.shape[-1]
+                            m_total = a_in.numel // k
+                            x_2d = a_in.contiguous()._native.reshape_view([m_total, k])
+                            g_2d = g_work.contiguous()._native.reshape_view([m_total, n])
+                            g_other = Tensor(x_2d.matmul(g_2d, True, False, None), device=self.device)
+                        else:
+                            g_other = Tensor(a_in._native.matmul(g_work._native, True, False, None), device=self.device)
+                    elif not trans_a and trans_b:
+                        if a_in.ndim > 2 and b_in.ndim == 2:
+                            k = a_in.shape[-1]
+                            n = g_work.shape[-1]
+                            m_total = a_in.numel // k
+                            x_2d = a_in.contiguous()._native.reshape_view([m_total, k])
+                            g_2d = g_work.contiguous()._native.reshape_view([m_total, n])
+                            g_other = Tensor(g_2d.matmul(x_2d, True, False, None), device=self.device)
+                        else:
+                            g_other = Tensor(g_work._native.matmul(a_in._native, True, False, None), device=self.device)
+                    elif trans_a and not trans_b:
+                        g_other = Tensor(a_in._native.matmul(g_work._native, False, False, None), device=self.device)
+                    else:
+                        g_other = Tensor(g_work._native.matmul(a_in._native, True, True, None), device=self.device)
+                    if g_other.dtype != other.dtype:
+                        g_other = g_other.to(other.dtype)
+                if bias is not None and bias.requires_grad:
+                    n = g_work.shape[-1]
+                    m_total = g_work.numel // n
+                    g_2d = g_work.contiguous()._native.reshape_view([m_total, n])
+                    g_bias = Tensor(g_2d.reduce_sum(0, False), device=self.device)
+                    if g_bias.dtype != bias.dtype:
+                        g_bias = g_bias.to(bias.dtype)
+                if bias is not None:
+                    return g_self, g_other, g_bias
                 return g_self, g_other
-            out.grad_fn = Node("MatmulBackward", matmul_backward, [self, other])
+
+            out.grad_fn = Node("MatmulBackward", matmul_backward, inputs)
         return out
+
+    def __matmul__(self, other) -> 'Tensor':
+        return self.matmul(other)
 
     def __pow__(self, exponent: Union[int, float]) -> 'Tensor':
         p = float(exponent)

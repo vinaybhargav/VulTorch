@@ -55,6 +55,24 @@ struct Identity : IEpilogue {
     static float apply(float value, uint m, uint n) { return value; }
 };
 
+struct ReLUEpilogue : IEpilogue {
+    static float apply(float value, uint m, uint n) { return max(value, 0.0); }
+};
+
+struct GELUEpilogue : IEpilogue {
+    static float apply(float value, uint m, uint n) {
+        const float kAlpha = 0.7978845608028654;
+        const float kBeta = 0.044715;
+        return 0.5 * value * (1.0 + tanh(kAlpha * (value + kBeta * value * value * value)));
+    }
+};
+
+struct SiLUEpilogue : IEpilogue {
+    static float apply(float value, uint m, uint n) {
+        return value / (1.0 + exp(-value));
+    }
+};
+
 [ForceInline]
 float load_a<let TILE : int, let BK : int>(uint baseA, uint bm, uint kb, uint idx) {
     uint m, k;
@@ -220,6 +238,16 @@ void matmul_tiled64(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) { gemm
 
 [shader("compute")] [numthreads(16, 16, 1)]
 void matmul_tiled(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) { gemm<128, 16, 8, Identity>(lid, gid); }
+
+// Fused Epilogue GEMM specialisations (Linear + Bias + ReLU / GELU / SiLU in a single dispatch)
+[shader("compute")] [numthreads(16, 16, 1)]
+void gemm_t64_k16_r4_relu(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) { gemm<64, 16, 4, ReLUEpilogue>(lid, gid); }
+
+[shader("compute")] [numthreads(16, 16, 1)]
+void gemm_t64_k16_r4_gelu(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) { gemm<64, 16, 4, GELUEpilogue>(lid, gid); }
+
+[shader("compute")] [numthreads(16, 16, 1)]
+void gemm_t64_k16_r4_silu(uint3 lid : SV_GroupThreadID, uint3 gid : SV_GroupID) { gemm<64, 16, 4, SiLUEpilogue>(lid, gid); }
 
 // ---------------------------------------------------------------------------
 // Cooperative-matrix 16x16x16 fp16 -> fp32 SGEMM (64x64 workgroup tile).

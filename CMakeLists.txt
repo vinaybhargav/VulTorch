@@ -86,6 +86,9 @@ set(SLANG_KERNELS
     gemm:matmul_tiled64
     gemm:matmul_tiled
     gemm:matmul_coopmat
+    gemm:gemm_t64_k16_r4_relu
+    gemm:gemm_t64_k16_r4_gelu
+    gemm:gemm_t64_k16_r4_silu
     adam:adam_step
     elementwise_unary_vec4:elementwise_unary_vec4
     elementwise_unary_scalar:elementwise_unary_scalar
@@ -148,6 +151,16 @@ set(SLANG_KERNELS
     snake:snake_backward_params
     ssm_scan:ssm_scan_forward
     ssm_scan:ssm_scan_backward
+    flash_attention:flash_attention_forward
+    flash_attention:flash_attention_backward_prep
+    flash_attention:flash_attention_backward_dq
+    flash_attention:flash_attention_backward_dkv
+    rope:rope_kernel
+    glu:glu_forward
+    glu:glu_backward
+    gemm_quant:gemm_quant_kernel
+    gemm_quant:quantize_pack_weights
+    gemm_quant:amp_unscale_check
 )
 
 set(SPV_OUTPUTS)

@@ -41,9 +41,13 @@ class Node:
         self.name = name
         self.backward_fn = backward_fn
         self.inputs = inputs
+        self.post_hook: Optional[Callable] = None
 
     def apply(self, grad_output):
-        return self.backward_fn(grad_output)
+        res = self.backward_fn(grad_output)
+        if self.post_hook is not None:
+            self.post_hook()
+        return res
 
 def backward(root_tensor: 'Tensor', grad: Optional['Tensor'] = None):
     """
@@ -81,13 +85,17 @@ def backward(root_tensor: 'Tensor', grad: Optional['Tensor'] = None):
         # Dictionary of accumulated gradients: Tensor -> Tensor
         grads = {root_tensor: grad}
         used_leaf_natives = {id(grad._native)}
+        post_hooks: List[Callable] = []
 
         for tensor in reversed(topo):
             if tensor not in grads or tensor.grad_fn is None:
                 continue
 
+            if getattr(tensor.grad_fn, "post_hook", None) is not None:
+                post_hooks.append(tensor.grad_fn.post_hook)
+
             g_out = grads[tensor]
-            input_grads = tensor.grad_fn.apply(g_out)
+            input_grads = tensor.grad_fn.backward_fn(g_out)
 
             if not isinstance(input_grads, (list, tuple)):
                 input_grads = [input_grads]
@@ -115,6 +123,12 @@ def backward(root_tensor: 'Tensor', grad: Optional['Tensor'] = None):
                             inp.grad = g_in
                     else:
                         inp.grad = inp.grad + g_in
+
+        for hook in post_hooks:
+            hook()
+        for tensor in topo:
+            if tensor.grad_fn is not None:
+                tensor.grad_fn.post_hook = None
 
         grads.clear()
         visited.clear()

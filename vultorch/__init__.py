@@ -10,6 +10,9 @@ from .tensor import (
     Device,
     DType,
     parse_dtype,
+    get_default_device,
+    set_default_device,
+    resolve_device,
     float32,
     float16,
     half,
@@ -23,6 +26,7 @@ from .tensor import (
 )
 from .autograd import no_grad, is_grad_enabled, backward
 from .testing import gradcheck
+from . import amp
 from . import nn
 from . import optim
 from . import utils
@@ -56,18 +60,18 @@ def _next_philox_state() -> Tuple[_builtins.int, _builtins.int]:
 def device(d: Union[str, Device]) -> Device:
     return Device(d)
 
-def tensor(data, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+def tensor(data, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     return Tensor(data, device=device, requires_grad=requires_grad, dtype=dtype)
 
-def from_numpy(ndarray: np.ndarray, device: Union[str, Device] = "vk", dtype=None) -> Tensor:
+def from_numpy(ndarray: np.ndarray, device: Optional[Union[str, Device]] = None, dtype=None) -> Tensor:
     if not isinstance(ndarray, np.ndarray):
         ndarray = np.asarray(ndarray)
     return Tensor(ndarray, device=device, dtype=dtype)
 
-def empty(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+def empty(*shape, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     if len(shape) == 1 and isinstance(shape[0], (list, tuple)):
         shape = shape[0]
-    dev = Device(device)
+    dev = resolve_device(device)
     dev_id = -1 if dev.type == "cpu" else dev.index
     dt = parse_dtype(dtype) if dtype is not None else float32
     if requires_grad and not dt.is_floating_point:
@@ -75,17 +79,17 @@ def empty(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bo
     native = _backend.NativeTensor([_builtins.int(d) for d in shape], dev_id, dt.name)
     return Tensor(native, device=dev, requires_grad=requires_grad)
 
-def zeros(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+def zeros(*shape, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     t = empty(*shape, device=device, requires_grad=requires_grad, dtype=dtype)
     t._native.zero_()
     return t
 
-def ones(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+def ones(*shape, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     t = empty(*shape, device=device, requires_grad=requires_grad, dtype=dtype)
     t._native.fill_(1.0)
     return t
 
-def full(shape, fill_value, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+def full(shape, fill_value, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     if isinstance(shape, _builtins.int):
         shape = (shape,)
     if dtype is None:
@@ -109,19 +113,19 @@ def ones_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_g
     dt = dtype if dtype is not None else t.dtype
     return ones(t.shape, device=dev, requires_grad=requires_grad, dtype=dt)
 
-def randn(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+def randn(*shape, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     t = empty(*shape, device=device, requires_grad=requires_grad, dtype=dtype)
     seed, offset = _next_philox_state()
     t._native.random_philox_(1, 0.0, 1.0, seed, offset, None)
     return t
 
-def rand(*shape, device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+def rand(*shape, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     t = empty(*shape, device=device, requires_grad=requires_grad, dtype=dtype)
     seed, offset = _next_philox_state()
     t._native.random_philox_(0, 0.0, 1.0, seed, offset, None)
     return t
 
-def randint(low: _builtins.int, high: Optional[_builtins.int] = None, size: Union[_builtins.int, Sequence[_builtins.int]] = (), device: Union[str, Device] = "vk", requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+def randint(low: _builtins.int, high: Optional[_builtins.int] = None, size: Union[_builtins.int, Sequence[_builtins.int]] = (), device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     if high is None:
         high = low
         low = 0
@@ -132,7 +136,7 @@ def randint(low: _builtins.int, high: Optional[_builtins.int] = None, size: Unio
     arr = np.random.randint(low, high, size=size, dtype=np_dt)
     return tensor(arr, device=device, requires_grad=requires_grad, dtype=dt)
 
-def arange(start, end=None, step=1, device: Union[str, Device] = "vk", dtype=None) -> Tensor:
+def arange(start, end=None, step=1, device: Optional[Union[str, Device]] = None, dtype=None) -> Tensor:
     dt = parse_dtype(dtype) if dtype is not None else float32
     np_dt = dt.numpy_dtype if dt.numpy_dtype is not None else np.float32
     if end is None:
@@ -141,13 +145,13 @@ def arange(start, end=None, step=1, device: Union[str, Device] = "vk", dtype=Non
         arr = np.arange(start, end, step, dtype=np_dt)
     return Tensor(arr, device=device, dtype=dt)
 
-def linspace(start: _builtins.float, end: _builtins.float, steps: _builtins.int, device: Union[str, Device] = "vk", dtype=None) -> Tensor:
+def linspace(start: _builtins.float, end: _builtins.float, steps: _builtins.int, device: Optional[Union[str, Device]] = None, dtype=None) -> Tensor:
     dt = parse_dtype(dtype) if dtype is not None else float32
     np_dt = dt.numpy_dtype if dt.numpy_dtype is not None else np.float32
     arr = np.linspace(start, end, steps, dtype=np_dt)
     return Tensor(arr, device=device, dtype=dt)
 
-def eye(n: _builtins.int, m: Optional[_builtins.int] = None, device: Union[str, Device] = "vk", dtype=None) -> Tensor:
+def eye(n: _builtins.int, m: Optional[_builtins.int] = None, device: Optional[Union[str, Device]] = None, dtype=None) -> Tensor:
     dt = parse_dtype(dtype) if dtype is not None else float32
     np_dt = dt.numpy_dtype if dt.numpy_dtype is not None else np.float32
     arr = np.eye(n, m, dtype=np_dt)
@@ -335,6 +339,40 @@ def snake_sinc(x: Tensor, a: _builtins.float = 1.0, eps: _builtins.float = 1e-9)
 def selective_scan(u: Tensor, delta: Tensor, A: Tensor, B: Tensor, C: Tensor, D: Optional[Tensor] = None) -> Tensor:
     from .nn import functional as _F
     return _F.selective_scan(u, delta, A, B, C, D)
+
+def quantize(model: 'nn.Module', bits: _builtins.int = 4, group_size: _builtins.int = 64, inplace: _builtins.bool = False) -> 'nn.Module':
+    """
+    One-line weight quantization helper: recursively replaces every `nn.Linear` layer
+    (whose `in_features` is divisible by `group_size` or `8`) in `model` with a
+    packed `nn.QuantizedLinear` layer (`bits=4` or `bits=8`).
+    """
+    import copy
+    target = model if inplace else copy.deepcopy(model)
+
+    def _replace(mod: 'nn.Module'):
+        for name, child in list(mod._modules.items()):
+            if child is None:
+                continue
+            if isinstance(child, nn.Linear):
+                pack_div = 8 if bits == 4 else 4
+                if child.in_features % pack_div == 0:
+                    eff_gs = min(group_size, child.in_features)
+                    while child.in_features % eff_gs != 0 and eff_gs > pack_div:
+                        eff_gs //= 2
+                    q_layer = nn.QuantizedLinear.from_float(child, bits=bits, group_size=eff_gs)
+                    setattr(mod, name, q_layer)
+            else:
+                _replace(child)
+
+    if isinstance(target, nn.Linear):
+        pack_div = 8 if bits == 4 else 4
+        eff_gs = min(group_size, target.in_features)
+        while target.in_features % eff_gs != 0 and eff_gs > pack_div:
+            eff_gs //= 2
+        return nn.QuantizedLinear.from_float(target, bits=bits, group_size=eff_gs)
+
+    _replace(target)
+    return target
 
 def cat(tensors: List[Tensor], dim: _builtins.int = 0, device: Optional[Union[str, Device]] = None) -> Tensor:
     if not tensors:

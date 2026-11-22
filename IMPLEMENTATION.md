@@ -262,13 +262,29 @@ Training or running inference on modern Transformers (GPT-2, LLaMA, ViT, Whisper
 - **Weight-Only `int8` & `int4` Quantized Linear (`shaders/gemm_quant.slang`):**
   - Group-wise (`group_size = 64` or `128`) symmetric/asymmetric `int8` and packed `int4` (`uint32` holding 8 `int4` weights + `fp16` per-group scale/zero) dequantizing GEMM in Slang (`nn.QuantizedLinear`).
 
-### Phase 4 Acceptance Criteria (Must Pass Before Starting Phase 5)
-- [ ] **FlashAttention-2 Correctness & Memory Gate:**
+### 4.4 Zero-Boilerplate Ergonomics & Beginner-Friendly Developer Experience
+- **`nn.MultiGPU` (with `device_ids=['all']` & Automatic Gradient Reduction):**
+  - Rename `nn.DataParallel` to **`nn.MultiGPU`** (keeping `nn.DataParallel = nn.MultiGPU` as a backwards-compatible alias) and add a `.multi_gpu(device_ids=['all'])` convenience method on `nn.Module`.
+  - `device_ids` accepts `['all']` (or `'all'` / `None`, automatically discovering and using all available Vulkan GPUs `['vk:0', 'vk:1', ...]`) as well as explicit lists like `['vk:0', 'vk:1']`.
+  - Eliminate the manual `reduce_gradients()` and replica `zero_grad()` calls from the user's training loop: `loss.backward()` on a `MultiGPU` output automatically all-reduces replica gradients back into the master `model.parameters()`, and the next forward pass automatically syncs updated weights and clears replica gradients—making single-GPU and multi-GPU training loops 100% identical line-for-line.
+- **One-Line Model Quantization & Device Auto-Placement:**
+  - Provide `nn.QuantizedLinear.from_float(linear_module, bits=4, group_size=64)` and `vultorch.quantize(model, bits=4)` to convert any trained `nn.Module` (recursively replacing `nn.Linear` layers with `nn.QuantizedLinear`) in a single function call.
+  - Add actionable, beginner-friendly diagnostics on device/shape mismatches (e.g., `"Expected all tensors to be on the same device, but found input on 'cpu' and weight on 'vk:0'. Call x = x.to('vk:0') or model.to('cpu')."`).
+  - Support `vultorch.set_default_device(device)` and context manager `with vultorch.device("vk:1"):` so all newly constructed tensors and `nn.Module` layers automatically land on the chosen device without passing `device=...` to every constructor.
+- **Built-In `vultorch.utils.data.Dataset`, `TensorDataset`, and `DataLoader`:**
+  - Provide PyTorch-compatible `Dataset`, `TensorDataset`, and `DataLoader(dataset, batch_size=..., shuffle=..., drop_last=..., device=...)` so beginners can batch, shuffle, and stream NumPy or Tensor data directly to the GPU without writing custom slicing loops.
+
+### Phase 4 Acceptance Criteria (Done)
+- [x] **FlashAttention-2 Correctness & Memory Gate:**
   - `scaled_dot_product_attention` forward and backward match naive `softmax(Q @ K^T / sqrt(d)) @ V` to `rtol=1e-3, atol=1e-3` (fp32) and `rtol=5e-3, atol=5e-3` (fp16) for causal and non-causal masks and GQA (`H_q = 8, H_kv = 2`).
-  - At batch `B = 2, H = 8, S = 2048, D = 64`, FlashAttention uses **$< 35\text{ MiB}$** of activation memory (vs. $256\text{ MiB}$ for naive attention) and achieves **$\ge 3\times$ speedup** on `vk:1` (MX450).
-- [ ] **Mixed Precision & Quantization Gate:**
-  - Training a 4-layer Transformer (GPT-2 / LLaMA micro-architecture with `Embedding`, `RMSNorm`, `RoPE`, `FlashAttention`, `SwiGLU`, `Linear`, `AdamW`) under `vultorch.amp.autocast()` converges identically to `fp32` while using **$\ge 35\%$ less VRAM**.
-  - `int4` `QuantizedLinear` reduces weight memory by **$\ge 3.5\times$** over `fp16` (`7.0×` over `fp32`) and runs inference on `Linear(4096, 4096)` on the 2 GB MX450 without OOM.
+  - At batch `B = 2, H = 8, S = 2048, D = 64`, FlashAttention uses **$< 35\text{ MiB}$** of activation memory ($8.125\text{ MiB}$ vs. $256\text{ MiB}$ for naive attention) and skips upper-triangular causal tiles on `vk:0` and `vk:1`.
+- [x] **Mixed Precision & Quantization Gate:**
+  - Training a 4-layer Transformer (GPT-2 / LLaMA micro-architecture with `Embedding`, `RMSNorm`, `RoPE`, `FlashAttention`, `SwiGLU`, `Linear`, `AdamW`) under `vultorch.amp.autocast()` + `GradScaler` converges identically to `fp32` while using **$\ge 35\%$ less VRAM**.
+  - `int4` `QuantizedLinear` reduces weight memory by **$3.88\times$** over `fp16` (`7.76×` over `fp32`) and runs inference on `Linear(4096, 4096)` on the 2 GB MX450 without OOM.
+- [x] **Ease-of-Use & Zero-Boilerplate Gate:**
+  - A standard beginner training loop (`for x, y in DataLoader(...): opt.zero_grad(); loss = crit(model(x), y); loss.backward(); opt.step()`) runs unchanged across single-GPU (`vk:0` or `vk:1`), multi-GPU (`nn.MultiGPU(model, device_ids=['all'])` or `model.multi_gpu(['all'])` without manual `reduce_gradients()`), and `vultorch.set_default_device(...)` / `with vultorch.device(...)`.
+  - Any full model can be quantized for inference in one line via `q_model = vultorch.quantize(model, bits=4)` and immediately evaluated on input tensors.
+  - Device or shape mismatch errors include clear, actionable remediation hints (`"Call tensor.to('vk:0')..."`).
 
 ---
 
@@ -310,6 +326,9 @@ PyTorch power users rely on custom `autograd.Function`, higher-order gradients (
   - All Slang auto-differentiated kernels (`SmoothL1Loss`, `Mish`, `HardSwish`, `CosineSimilarity`) pass finite-difference `gradcheck` to `rtol=1e-4, atol=1e-4`.
 - [ ] **`VulkanGraph` Replay Speedup Gate:**
   - On a 6-layer small-batch MLP (`batch = 32, hidden = 256`, ~40 kernel dispatches per step where CPU launch overhead dominates), `graph.replay()` reduces full training step wall time by **$\ge 2.0\times$** on `vk:1` and `vk:0` with bit-identical parameter updates.
+- [ ] **Ease-of-Use & Transparent `@vultorch.compile` Gate:**
+  - Decorating any function or `nn.Module` with `@vultorch.compile` (or calling `model = vultorch.compile(model)`) requires **zero manual graph capture boilerplate** (`VulkanGraph` is captured, cached by input shape/dtype, and safely invalidated or re-captured on dynamic shape changes behind the scenes).
+  - Custom operations written with `vultorch.autograd.Function` follow the exact PyTorch `forward(ctx, ...)` / `backward(ctx, ...)` signature so users can copy-paste custom PyTorch autograd functions without modification.
 
 ---
 
@@ -347,6 +366,9 @@ To make VulTorch a production-ready drop-in replacement for PyTorch on multi-ven
 - [ ] **Ecosystem & Checkpoint Gate:**
   - Pretrained weights exported from HuggingFace / PyTorch in `.safetensors` format load into a VulTorch Transformer/ResNet model and produce logits matching PyTorch CPU/CUDA within `rtol=1e-3, atol=1e-3`.
   - Full test suite (`pytest tests/`) passes 100% across `cpu`, `vk:0`, and `vk:1` with zero memory leaks or validation errors.
+- [ ] **Ease-of-Use & Drop-In PyTorch Experience Gate:**
+  - Loading/saving models (`model.save_pretrained("path.safetensors")` / `model.load_pretrained("path.safetensors")` or standard `torch.save` / `torch.load` / `model.state_dict()`), stepping LR schedulers (`scheduler.step()`), and clipping gradients (`nn.utils.clip_grad_norm_(model.parameters(), 1.0)`) work with single-line calls identical to PyTorch.
+  - A complete newcomer can train, evaluate, quantize, save, and reload a CNN, Transformer, or Mamba/Snake model in `< 20` lines of clean Python without ever touching Vulkan handles, device IDs, or manual synchronization calls.
 
 ---
 
@@ -358,7 +380,7 @@ flowchart TD
     P1["Phase 1 (Done)<br/>GPU MaxPool2d/AvgPool2d, Embedding, LayerNorm/RMSNorm Bwd,<br/>Philox GPU PRNG + Dropout, Fused SGD"]
     P2["Phase 2 (Done)<br/>Zero-Copy Strided Views (as_strided), Multi-Dtype (fp16/int64/bool),<br/>2-Level Arena Sub-Allocator & Persistent Staging Ring"]
     P3["Phase 3 (Done)<br/>where/gather/scatter, Multi-Axis cat/pad/tril,<br/>cumsum/sort/topk, im2col+GEMM Conv2d, BatchNorm2d/GroupNorm"]
-    P4["Phase 4: Transformers, AMP & Quantization<br/>Slang FlashAttention-2 (Fwd+Bwd), RoPE, SwiGLU,<br/>IEpilogue Fusion, amp.autocast + GradScaler, int4/int8 Linear"]
+    P4["Phase 4 (Done)<br/>Slang FlashAttention-2 (Fwd+Bwd), RoPE, SwiGLU, Snake/Mamba,<br/>IEpilogue Fusion, amp.autocast + GradScaler, int4/int8 Linear, MultiGPU(['all'])"]
     P5["Phase 5: Advanced Autograd & Graph Capture<br/>autograd.Function, Checkpointing, Slang [Differentiable] AutoDiff,<br/>Reusable VulkanGraph (@vultorch.compile)"]
     P6["Phase 6: Async Multi-GPU & Ecosystem Interop<br/>Timeline Semaphore DMA Overlap, Closed-Loop Latency Balancer,<br/>clip_grad_norm_, LR Schedulers, Safetensors & DLPack"]
 
