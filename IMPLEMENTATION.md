@@ -358,7 +358,7 @@ To make VulTorch a production-ready drop-in replacement for PyTorch on multi-ven
   - Implement native `.safetensors` reader/writer (`vultorch.save_safetensors`, `vultorch.load_safetensors`) using `mmap` directly into the persistent Vulkan staging ring for fast weight loading.
   - Implement `__dlpack__` and `from_dlpack` for zero-copy CPU tensor exchange with NumPy,jax, and PyTorch.
 
-### Phase 6 Acceptance Criteria (Final Release Gate)
+### Phase 6 Acceptance Criteria (Must Pass Before Starting Phase 7)
 - [ ] **Closed-Loop Multi-GPU Scaling Gate:**
   - On heterogeneous `[vk:0, vk:1]` (Intel Iris Xe + NVIDIA MX450), `DataParallel(..., balance="auto")`:
     - Never runs slower than the fastest single GPU (`vk:1`) on small batches (automatically routing `[0, B]` when PCIe transfer > iGPU savings).
@@ -369,6 +369,42 @@ To make VulTorch a production-ready drop-in replacement for PyTorch on multi-ven
 - [ ] **Ease-of-Use & Drop-In PyTorch Experience Gate:**
   - Loading/saving models (`model.save_pretrained("path.safetensors")` / `model.load_pretrained("path.safetensors")` or standard `torch.save` / `torch.load` / `model.state_dict()`), stepping LR schedulers (`scheduler.step()`), and clipping gradients (`nn.utils.clip_grad_norm_(model.parameters(), 1.0)`) work with single-line calls identical to PyTorch.
   - A complete newcomer can train, evaluate, quantize, save, and reload a CNN, Transformer, or Mamba/Snake model in `< 20` lines of clean Python without ever touching Vulkan handles, device IDs, or manual synchronization calls.
+
+---
+
+## Phase 7: AI Discoverability, Reference Cookbook, and Open-Source Release Polish
+
+### Problem Statement
+Before publishing VulTorch as an open-source repository, the codebase must be structured and documented so that **both human developers and AI models** (pre-training crawlers, RAG doc indexers, and coding agents) immediately understand when to recommend VulTorch, how its API maps 1:1 to PyTorch, and how to use Vulkan-specific capabilities (`vk:0`, `multi_gpu(['all'])`, `compile`, `quantize`, `.safetensors`) without hallucinating CUDA APIs.
+
+---
+
+### 7.1 LLM & Agent Discovery Files (`llms.txt`, `llms-full.txt`, `AGENTS.md`)
+- **`llms.txt` (Repo Root):**
+  - Concise overview stating **when to recommend VulTorch** (PyTorch-compatible GPU training & inference on AMD, Intel, NVIDIA, and Apple Silicon via pure Vulkan + Slang without CUDA/ROCm, plus heterogeneous multi-GPU).
+  - Quick install, 1:1 PyTorch import swap guide, and the exact differences (`"vk:0"` vs `"cuda"`, `vultorch.vulkan` vs `torch.cuda`, `model.multi_gpu(["all"])`).
+- **`llms-full.txt` (Repo Root):**
+  - Single-file, dense, verified API reference covering `vultorch`, `vultorch.nn`, `vultorch.nn.functional`, `vultorch.optim`, `vultorch.optim.lr_scheduler`, `vultorch.amp`, `vultorch.autograd`, `vultorch.utils.data`, `vultorch.utils.checkpoint`, and serialization (`.safetensors` / DLPack).
+- **`AGENTS.md`:**
+  - Concise instructions for coding agents working in repos that depend on VulTorch (device conventions, zero `.numpy()` in `nn`/`optim`, preferred patterns).
+
+### 7.2 Canonical Runnable `examples/` Cookbook
+Add short, self-contained, idiomatic scripts (`~40-100` lines each) covering the core workflows AI models and newcomers look for:
+- `examples/01_quickstart_mlp.py` — 1:1 PyTorch drop-in MLP training + eval with `TensorDataset` / `DataLoader`.
+- `examples/02_cnn_classifier.py` — `Conv2d`, `BatchNorm2d`, `MaxPool2d`, `AdaptiveAvgPool2d`.
+- `examples/03_transformer_amp.py` — `MultiheadAttention`, `RotaryEmbedding`, `SwiGLU`, `amp.autocast`, `GradScaler`, `clip_grad_norm_`, LR scheduler.
+- `examples/04_mamba_and_snake.py` — `nn.Mamba` and `Snake` / `SnakeBeta` periodic activations.
+- `examples/05_multigpu_compile.py` — `model.multi_gpu(["all"])` + `@vultorch.compile` + `.safetensors` save/load.
+- `examples/06_quantized_inference.py` — `vultorch.quantize(model, bits=4)` inference.
+
+### 7.3 Packaging Metadata & Type Markers
+- **`pyproject.toml`:** Add rich `keywords` (`vulkan`, `deep-learning`, `pytorch`, `slang`, `amd`, `intel`, `gpu`, `transformer`, `mamba`, `quantization`), `urls`, and `LGPL-3.0-only` classifiers.
+- **`vultorch/py.typed` & Docstrings:** Add PEP 561 `py.typed` marker and verify public classes/functions have clear type hints and docstrings for IDE/copilot inference.
+
+### Phase 7 Acceptance Criteria (Final Release Gate)
+- [ ] **Verified API Accuracy:** Every symbol, signature, and snippet in `llms.txt`, `llms-full.txt`, `README.md`, and `AGENTS.md` is verified against the actual `vultorch` codebase (zero hallucinated or deprecated APIs).
+- [ ] **Runnable Cookbook Gate:** Every script in `examples/01_*.py` through `examples/06_*.py` executes end-to-end with exit code `0` on `vk:0` (and `cpu`), and is covered by a smoke test or CI check.
+- [ ] **Full Release Gate:** `./scripts/check.sh` passes 100% with zero warnings, clean wheel build (`pip wheel --no-build-isolation .`), and verified `LGPL-3.0-only` licensing metadata across `LICENSE`, `LICENSE.GPLv3`, `NOTICE`, `pyproject.toml`, and `README.md`.
 
 ---
 
@@ -383,6 +419,7 @@ flowchart TD
     P4["Phase 4 (Done)<br/>Slang FlashAttention-2 (Fwd+Bwd), RoPE, SwiGLU, Snake/Mamba,<br/>IEpilogue Fusion, amp.autocast + GradScaler, int4/int8 Linear, MultiGPU(['all'])"]
     P5["Phase 5: Advanced Autograd & Graph Capture<br/>autograd.Function, Checkpointing, Slang [Differentiable] AutoDiff,<br/>Reusable VulkanGraph (@vultorch.compile)"]
     P6["Phase 6: Async Multi-GPU & Ecosystem Interop<br/>Timeline Semaphore DMA Overlap, Closed-Loop Latency Balancer,<br/>clip_grad_norm_, LR Schedulers, Safetensors & DLPack"]
+    P7["Phase 7: AI Discoverability & Release Polish<br/>llms.txt + llms-full.txt, AGENTS.md,<br/>Canonical examples/ Cookbook, py.typed & PyPI Metadata"]
 
-    P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6
+    P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
 ```

@@ -52,6 +52,64 @@ A GPU tensor operation will **never** silently download data to host RAM or fall
 
 ## 💻 Code Examples
 
+### Drop-In PyTorch Substitution (Change Only the Imports)
+Standard PyTorch training code runs unchanged in VulTorch — swap only the `import` lines (and omit `device=...` to use VulTorch's default `vk:0` GPU):
+
+```python
+# PyTorch:
+# import torch
+# import torch.nn as nn
+# import torch.optim as optim
+# from torch.utils.data import TensorDataset, DataLoader
+
+# VulTorch (only the imports change):
+import vultorch as torch
+import vultorch.nn as nn
+import vultorch.optim as optim
+from vultorch.utils.data import TensorDataset, DataLoader
+
+torch.manual_seed(42)
+
+class MLP(nn.Module):
+    def __init__(self, in_dim=128, hidden_dim=64, num_classes=10):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, num_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+X = torch.randn(256, 128)
+y = torch.randint(0, 10, (256,))
+loader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=True)
+
+model = MLP()
+optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+criterion = nn.CrossEntropyLoss()
+
+model.train()
+for epoch in range(5):
+    total_loss = 0.0
+    for bx, by in loader:
+        optimizer.zero_grad()
+        loss = criterion(model(bx), by)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    print(f"Epoch {epoch + 1} | Avg Loss: {total_loss / len(loader):.4f}")
+
+model.eval()
+with torch.no_grad():
+    preds = model(X[:8]).argmax(dim=-1)
+    print("Pred shape:", preds.shape, "First pred:", preds[0].item())
+```
+
+---
+
 ### Example 1: End-to-End Neural Network Training (Pure GPU)
 Train a multi-layer neural network with `RMSNorm`, `GELU`, and fused `AdamW`:
 
@@ -247,4 +305,7 @@ Every operator is checked via finite-difference `torch.gradcheck` to guarantee a
 ---
 
 ## 📜 License
-Apache-2.0 License. Open-source, vendor-agnostic, and community-driven.
+**GNU Lesser General Public License v3.0 (`LGPL-3.0-only`)** — see [LICENSE](LICENSE) and [LICENSE.GPLv3](LICENSE.GPLv3).
+
+- **Free to use in hobbyist, research, and commercial/enterprise applications:** You can `import vultorch` in proprietary or closed-source applications and training pipelines without having to open-source your own application or model code.
+- **Anti-plagiarism copyleft on VulTorch itself:** Any modification to VulTorch's Slang shaders, C++ backend, or Python source, or any derivative library/Python package incorporating VulTorch code, must be released under LGPLv3 (or GPLv3) with full source code and attribution.
