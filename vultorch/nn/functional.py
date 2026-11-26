@@ -331,3 +331,432 @@ def geglu(a: Tensor, b: Optional[Tensor] = None) -> Tensor:
 
         out.grad_fn = Node("GeGLUBackward", geglu_backward, [a, b])
     return out
+
+
+def _autodiff_unary(x: Tensor, op_type: int, name: str, param: float = 0.0) -> Tensor:
+    out_nat = x._native.autodiff_unary_fwd(op_type, float(param))
+    req_grad = x.requires_grad and is_grad_enabled()
+    out = Tensor._from_native(out_nat, x.device, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        dev = x.device
+        x_ref = x.detach()
+
+        def _bwd(g: Tensor):
+            dx_nat = x_ref._native.autodiff_unary_bwd(
+                op_type, g.contiguous()._native, float(param)
+            )
+            return Tensor._from_native(dx_nat, dev, False)
+
+        out.grad_fn = Node(f"{name}Backward", _bwd, [x])
+    return out
+
+
+def mish(x: Tensor) -> Tensor:
+    """Mish activation backed by Slang `[Differentiable]` bwd_diff kernel."""
+    return _autodiff_unary(x, 0, "Mish")
+
+
+def hardswish(x: Tensor) -> Tensor:
+    """HardSwish activation backed by Slang `[Differentiable]` bwd_diff kernel."""
+    return _autodiff_unary(x, 1, "HardSwish")
+
+
+def leaky_relu(x: Tensor, negative_slope: float = 0.01) -> Tensor:
+    """LeakyReLU activation backed by Slang `[Differentiable]` bwd_diff kernel."""
+    return _autodiff_unary(x, 2, "LeakyReLU", float(negative_slope))
+
+
+def elu(x: Tensor, alpha: float = 1.0) -> Tensor:
+    """ELU activation backed by Slang `[Differentiable]` bwd_diff kernel."""
+    return _autodiff_unary(x, 3, "ELU", float(alpha))
+
+
+def smooth_l1_loss(
+    input: Tensor,
+    target: Tensor,
+    reduction: str = "mean",
+    beta: float = 1.0,
+) -> Tensor:
+    """Smooth L1 (Huber) loss backed by Slang `[Differentiable]` bwd_diff kernel."""
+    _check_same_device(input, target, "smooth_l1_loss")
+    out_nat = input._native.autodiff_binary_fwd(0, target._native, float(beta))
+    req_grad = (input.requires_grad or target.requires_grad) and is_grad_enabled()
+    out = Tensor._from_native(out_nat, input.device, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        dev = input.device
+        a_ref = input.detach()
+        b_ref = target.detach()
+
+        def _bwd(g: Tensor):
+            da_nat, db_nat = a_ref._native.autodiff_binary_bwd(
+                0, b_ref._native, g.contiguous()._native, float(beta)
+            )
+            da = Tensor._from_native(da_nat, dev, False) if input.requires_grad else None
+            db = Tensor._from_native(db_nat, dev, False) if target.requires_grad else None
+            return da, db
+
+        out.grad_fn = Node("SmoothL1Backward", _bwd, [input, target])
+
+    if reduction == "mean":
+        return out.mean()
+    if reduction == "sum":
+        return out.sum()
+    return out
+
+
+def cosine_similarity(x1: Tensor, x2: Tensor, dim: int = 1, eps: float = 1e-8) -> Tensor:
+    """Computes cosine similarity between `x1` and `x2` along `dim`."""
+    _check_same_device(x1, x2, "cosine_similarity")
+    num = (x1 * x2).sum(dim=dim)
+    n1 = (x1 * x1).sum(dim=dim).sqrt().clamp(min=eps)
+    n2 = (x2 * x2).sum(dim=dim).sqrt().clamp(min=eps)
+    return num / (n1 * n2)
+
+
+def selu(x: Tensor) -> Tensor:
+    alpha = 1.6732632423543772
+    scale = 1.0507009873554805
+    return scale * elu(x, alpha=alpha)
+
+
+def hardsigmoid(x: Tensor) -> Tensor:
+    return ((x + 3.0) / 6.0).clamp(min=0.0, max=1.0)
+
+
+def normalize(input: Tensor, p: float = 2.0, dim: int = 1, eps: float = 1e-12) -> Tensor:
+    denom = input.norm(p=p, dim=dim, keepdim=True).clamp(min=eps)
+    return input / denom
+
+
+def dropout(input: Tensor, p: float = 0.5, training: bool = True) -> Tensor:
+    if not training or p <= 0.0:
+        return input
+    if p >= 1.0:
+        return vultorch.zeros_like(input)
+    seed, offset = vultorch._next_philox_state()
+    out_nat = input._native.dropout_philox(float(p), seed, offset)
+    req_grad = input.requires_grad and is_grad_enabled()
+    out = Tensor._from_native(out_nat, input.device, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        dev = input.device
+        def _bwd(g: Tensor):
+            dx_nat = g._native.dropout_philox(float(p), seed, offset)
+            return Tensor._from_native(dx_nat, dev, False)
+        out.grad_fn = Node("DropoutBackward", _bwd, [input])
+    return out
+
+
+def mse_loss(input: Tensor, target: Tensor, reduction: str = "mean") -> Tensor:
+    diff = input - target
+    sq = diff * diff
+    if reduction == "mean":
+        return sq.mean()
+    if reduction == "sum":
+        return sq.sum()
+    return sq
+
+
+def l1_loss(input: Tensor, target: Tensor, reduction: str = "mean") -> Tensor:
+    diff = (input - target).abs()
+    if reduction == "mean":
+        return diff.mean()
+    if reduction == "sum":
+        return diff.sum()
+    return diff
+
+
+def binary_cross_entropy_with_logits(
+    input: Tensor, target: Tensor, reduction: str = "mean"
+) -> Tensor:
+    # Numerically stable: max(x, 0) - x * target + log(1 + exp(-|x|))
+    loss = input.relu() - input * target + ((-input.abs()).exp() + 1.0).log()
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    return loss
+
+
+def binary_cross_entropy(
+    input: Tensor, target: Tensor, reduction: str = "mean", eps: float = 1e-7
+) -> Tensor:
+    p = input.clamp(min=eps, max=1.0 - eps)
+    loss = -(target * p.log() + (1.0 - target) * (1.0 - p).log())
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    return loss
+
+
+def cross_entropy(input: Tensor, target: Tensor, reduction: str = "mean") -> Tensor:
+    from . import CrossEntropyLoss
+    return CrossEntropyLoss(reduction=reduction)(input, target)
+
+
+def nll_loss(input: Tensor, target: Tensor, reduction: str = "mean") -> Tensor:
+    one_hot_t = one_hot(target, num_classes=input.shape[-1]).cast(input.dtype)
+    loss = -(one_hot_t * input).sum(dim=-1)
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    return loss
+
+
+def kl_div(input: Tensor, target: Tensor, reduction: str = "mean", log_target: bool = False) -> Tensor:
+    if log_target:
+        loss = target.exp() * (target - input)
+    else:
+        safe_t = target.clamp(min=1e-12)
+        loss = target * (safe_t.log() - input)
+    if reduction == "mean":
+        return loss.mean()
+    if reduction == "sum":
+        return loss.sum()
+    return loss
+
+
+def one_hot(tensor: Tensor, num_classes: int = -1) -> Tensor:
+    if num_classes <= 0:
+        num_classes = int(tensor.amax().item()) + 1
+    z = vultorch.zeros(*tensor.shape, num_classes, device=tensor.device, dtype=vultorch.int64)
+    idx = tensor.unsqueeze(-1).cast(vultorch.int64)
+    return z.scatter(-1, idx, 1)
+
+
+def conv2d(
+    input: Tensor,
+    weight: Tensor,
+    bias: Optional[Tensor] = None,
+    stride=1,
+    padding=0,
+    groups: int = 1,
+) -> Tensor:
+    sh, sw = (stride, stride) if isinstance(stride, int) else tuple(stride)
+    ph, pw = (padding, padding) if isinstance(padding, int) else tuple(padding)
+    out_nat = input._native.conv2d(
+        weight._native,
+        bias._native if bias is not None else None,
+        sh, sw, ph, pw, groups, True,
+    )
+    req_grad = (
+        input.requires_grad or weight.requires_grad or (bias is not None and bias.requires_grad)
+    ) and is_grad_enabled()
+    out = Tensor._from_native(out_nat, input.device, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        dev = input.device
+        in_shape = list(input.shape)
+        w_shape = list(weight.shape)
+        inputs = [input, weight] + ([bias] if bias is not None else [])
+        def _bwd(g: Tensor):
+            gc = g.contiguous()
+            dx = (
+                Tensor._from_native(
+                    gc._native.conv2d_backward_input(weight._native, in_shape, sh, sw, ph, pw, groups, True),
+                    dev, False,
+                )
+                if input.requires_grad else None
+            )
+            dw = (
+                Tensor._from_native(
+                    gc._native.conv2d_backward_weight(input._native, w_shape, sh, sw, ph, pw, groups, True),
+                    dev, False,
+                )
+                if weight.requires_grad else None
+            )
+            res = [dx, dw]
+            if bias is not None:
+                db = gc.sum(dim=(0, 2, 3)) if bias.requires_grad else None
+                res.append(db)
+            return tuple(res)
+        out.grad_fn = Node("Conv2dBackward", _bwd, inputs)
+    return out
+
+
+def max_pool2d(input: Tensor, kernel_size, stride=None, padding=0) -> Tensor:
+    kh, kw = (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+    if stride is None:
+        sh, sw = kh, kw
+    else:
+        sh, sw = (stride, stride) if isinstance(stride, int) else tuple(stride)
+    ph, pw = (padding, padding) if isinstance(padding, int) else tuple(padding)
+    out_nat, idx_nat = input._native.maxpool2d(kh, kw, sh, sw, ph, pw)
+    req_grad = input.requires_grad and is_grad_enabled()
+    out = Tensor._from_native(out_nat, input.device, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        dev = input.device
+        in_shape = list(input.shape)
+        def _bwd(g: Tensor):
+            dx = g.contiguous()._native.maxpool2d_backward(idx_nat, in_shape, kh, kw, sh, sw, ph, pw)
+            return Tensor._from_native(dx, dev, False)
+        out.grad_fn = Node("MaxPool2dBackward", _bwd, [input])
+    return out
+
+
+def avg_pool2d(input: Tensor, kernel_size, stride=None, padding=0, count_include_pad: bool = True) -> Tensor:
+    kh, kw = (kernel_size, kernel_size) if isinstance(kernel_size, int) else tuple(kernel_size)
+    if stride is None:
+        sh, sw = kh, kw
+    else:
+        sh, sw = (stride, stride) if isinstance(stride, int) else tuple(stride)
+    ph, pw = (padding, padding) if isinstance(padding, int) else tuple(padding)
+    out_nat = input._native.avgpool2d(kh, kw, sh, sw, ph, pw, count_include_pad, False, 1, 1)
+    req_grad = input.requires_grad and is_grad_enabled()
+    out = Tensor._from_native(out_nat, input.device, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        dev = input.device
+        in_shape = list(input.shape)
+        def _bwd(g: Tensor):
+            dx = g.contiguous()._native.avgpool2d_backward(in_shape, kh, kw, sh, sw, ph, pw, count_include_pad, False)
+            return Tensor._from_native(dx, dev, False)
+        out.grad_fn = Node("AvgPool2dBackward", _bwd, [input])
+    return out
+
+
+def layer_norm(
+    input: Tensor,
+    normalized_shape,
+    weight: Optional[Tensor] = None,
+    bias: Optional[Tensor] = None,
+    eps: float = 1e-5,
+) -> Tensor:
+    norm_dims = len(normalized_shape) if isinstance(normalized_shape, (tuple, list)) else 1
+    out_nat = input._native.layernorm(
+        weight._native if weight is not None else None,
+        bias._native if bias is not None else None,
+        float(eps), norm_dims,
+    )
+    req_grad = (
+        input.requires_grad
+        or (weight is not None and weight.requires_grad)
+        or (bias is not None and bias.requires_grad)
+    ) and is_grad_enabled()
+    out = Tensor._from_native(out_nat, input.device, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        dev = input.device
+        inputs = [input] + ([weight] if weight is not None else []) + ([bias] if bias is not None else [])
+        def _bwd(g: Tensor):
+            dx, dw, db = input._native.layernorm_backward(
+                g.contiguous()._native,
+                weight._native if weight is not None else None,
+                float(eps), norm_dims,
+                input.requires_grad,
+                weight is not None and weight.requires_grad,
+                bias is not None and bias.requires_grad,
+            )
+            res = [Tensor._from_native(dx, dev, False) if input.requires_grad else None]
+            if weight is not None:
+                res.append(Tensor._from_native(dw, dev, False) if weight.requires_grad else None)
+            if bias is not None:
+                res.append(Tensor._from_native(db, dev, False) if bias.requires_grad else None)
+            return tuple(res)
+        out.grad_fn = Node("LayerNormBackward", _bwd, inputs)
+    return out
+
+
+def rms_norm(
+    input: Tensor,
+    normalized_shape,
+    weight: Optional[Tensor] = None,
+    eps: float = 1e-6,
+) -> Tensor:
+    norm_dims = len(normalized_shape) if isinstance(normalized_shape, (tuple, list)) else 1
+    out_nat = input._native.rmsnorm(
+        weight._native if weight is not None else None, float(eps), norm_dims
+    )
+    req_grad = (input.requires_grad or (weight is not None and weight.requires_grad)) and is_grad_enabled()
+    out = Tensor._from_native(out_nat, input.device, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        dev = input.device
+        inputs = [input] + ([weight] if weight is not None else [])
+        def _bwd(g: Tensor):
+            dx, dw = input._native.rmsnorm_backward(
+                g.contiguous()._native,
+                weight._native if weight is not None else None,
+                float(eps), norm_dims,
+                input.requires_grad,
+                weight is not None and weight.requires_grad,
+            )
+            res = [Tensor._from_native(dx, dev, False) if input.requires_grad else None]
+            if weight is not None:
+                res.append(Tensor._from_native(dw, dev, False) if weight.requires_grad else None)
+            return tuple(res)
+        out.grad_fn = Node("RMSNormBackward", _bwd, inputs)
+    return out
+
+
+def embedding(input: Tensor, weight: Tensor, padding_idx: Optional[int] = None) -> Tensor:
+    pad = -1 if padding_idx is None else int(padding_idx)
+    out_nat = input._native.embedding(weight._native, pad)
+    req_grad = weight.requires_grad and is_grad_enabled()
+    out = Tensor._from_native(out_nat, weight.device, req_grad)
+    if req_grad:
+        out.is_leaf = False
+        dev = weight.device
+        num_emb = weight.shape[0]
+        idx_ref = input.detach()
+        def _bwd(g: Tensor):
+            dw = g.contiguous()._native.embedding_backward(idx_ref._native, num_emb, pad)
+            return Tensor._from_native(dw, dev, False)
+        out.grad_fn = Node("EmbeddingBackward", _bwd, [weight])
+    return out
+
+
+def interpolate(
+    input: Tensor,
+    size=None,
+    scale_factor=None,
+    mode: str = "nearest",
+    align_corners: Optional[bool] = None,
+) -> Tensor:
+    H, W = input.shape[-2], input.shape[-1]
+    if size is not None:
+        oh, ow = (size, size) if isinstance(size, int) else tuple(size)
+    elif scale_factor is not None:
+        sh, sw = (scale_factor, scale_factor) if isinstance(scale_factor, (int, float)) else tuple(scale_factor)
+        oh, ow = int(H * sh), int(W * sw)
+    else:
+        raise ValueError("interpolate requires size or scale_factor")
+
+    dev = input.device
+    if mode == "nearest":
+        if oh % H == 0 and ow % W == 0:
+            return input.repeat_interleave(oh // H, dim=-2).repeat_interleave(ow // W, dim=-1)
+        iy = vultorch.linspace(0, H - 1, oh, device=dev).round().clamp(0, H - 1).cast(vultorch.int32)
+        ix = vultorch.linspace(0, W - 1, ow, device=dev).round().clamp(0, W - 1).cast(vultorch.int32)
+        return input.index_select(-2, iy).index_select(-1, ix)
+
+    # Bilinear interpolation using GPU index_select + lerp (full autograd)
+    ac = bool(align_corners) if align_corners is not None else False
+    if ac and oh > 1:
+        ys = vultorch.linspace(0.0, float(H - 1), oh, device=dev)
+    else:
+        ys = ((vultorch.arange(oh, device=dev) + 0.5) * (float(H) / float(oh)) - 0.5).clamp(0.0, float(H - 1))
+    if ac and ow > 1:
+        xs = vultorch.linspace(0.0, float(W - 1), ow, device=dev)
+    else:
+        xs = ((vultorch.arange(ow, device=dev) + 0.5) * (float(W) / float(ow)) - 0.5).clamp(0.0, float(W - 1))
+
+    y0 = ys.floor().clamp(0, H - 1).cast(vultorch.int32)
+    y1 = (ys.floor() + 1.0).clamp(0, H - 1).cast(vultorch.int32)
+    wy = (ys - ys.floor()).reshape((1, 1, oh, 1))
+
+    x0 = xs.floor().clamp(0, W - 1).cast(vultorch.int32)
+    x1 = (xs.floor() + 1.0).clamp(0, W - 1).cast(vultorch.int32)
+    wx = (xs - xs.floor()).reshape((1, 1, 1, ow))
+
+    top = input.index_select(-2, y0)
+    bot = input.index_select(-2, y1)
+    v_interp = top.lerp(bot, wy)
+    left = v_interp.index_select(-1, x0)
+    right = v_interp.index_select(-1, x1)
+    return left.lerp(right, wx)

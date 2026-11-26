@@ -163,6 +163,13 @@ set(SLANG_KERNELS
     gemm_quant:amp_unscale_check
 )
 
+macro(vultorch_add_slang_autodiff_shader SLANG_FILE FWD_ENTRY BWD_ENTRY)
+    list(APPEND SLANG_KERNELS "${SLANG_FILE}:${FWD_ENTRY}" "${SLANG_FILE}:${BWD_ENTRY}")
+endmacro()
+
+vultorch_add_slang_autodiff_shader(autodiff_ops autodiff_unary_fwd autodiff_unary_bwd)
+vultorch_add_slang_autodiff_shader(autodiff_ops autodiff_binary_fwd autodiff_binary_bwd)
+
 set(SPV_OUTPUTS)
 foreach(kernel ${SLANG_KERNELS})
     string(REPLACE ":" ";" parts "${kernel}")
@@ -187,6 +194,7 @@ add_custom_target(vultorch_shaders ALL DEPENDS ${SPV_OUTPUTS})
 # Extension module
 set(SOURCES
     src/runtime/vk_context.cpp
+    src/runtime/vk_graph.cpp
     src/runtime/vk_memory.cpp
     src/runtime/vk_pipeline.cpp
     src/tensor/core.cpp

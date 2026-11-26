@@ -112,6 +112,58 @@ inline float apply_unary_op(uint32_t op, float x, float p1 = 0.0f,
     return (x > 0.0f) ? 1.0f : ((x < 0.0f) ? -1.0f : 0.0f);
   case 15:
     return x * p1 + p2;
+  case 16:
+    return std::nearbyint(x);
+  case 17:
+    return std::ceil(x);
+  case 18:
+    return std::floor(x);
+  case 19:
+    return std::trunc(x);
+  case 20:
+    return x - std::trunc(x);
+  case 21:
+    return x * x;
+  case 22:
+    return 1.0f / x;
+  case 23:
+    return std::exp2(x);
+  case 24:
+    return std::expm1(x);
+  case 25:
+    return std::log2(x);
+  case 26:
+    return std::log10(x);
+  case 27:
+    return std::log1p(x);
+  case 28:
+    return std::tan(x);
+  case 29:
+    return std::asin(x);
+  case 30:
+    return std::acos(x);
+  case 31:
+    return std::atan(x);
+  case 32:
+    return std::sinh(x);
+  case 33:
+    return std::cosh(x);
+  case 34:
+    return std::asinh(x);
+  case 35:
+    return std::acosh(x);
+  case 36:
+    return std::atanh(x);
+  case 37:
+    return std::erf(x);
+  case 38:
+    return std::erfc(x);
+  case 39:
+    return std::isnan(x) ? 1.0f : 0.0f;
+  case 40:
+    return std::isinf(x) ? 1.0f : 0.0f;
+  case 41:
+    return std::isfinite(x) ? 1.0f : 0.0f;
   default:
     throw std::runtime_error("Unsupported unary op_type: " +
                              std::to_string(op));

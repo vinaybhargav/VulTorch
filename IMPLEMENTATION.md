@@ -317,6 +317,29 @@ PyTorch power users rely on custom `autograd.Function`, higher-order gradients (
   - Calling `graph.replay()` submits the entire multi-layer step in a **single `vkQueueSubmit`** with zero Python or C++ per-op overhead.
   - Expose `@vultorch.compile` decorator that automatically captures a `VulkanGraph` keyed on input shapes/dtypes.
 
+### 5.4 Zero-Roundtrip GPU Helper Ops & Constructors (Eliminate PCIe Transfers)
+To ensure users and ported PyTorch models never fall back to `.numpy()` over PCIe mid-step:
+- **Slang Elementwise & Math Kernels (`shaders/elementwise_unary_*.slang`, `shaders/elementwise_binary_*.slang`):**
+  - Rounding & truncation: `round`, `ceil`, `floor`, `trunc`, `frac`.
+  - Powers, logs, & exponentials: `square`, `reciprocal`, `exp2`, `expm1`, `log2`, `log10`, `log1p`, `fmod`, `remainder`, `hypot`, `copysign`.
+  - Trig, hyperbolic, & special: `tan`, `asin`, `acos`, `atan`, `atan2`, `sinh`, `cosh`, `asinh`, `acosh`, `atanh`, `erf`, `erfc`.
+  - On-GPU NaN/Inf & tolerance checks (no host sync): `isnan`, `isinf`, `isfinite`, `nan_to_num`, `isclose`, `allclose`, `equal`.
+  - Bitwise ops for integer/bool tensors: `bitwise_and`, `bitwise_or`, `bitwise_xor`, `bitwise_not`.
+- **Expose Existing C++/Slang Ops to Python (`vultorch.*` & `Tensor.*`):**
+  - `pow`, `neg`, `maximum`, `minimum`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `lerp`, `addcmul`, `addcdiv`, `logical_and`, `logical_or`, `logical_not`, `logical_xor`, `min` (`reduce_min`), `amin`, `amax`, `nonzero`, `masked_select`.
+- **Zero-PCIe GPU Constructors & DataLoader Shuffling:**
+  - Replace NumPy+upload in `vultorch.randint`, `vultorch.arange`, `vultorch.linspace`, and `vultorch.eye` with pure Slang GPU generator kernels when `device` is `vk:*`.
+  - Add `empty_like`, `full_like`, `rand_like`, `randn_like`, `randint_like`, `logspace`, `diag`, `diagonal`, `trace`, `meshgrid`, and `randperm` (on-GPU Philox + bitonic sort).
+  - Update `DataLoader` to generate shuffled batch indices on-GPU via `randperm` when `TensorDataset` already resides on `vk:*`, eliminating per-batch index-tensor PCIe uploads.
+
+### 5.5 PyTorch Drop-In `Tensor`, `nn`, & `nn.functional` Parity
+- **`Tensor` & Top-Level Shape/Utility Parity:**
+  - `Tensor.tolist()`, `Tensor.size(dim=None)`, `Tensor.dim()`, `Tensor.is_floating_point()`, `Tensor.requires_grad_(mode=True)`, `Tensor.retain_grad()`, `Tensor.type_as(other)`.
+  - Top-level `vultorch.*` aliases: `squeeze`, `unsqueeze`, `flatten`, `reshape`, `all`, `any`, `clone`, `detach`, `masked_fill`, `concat`, `concatenate`, `hstack`, `vstack`, `unbind`, `tile`, `movedim`, `moveaxis`, `swapaxes`, `swapdims`, `broadcast_to`, `argsort`, `unique`, `bincount`.
+- **`vultorch.nn.functional` (`F.*`) & `nn.*` Parity:**
+  - Expose `F.*` wrappers for existing GPU kernels: `F.conv1d`, `F.conv2d`, `F.conv_transpose2d`, `F.max_pool2d`, `F.avg_pool2d`, `F.adaptive_avg_pool2d`, `F.layer_norm`, `F.rms_norm`, `F.batch_norm`, `F.group_norm`, `F.dropout`, `F.embedding`, `F.cross_entropy`, `F.mse_loss`, `F.interpolate`, `F.one_hot`.
+  - Add functional + module ops: `F.leaky_relu`/`nn.LeakyReLU`, `F.elu`/`nn.ELU`, `F.selu`, `F.mish`/`nn.Mish`, `F.hardswish`/`nn.Hardswish`, `F.hardsigmoid`, `F.l1_loss`/`nn.L1Loss`, `F.smooth_l1_loss`/`nn.SmoothL1Loss`, `F.nll_loss`, `F.binary_cross_entropy`, `F.binary_cross_entropy_with_logits`/`nn.BCEWithLogitsLoss`, `F.kl_div`, `F.normalize`, `F.cosine_similarity`/`nn.CosineSimilarity`, `nn.Identity`, `nn.Upsample`, `nn.ParameterList`, `nn.ModuleDict`.
+
 ### Phase 5 Acceptance Criteria (Must Pass Before Starting Phase 6)
 - [ ] **Autograd Completeness:**
   - Custom multi-input, multi-output `vultorch.autograd.Function` subclasses pass `gradcheck`.
@@ -329,6 +352,9 @@ PyTorch power users rely on custom `autograd.Function`, higher-order gradients (
 - [ ] **Ease-of-Use & Transparent `@vultorch.compile` Gate:**
   - Decorating any function or `nn.Module` with `@vultorch.compile` (or calling `model = vultorch.compile(model)`) requires **zero manual graph capture boilerplate** (`VulkanGraph` is captured, cached by input shape/dtype, and safely invalidated or re-captured on dynamic shape changes behind the scenes).
   - Custom operations written with `vultorch.autograd.Function` follow the exact PyTorch `forward(ctx, ...)` / `backward(ctx, ...)` signature so users can copy-paste custom PyTorch autograd functions without modification.
+- [ ] **Zero-Roundtrip GPU Helper & Parity Gate:**
+  - All new math/elementwise/comparison/NaN-check ops (`round`, `ceil`, `floor`, `trunc`, `pow`, `erf`, `isnan`, `isclose`, `lerp`, `maximum`, `minimum`, etc.), GPU constructors (`randint`, `arange`, `linspace`, `eye`, `randperm`, `*_like`), and `F.*` wrappers execute 100% in Slang on `vk:0`/`vk:1` with **zero `.numpy()` fallbacks** and zero PCIe roundtrips during training/inference steps.
+  - All differentiable new ops (`pow`, `square`, `reciprocal`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `erf`, `lerp`, `maximum`, `minimum`, `F.l1_loss`, `F.binary_cross_entropy_with_logits`, etc.) pass `gradcheck` across `cpu`, `vk:0`, and `vk:1`.
 
 ---
 
@@ -358,6 +384,23 @@ To make VulTorch a production-ready drop-in replacement for PyTorch on multi-ven
   - Implement native `.safetensors` reader/writer (`vultorch.save_safetensors`, `vultorch.load_safetensors`) using `mmap` directly into the persistent Vulkan staging ring for fast weight loading.
   - Implement `__dlpack__` and `from_dlpack` for zero-copy CPU tensor exchange with NumPy,jax, and PyTorch.
 
+### 6.3 Real-World Neural Network, Initialization & Optimizer Parity
+- **Recurrent & Transformer Containers (`vultorch/nn/`):**
+  - Add `nn.RNN`, `nn.LSTM`, and `nn.GRU` (`num_layers`, `bidirectional`, `batch_first`, `dropout`) backed by Slang fused gate kernels.
+  - Add `nn.TransformerEncoder`, `nn.TransformerEncoderLayer`, `nn.TransformerDecoder`, `nn.TransformerDecoderLayer` (using FlashAttention-2), plus `nn.InstanceNorm1d`/`2d`, `nn.PixelShuffle`, `nn.ConvTranspose1d`, and padding layers (`ZeroPad2d`, `ReflectionPad2d`).
+- **On-GPU `nn.init` & Optimizer Completeness:**
+  - Add `vultorch.nn.init` (`xavier_uniform_`, `xavier_normal_`, `kaiming_uniform_`, `kaiming_normal_`, `normal_`, `uniform_`, `zeros_`, `ones_`, `constant_`, `orthogonal_`) powered by GPU Philox RNG.
+  - Add `optim.RMSprop` and `optim.Adagrad`, plus `state_dict()` / `load_state_dict()` across all optimizers and LR schedulers for seamless training resume.
+
+### 6.4 Contractions (`einsum`), `linalg`/`fft`, & Checkpoint/DataLoader Parity
+- **Tensor Contractions & BLAS-Style Ops (`vultorch.*`):**
+  - Implement `vultorch.einsum`, `vultorch.bmm`, `vultorch.mm`, `vultorch.mv`, `vultorch.dot`, `vultorch.outer`, `vultorch.tensordot`, `vultorch.addmm`, `vultorch.baddbmm` lowered onto VulTorch's tiled/Cooperative-Matrix GEMM with full autograd.
+- **`vultorch.linalg` & `vultorch.fft` Essentials:**
+  - Add `vultorch.linalg` (`norm`, `vector_norm`, `matrix_norm`, `solve`, `inv`, `cholesky`, `qr`, `svd`) and `vultorch.fft` (`fft`, `ifft`, `rfft`, `irfft`, `stft`, `istft`) for scientific, audio, and Snake-based models.
+- **`Module`, Checkpoint, & `DataLoader` Compatibility:**
+  - Full `state_dict()`, `load_state_dict(strict=...)`, `named_parameters()`, `named_buffers()`, `register_buffer()`, and `apply(fn)` parity.
+  - `vultorch.save` / `vultorch.load` supporting `map_location` and `weights_only`, and `DataLoader` supporting `num_workers` and `pin_memory` (backed by the persistent Vulkan staging ring).
+
 ### Phase 6 Acceptance Criteria (Must Pass Before Starting Phase 7)
 - [ ] **Closed-Loop Multi-GPU Scaling Gate:**
   - On heterogeneous `[vk:0, vk:1]` (Intel Iris Xe + NVIDIA MX450), `DataParallel(..., balance="auto")`:
@@ -369,6 +412,8 @@ To make VulTorch a production-ready drop-in replacement for PyTorch on multi-ven
 - [ ] **Ease-of-Use & Drop-In PyTorch Experience Gate:**
   - Loading/saving models (`model.save_pretrained("path.safetensors")` / `model.load_pretrained("path.safetensors")` or standard `torch.save` / `torch.load` / `model.state_dict()`), stepping LR schedulers (`scheduler.step()`), and clipping gradients (`nn.utils.clip_grad_norm_(model.parameters(), 1.0)`) work with single-line calls identical to PyTorch.
   - A complete newcomer can train, evaluate, quantize, save, and reload a CNN, Transformer, or Mamba/Snake model in `< 20` lines of clean Python without ever touching Vulkan handles, device IDs, or manual synchronization calls.
+- [ ] **Real-World PyTorch Model Compatibility Gate:**
+  - Standard real-world PyTorch architectures (ResNet/UNet with `nn.init`, `LSTM`/`GRU` sequence models, `TransformerEncoder`, and audio/spectral models using `stft`/`einsum`) run end-to-end with only `import vultorch as torch` and `"vk:0"` device selection, matching PyTorch outputs and gradients within `rtol=1e-3, atol=1e-3`.
 
 ---
 
@@ -417,8 +462,8 @@ flowchart TD
     P2["Phase 2 (Done)<br/>Zero-Copy Strided Views (as_strided), Multi-Dtype (fp16/int64/bool),<br/>2-Level Arena Sub-Allocator & Persistent Staging Ring"]
     P3["Phase 3 (Done)<br/>where/gather/scatter, Multi-Axis cat/pad/tril,<br/>cumsum/sort/topk, im2col+GEMM Conv2d, BatchNorm2d/GroupNorm"]
     P4["Phase 4 (Done)<br/>Slang FlashAttention-2 (Fwd+Bwd), RoPE, SwiGLU, Snake/Mamba,<br/>IEpilogue Fusion, amp.autocast + GradScaler, int4/int8 Linear, MultiGPU(['all'])"]
-    P5["Phase 5: Advanced Autograd & Graph Capture<br/>autograd.Function, Checkpointing, Slang [Differentiable] AutoDiff,<br/>Reusable VulkanGraph (@vultorch.compile)"]
-    P6["Phase 6: Async Multi-GPU & Ecosystem Interop<br/>Timeline Semaphore DMA Overlap, Closed-Loop Latency Balancer,<br/>clip_grad_norm_, LR Schedulers, Safetensors & DLPack"]
+    P5["Phase 5: Autograd, Graph Capture & Zero-PCIe Parity<br/>autograd.Function, Checkpointing, Slang [Differentiable],<br/>VulkanGraph (@vultorch.compile), GPU Math/F.* Parity"]
+    P6["Phase 6: Async Multi-GPU & Real-World PyTorch Parity<br/>Timeline Semaphore DMA, Closed-Loop Balancer, Safetensors/DLPack,<br/>RNN/LSTM/GRU, nn.init, einsum, linalg/fft, LR Schedulers"]
     P7["Phase 7: AI Discoverability & Release Polish<br/>llms.txt + llms-full.txt, AGENTS.md,<br/>Canonical examples/ Cookbook, py.typed & PyPI Metadata"]
 
     P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7

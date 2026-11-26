@@ -13,6 +13,7 @@
 namespace vultorch {
 
 class VulkanBuffer;
+class VulkanGraph;
 
 struct CooperativeMatrixConfig {
   uint32_t M;
@@ -143,6 +144,14 @@ public:
       const std::vector<std::shared_ptr<VulkanBuffer>> &buffers = {}) {
     std::lock_guard<std::mutex> lock(submit_mutex);
 
+    if (active_graph != nullptr) {
+      VkCommandBuffer gcmd = active_graph_cmd();
+      const DescriptorAllocation descriptor = recorder(gcmd);
+      add_compute_barrier(gcmd);
+      finish_graph_dispatch(descriptor, buffers);
+      return;
+    }
+
     if (pending_descriptors.size() >= kMaxPendingDescSets) {
       // Pool pressure: complete outstanding work so sets can be recycled.
       synchronize_locked();
@@ -197,6 +206,8 @@ public:
   uint32_t open_batch_ops() const { return ops_in_batch; }
 
 private:
+  friend class VulkanGraph;
+
   struct Slot {
     VkCommandBuffer cmd = VK_NULL_HANDLE;
     VkFence fence = VK_NULL_HANDLE;
@@ -215,11 +226,18 @@ private:
 
   std::atomic<uint64_t> batches_submitted{0};
   std::atomic<uint64_t> dispatches_recorded{0};
+  VulkanGraph *active_graph = nullptr;
+  bool graph_submitted_since_sync = false;
 
   void open_batch_locked();
   void flush_locked();
   void synchronize_locked();
   static void add_compute_barrier(VkCommandBuffer cmd);
+
+  VkCommandBuffer active_graph_cmd() const;
+  void finish_graph_dispatch(
+      const DescriptorAllocation &descriptor,
+      const std::vector<std::shared_ptr<VulkanBuffer>> &buffers);
 };
 
 class VulkanManager {

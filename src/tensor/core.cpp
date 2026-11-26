@@ -296,6 +296,7 @@ void NativeTensor::copy_from_native(const std::shared_ptr<NativeTensor> &src) {
   } else {
     std::memcpy(cpu_raw_ptr(), src_ready->cpu_raw_ptr(), nbytes());
   }
+  bump_version();
 }
 
 std::shared_ptr<NativeTensor>
@@ -350,6 +351,7 @@ void NativeTensor::copy_from_raw_bytes(const void *src, size_t byte_count) {
   size_t copy_bytes = std::min(byte_count, nbytes());
   if (copy_bytes == 0)
     return;
+  bump_version();
   if (device_id >= 0) {
     VulkanMemoryManager::instance().copy_host_to_device(
         device_id, src, gpu_buf(), static_cast<VkDeviceSize>(copy_bytes));
@@ -439,6 +441,7 @@ void NativeTensor::fill_(float val) {
   }
   if (numel == 0)
     return;
+  bump_version();
 
   if (device_id < 0) {
     if (dtype == ScalarType::Float32) {

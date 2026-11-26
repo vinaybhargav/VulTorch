@@ -769,6 +769,266 @@ class Tensor:
         native_out = self._native.unary_op(14)
         return Tensor(native_out, device=self.device, requires_grad=False)
 
+    def _unary_simple(self, op_code: int, name: str, bwd_fn=None) -> 'Tensor':
+        native_out = self._native.unary_op(op_code)
+        req_grad = (bwd_fn is not None) and self.requires_grad and is_grad_enabled()
+        out = Tensor(native_out, device=self.device, requires_grad=req_grad)
+        if req_grad:
+            out.is_leaf = False
+            out.grad_fn = Node(name, lambda g: bwd_fn(g, out), [self])
+        return out
+
+    def round(self) -> 'Tensor':
+        return self._unary_simple(16, "RoundBackward")
+
+    def ceil(self) -> 'Tensor':
+        return self._unary_simple(17, "CeilBackward")
+
+    def floor(self) -> 'Tensor':
+        return self._unary_simple(18, "FloorBackward")
+
+    def trunc(self) -> 'Tensor':
+        return self._unary_simple(19, "TruncBackward")
+
+    def frac(self) -> 'Tensor':
+        return self._unary_simple(20, "FracBackward", lambda g, _o: g)
+
+    def square(self) -> 'Tensor':
+        return self._unary_simple(21, "SquareBackward", lambda g, _o: g * (2.0 * self))
+
+    def reciprocal(self) -> 'Tensor':
+        return self._unary_simple(22, "ReciprocalBackward", lambda g, o: -g * o * o)
+
+    def neg(self) -> 'Tensor':
+        return -self
+
+    def pow(self, exponent) -> 'Tensor':
+        return self ** exponent
+
+    def exp2(self) -> 'Tensor':
+        ln2 = 0.6931471805599453
+        return self._unary_simple(23, "Exp2Backward", lambda g, o: g * o * ln2)
+
+    def expm1(self) -> 'Tensor':
+        return self._unary_simple(24, "Expm1Backward", lambda g, o: g * (o + 1.0))
+
+    def log2(self) -> 'Tensor':
+        inv_ln2 = 1.4426950408889634
+        return self._unary_simple(25, "Log2Backward", lambda g, _o: g * inv_ln2 / self)
+
+    def log10(self) -> 'Tensor':
+        inv_ln10 = 0.4342944819032518
+        return self._unary_simple(26, "Log10Backward", lambda g, _o: g * inv_ln10 / self)
+
+    def log1p(self) -> 'Tensor':
+        return self._unary_simple(27, "Log1pBackward", lambda g, _o: g / (self + 1.0))
+
+    def tan(self) -> 'Tensor':
+        return self._unary_simple(28, "TanBackward", lambda g, o: g * (1.0 + o * o))
+
+    def asin(self) -> 'Tensor':
+        return self._unary_simple(29, "AsinBackward", lambda g, _o: g * (1.0 - self * self).rsqrt())
+
+    def acos(self) -> 'Tensor':
+        return self._unary_simple(30, "AcosBackward", lambda g, _o: -g * (1.0 - self * self).rsqrt())
+
+    def atan(self) -> 'Tensor':
+        return self._unary_simple(31, "AtanBackward", lambda g, _o: g / (1.0 + self * self))
+
+    def sinh(self) -> 'Tensor':
+        return self._unary_simple(32, "SinhBackward", lambda g, _o: g * self.cosh())
+
+    def cosh(self) -> 'Tensor':
+        return self._unary_simple(33, "CoshBackward", lambda g, _o: g * self.sinh())
+
+    def asinh(self) -> 'Tensor':
+        return self._unary_simple(34, "AsinhBackward", lambda g, _o: g * (self * self + 1.0).rsqrt())
+
+    def acosh(self) -> 'Tensor':
+        return self._unary_simple(35, "AcoshBackward", lambda g, _o: g * (self * self - 1.0).rsqrt())
+
+    def atanh(self) -> 'Tensor':
+        return self._unary_simple(36, "AtanhBackward", lambda g, _o: g / (1.0 - self * self))
+
+    def erf(self) -> 'Tensor':
+        two_over_sqrt_pi = 1.1283791670955126
+        return self._unary_simple(37, "ErfBackward", lambda g, _o: g * two_over_sqrt_pi * (-(self * self)).exp())
+
+    def erfc(self) -> 'Tensor':
+        two_over_sqrt_pi = 1.1283791670955126
+        return self._unary_simple(38, "ErfcBackward", lambda g, _o: -g * two_over_sqrt_pi * (-(self * self)).exp())
+
+    def isnan(self) -> 'Tensor':
+        return Tensor(self._native.unary_op(39).cast("bool"), device=self.device, requires_grad=False)
+
+    def isinf(self) -> 'Tensor':
+        return Tensor(self._native.unary_op(40).cast("bool"), device=self.device, requires_grad=False)
+
+    def isfinite(self) -> 'Tensor':
+        return Tensor(self._native.unary_op(41).cast("bool"), device=self.device, requires_grad=False)
+
+    def nan_to_num(self, nan: float = 0.0, posinf: Optional[float] = None, neginf: Optional[float] = None) -> 'Tensor':
+        import vultorch
+        hi = 3.4028235e+38 if posinf is None else float(posinf)
+        lo = -3.4028235e+38 if neginf is None else float(neginf)
+        out = vultorch.where(self.isnan(), float(nan), self)
+        pos_inf_mask = self.isinf() & (self > 0.0)
+        neg_inf_mask = self.isinf() & (self < 0.0)
+        out = vultorch.where(pos_inf_mask, hi, out)
+        out = vultorch.where(neg_inf_mask, lo, out)
+        return out
+
+    def cast(self, dtype) -> 'Tensor':
+        dt = parse_dtype(dtype)
+        if dt == self.dtype:
+            return self
+        return Tensor(self._native.cast(dt.name), device=self.device, requires_grad=self.requires_grad and dt.is_floating_point)
+
+    def __and__(self, other: 'Tensor') -> 'Tensor':
+        return self.logical_and(other)
+
+    def __or__(self, other: 'Tensor') -> 'Tensor':
+        return self.logical_or(other)
+
+    def __invert__(self) -> 'Tensor':
+        return self.logical_not()
+
+    def maximum(self, other) -> 'Tensor':
+        other_t = other if isinstance(other, Tensor) else Tensor(other, device=self.device, dtype=self.dtype)
+        if other_t.device != self.device:
+            other_t = other_t.to(self.device)
+        native_out = self._native.binary_op(5, other_t._native)
+        req_grad = (self.requires_grad or other_t.requires_grad) and is_grad_enabled()
+        out = Tensor(native_out, device=self.device, requires_grad=req_grad)
+        if req_grad:
+            out.is_leaf = False
+            import vultorch
+            mask_a = self >= other_t
+            def _max_bwd(g: 'Tensor'):
+                ga = vultorch.where(mask_a, g, 0.0) if self.requires_grad else None
+                gb = vultorch.where(mask_a, 0.0, g) if other_t.requires_grad else None
+                return ga, gb
+            out.grad_fn = Node("MaximumBackward", _max_bwd, [self, other_t])
+        return out
+
+    def minimum(self, other) -> 'Tensor':
+        other_t = other if isinstance(other, Tensor) else Tensor(other, device=self.device, dtype=self.dtype)
+        if other_t.device != self.device:
+            other_t = other_t.to(self.device)
+        native_out = self._native.binary_op(6, other_t._native)
+        req_grad = (self.requires_grad or other_t.requires_grad) and is_grad_enabled()
+        out = Tensor(native_out, device=self.device, requires_grad=req_grad)
+        if req_grad:
+            out.is_leaf = False
+            import vultorch
+            mask_a = self <= other_t
+            def _min_bwd(g: 'Tensor'):
+                ga = vultorch.where(mask_a, g, 0.0) if self.requires_grad else None
+                gb = vultorch.where(mask_a, 0.0, g) if other_t.requires_grad else None
+                return ga, gb
+            out.grad_fn = Node("MinimumBackward", _min_bwd, [self, other_t])
+        return out
+
+    def lerp(self, end: 'Tensor', weight) -> 'Tensor':
+        return self + weight * (end - self)
+
+    def eq(self, other) -> 'Tensor':
+        return self == other
+
+    def ne(self, other) -> 'Tensor':
+        return self != other
+
+    def lt(self, other) -> 'Tensor':
+        return self < other
+
+    def le(self, other) -> 'Tensor':
+        return self <= other
+
+    def gt(self, other) -> 'Tensor':
+        return self > other
+
+    def ge(self, other) -> 'Tensor':
+        return self >= other
+
+    def logical_and(self, other: 'Tensor') -> 'Tensor':
+        b = other if other.device == self.device else other.to(self.device)
+        return (((self != 0.0).cast("float32") * (b != 0.0).cast("float32")) != 0.0)
+
+    def logical_or(self, other: 'Tensor') -> 'Tensor':
+        b = other if other.device == self.device else other.to(self.device)
+        return (((self != 0.0).cast("float32") + (b != 0.0).cast("float32")) != 0.0)
+
+    def logical_not(self) -> 'Tensor':
+        return self == 0.0
+
+    def logical_xor(self, other: 'Tensor') -> 'Tensor':
+        return (self.logical_or(other)).logical_and(self.logical_and(other).logical_not())
+
+    def tolist(self):
+        return self.numpy().tolist()
+
+    def size(self, dim: Optional[int] = None):
+        if dim is None:
+            return self.shape
+        return self.shape[dim]
+
+    def dim(self) -> int:
+        return self.ndim
+
+    def is_floating_point(self) -> bool:
+        return self.dtype.is_floating_point
+
+    def requires_grad_(self, mode: bool = True) -> 'Tensor':
+        if mode and not self.dtype.is_floating_point:
+            raise RuntimeError("only Tensors of floating point dtype can require gradients")
+        self.requires_grad = bool(mode)
+        return self
+
+    def retain_grad(self):
+        pass
+
+    def type_as(self, other: 'Tensor') -> 'Tensor':
+        return self.to(other.device).cast(other.dtype)
+
+    def add_(self, other) -> 'Tensor':
+        res = self + other
+        self._native.copy_from_native(res._native)
+        return self
+
+    def sub_(self, other) -> 'Tensor':
+        res = self - other
+        self._native.copy_from_native(res._native)
+        return self
+
+    def mul_(self, other) -> 'Tensor':
+        res = self * other
+        self._native.copy_from_native(res._native)
+        return self
+
+    def div_(self, other) -> 'Tensor':
+        res = self / other
+        self._native.copy_from_native(res._native)
+        return self
+
+    def min(self, dim: Optional[int] = None, keepdim: bool = False):
+        if dim is None:
+            return -Tensor((-self)._native.reduce_max(-1, False), device=self.device, requires_grad=False)
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        return -Tensor((-self)._native.reduce_max(norm_dim, keepdim), device=self.device, requires_grad=False)
+
+    def amin(self, dim: Optional[int] = None, keepdim: bool = False) -> 'Tensor':
+        return self.min(dim=dim, keepdim=keepdim)
+
+    def amax(self, dim: Optional[int] = None, keepdim: bool = False) -> 'Tensor':
+        if dim is None:
+            return Tensor(self._native.reduce_max(-1, False), device=self.device, requires_grad=False)
+        norm_dim = dim if dim >= 0 else dim + self.ndim
+        return Tensor(self._native.reduce_max(norm_dim, keepdim), device=self.device, requires_grad=False)
+
+    def argsort(self, dim: int = -1, descending: bool = False) -> 'Tensor':
+        _, idx = self.sort(dim=dim, descending=descending)
+        return idx
+
     def sin(self) -> 'Tensor':
         native_out = self._native.unary_op(6)
         out = Tensor(native_out, device=self.device, requires_grad=self.requires_grad)

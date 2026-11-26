@@ -917,6 +917,30 @@ class SiLU(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.silu()
 
+class Mish(Module):
+    def forward(self, x: Tensor) -> Tensor:
+        return F.mish(x)
+
+class Hardswish(Module):
+    def forward(self, x: Tensor) -> Tensor:
+        return F.hardswish(x)
+
+class LeakyReLU(Module):
+    def __init__(self, negative_slope: float = 0.01):
+        super().__init__()
+        self.negative_slope = float(negative_slope)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.leaky_relu(x, negative_slope=self.negative_slope)
+
+class ELU(Module):
+    def __init__(self, alpha: float = 1.0):
+        super().__init__()
+        self.alpha = float(alpha)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.elu(x, alpha=self.alpha)
+
 
 class _SnakeBase(Module):
     """
@@ -1449,6 +1473,104 @@ class MSELoss(Module):
         elif self.reduction == "sum":
             return sq.sum()
         return sq
+
+class SmoothL1Loss(Module):
+    def __init__(self, reduction: str = "mean", beta: float = 1.0):
+        super().__init__()
+        self.reduction = reduction
+        self.beta = float(beta)
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        return F.smooth_l1_loss(input, target, reduction=self.reduction, beta=self.beta)
+
+class CosineSimilarity(Module):
+    def __init__(self, dim: int = 1, eps: float = 1e-8):
+        super().__init__()
+        self.dim = int(dim)
+        self.eps = float(eps)
+
+    def forward(self, x1: Tensor, x2: Tensor) -> Tensor:
+        return F.cosine_similarity(x1, x2, dim=self.dim, eps=self.eps)
+
+class Identity(Module):
+    def forward(self, x: Tensor) -> Tensor:
+        return x
+
+class L1Loss(Module):
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        return F.l1_loss(input, target, reduction=self.reduction)
+
+class BCEWithLogitsLoss(Module):
+    def __init__(self, reduction: str = "mean"):
+        super().__init__()
+        self.reduction = reduction
+
+    def forward(self, input: Tensor, target: Tensor) -> Tensor:
+        return F.binary_cross_entropy_with_logits(input, target, reduction=self.reduction)
+
+class Upsample(Module):
+    def __init__(self, size=None, scale_factor=None, mode: str = "nearest", align_corners: Optional[bool] = None):
+        super().__init__()
+        self.size = size
+        self.scale_factor = scale_factor
+        self.mode = mode
+        self.align_corners = align_corners
+
+    def forward(self, x: Tensor) -> Tensor:
+        return F.interpolate(x, size=self.size, scale_factor=self.scale_factor, mode=self.mode, align_corners=self.align_corners)
+
+class ParameterList(Module):
+    def __init__(self, parameters=None):
+        super().__init__()
+        if parameters is not None:
+            for i, p in enumerate(parameters):
+                self.register_parameter(str(i), p)
+
+    def __getitem__(self, idx: int) -> Parameter:
+        keys = list(self._parameters.keys())
+        return self._parameters[keys[idx]]
+
+    def __len__(self) -> int:
+        return len(self._parameters)
+
+    def __iter__(self):
+        return iter(self._parameters.values())
+
+    def append(self, p: Parameter):
+        self.register_parameter(str(len(self._parameters)), p)
+        return self
+
+class ModuleDict(Module):
+    def __init__(self, modules=None):
+        super().__init__()
+        if modules is not None:
+            for k, m in modules.items():
+                self.register_module(str(k), m)
+
+    def __getitem__(self, key: str) -> Module:
+        return self._modules[key]
+
+    def __setitem__(self, key: str, module: Module):
+        self.register_module(str(key), module)
+
+    def __len__(self) -> int:
+        return len(self._modules)
+
+    def __iter__(self):
+        return iter(self._modules.keys())
+
+    def keys(self):
+        return self._modules.keys()
+
+    def values(self):
+        return self._modules.values()
+
+    def items(self):
+        return self._modules.items()
 
 class CrossEntropyLoss(Module):
     """

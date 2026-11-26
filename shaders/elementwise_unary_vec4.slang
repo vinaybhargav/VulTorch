@@ -18,6 +18,18 @@ float4 fast_gelu(float4 x) {
     return 0.5 * x * (float4(1.0) + tanh(inner));
 }
 
+float erf_s(float x) {
+    float s = (x < 0.0) ? -1.0 : 1.0;
+    float ax = abs(x);
+    float t = 1.0 / (1.0 + 0.3275911 * ax);
+    float poly = t * (0.254829592 + t * (-0.284496736 + t * (1.421413741 + t * (-1.453152027 + t * 1.061405429))));
+    return s * (1.0 - poly * exp(-ax * ax));
+}
+
+float4 erf_v4(float4 x) {
+    return float4(erf_s(x.x), erf_s(x.y), erf_s(x.z), erf_s(x.w));
+}
+
 float4 apply_op_vec4(float4 x, uint op) {
     switch (op) {
         case 0u: return -x;
@@ -36,6 +48,32 @@ float4 apply_op_vec4(float4 x, uint op) {
         case 13u: return clamp(x, float4(pc.param1), float4(pc.param2));
         case 14u: return float4(sign(x));
         case 15u: return x * pc.param1 + pc.param2;
+        case 16u: return round(x);
+        case 17u: return ceil(x);
+        case 18u: return floor(x);
+        case 19u: return trunc(x);
+        case 20u: return x - trunc(x);
+        case 21u: return x * x;
+        case 22u: return float4(1.0) / x;
+        case 23u: return exp2(x);
+        case 24u: return exp(x) - float4(1.0);
+        case 25u: return log2(x);
+        case 26u: return log(x) * float4(0.4342944819032518);
+        case 27u: return log(float4(1.0) + x);
+        case 28u: return tan(x);
+        case 29u: return asin(x);
+        case 30u: return acos(x);
+        case 31u: return atan(x);
+        case 32u: return sinh(x);
+        case 33u: return cosh(x);
+        case 34u: return log(x + sqrt(x * x + float4(1.0)));
+        case 35u: return log(x + sqrt(x * x - float4(1.0)));
+        case 36u: return float4(0.5) * log((float4(1.0) + x) / (float4(1.0) - x));
+        case 37u: return erf_v4(x);
+        case 38u: return float4(1.0) - erf_v4(x);
+        case 39u: return select(isnan(x), float4(1.0), float4(0.0));
+        case 40u: return select(isinf(x), float4(1.0), float4(0.0));
+        case 41u: return select(isfinite(x), float4(1.0), float4(0.0));
         default: return x;
     }
 }

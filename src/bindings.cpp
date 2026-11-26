@@ -1,4 +1,5 @@
 #include "runtime/vk_context.hpp"
+#include "runtime/vk_graph.hpp"
 #include "runtime/vk_memory.hpp"
 #include "runtime/vk_pipeline.hpp"
 #include "tensor.hpp"
@@ -73,6 +74,7 @@ PYBIND11_MODULE(_vultorch_backend, m) {
   atexit.attr("register")(py::cpp_function([]() {
     py::gil_scoped_release release;
     VulkanManager::instance_ref().synchronize_all();
+    VulkanGraph::release_all();
     VulkanMemoryManager::instance().shutdown();
     VulkanPipelineManager::instance().clear();
   }));
@@ -239,6 +241,8 @@ PYBIND11_MODULE(_vultorch_backend, m) {
       .def("itemsize", &NativeTensor::itemsize)
       .def("nbytes", &NativeTensor::nbytes)
       .def("storage_id", &NativeTensor::storage_id)
+      .def("version", &NativeTensor::version)
+      .def("bump_version", &NativeTensor::bump_version)
       .def("data_ptr", &NativeTensor::data_ptr)
       .def("to_device", &NativeTensor::to_device, py::arg("target_device_id"),
            py::call_guard<py::gil_scoped_release>())
@@ -424,6 +428,19 @@ PYBIND11_MODULE(_vultorch_backend, m) {
       .def_static("amp_unscale_and_check", &NativeTensor::amp_unscale_and_check,
                   py::arg("grads"), py::arg("inv_scale"),
                   py::call_guard<py::gil_scoped_release>())
+      .def("autodiff_unary_fwd", &NativeTensor::autodiff_unary_fwd,
+           py::arg("op_type"), py::arg("param") = 0.0f,
+           py::call_guard<py::gil_scoped_release>())
+      .def("autodiff_unary_bwd", &NativeTensor::autodiff_unary_bwd,
+           py::arg("op_type"), py::arg("grad_out"), py::arg("param") = 0.0f,
+           py::call_guard<py::gil_scoped_release>())
+      .def("autodiff_binary_fwd", &NativeTensor::autodiff_binary_fwd,
+           py::arg("op_type"), py::arg("other"), py::arg("param") = 1.0f,
+           py::call_guard<py::gil_scoped_release>())
+      .def("autodiff_binary_bwd", &NativeTensor::autodiff_binary_bwd,
+           py::arg("op_type"), py::arg("other"), py::arg("grad_out"),
+           py::arg("param") = 1.0f,
+           py::call_guard<py::gil_scoped_release>())
       .def("layernorm", &NativeTensor::layernorm, py::arg("gamma") = nullptr,
            py::arg("beta") = nullptr, py::arg("eps") = 1e-5f,
            py::arg("norm_dims") = 1, py::call_guard<py::gil_scoped_release>())
@@ -569,4 +586,18 @@ PYBIND11_MODULE(_vultorch_backend, m) {
                                                 dt);
           },
           py::arg("array"), py::arg("device_id") = 0, py::arg("dtype") = "");
+
+  py::class_<VulkanGraph>(m, "VulkanGraph")
+      .def(py::init<uint32_t>(), py::arg("device_id") = 0)
+      .def("capture_begin", &VulkanGraph::capture_begin,
+           py::call_guard<py::gil_scoped_release>())
+      .def("capture_end", &VulkanGraph::capture_end,
+           py::call_guard<py::gil_scoped_release>())
+      .def("replay", &VulkanGraph::replay,
+           py::call_guard<py::gil_scoped_release>())
+      .def("release", &VulkanGraph::release,
+           py::call_guard<py::gil_scoped_release>())
+      .def_property_readonly("device_id", &VulkanGraph::device_id)
+      .def_property_readonly("num_dispatches", &VulkanGraph::num_dispatches)
+      .def_property_readonly("is_captured", &VulkanGraph::is_captured);
 }

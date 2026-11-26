@@ -451,5 +451,213 @@ std::shared_ptr<NativeTensor> NativeTensor::unary_op(uint32_t op_type, float p1,
   return out;
 }
 
+std::shared_ptr<NativeTensor>
+NativeTensor::autodiff_unary_fwd(uint32_t op_type, float param) {
+  auto x_c = (dtype == ScalarType::Float32)
+                 ? force_contiguous()
+                 : cast(ScalarType::Float32)->force_contiguous();
+  auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+  if (numel == 0)
+    return (dtype == ScalarType::Float32) ? out : out->cast(dtype);
+
+  if (device_id < 0) {
+    const float *xp = x_c->cpu_f32();
+    float *yp = out->cpu_f32();
+    for (size_t i = 0; i < numel; ++i) {
+      float x = xp[i];
+      if (op_type == 0u) {
+        float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
+        yp[i] = x * std::tanh(sp);
+      } else if (op_type == 1u) {
+        float c = std::min(std::max(x + 3.0f, 0.0f), 6.0f);
+        yp[i] = x * c / 6.0f;
+      } else if (op_type == 2u) {
+        yp[i] = (x >= 0.0f) ? x : (param * x);
+      } else if (op_type == 3u) {
+        yp[i] = (x >= 0.0f) ? x : (param * (std::exp(x) - 1.0f));
+      } else {
+        yp[i] = x;
+      }
+    }
+    return (dtype == ScalarType::Float32) ? out : out->cast(dtype);
+  }
+
+  struct {
+    uint32_t total_elements;
+    uint32_t op_type;
+    float param;
+    uint32_t _pad;
+  } pc{static_cast<uint32_t>(numel), op_type, param, 0u};
+
+  uint32_t groups = (static_cast<uint32_t>(numel) + 255u) / 256u;
+  auto x_buf = x_c->gpu_buf();
+  auto out_buf = out->gpu_buf();
+  VulkanPipelineManager::instance().dispatch(
+      device_id, "autodiff_unary_fwd",
+      {x_buf, x_buf, x_buf, out_buf, out_buf}, &pc, sizeof(pc), groups);
+  return (dtype == ScalarType::Float32) ? out : out->cast(dtype);
+}
+
+std::shared_ptr<NativeTensor>
+NativeTensor::autodiff_unary_bwd(uint32_t op_type,
+                                 std::shared_ptr<NativeTensor> grad_out,
+                                 float param) {
+  auto x_c = (dtype == ScalarType::Float32)
+                 ? force_contiguous()
+                 : cast(ScalarType::Float32)->force_contiguous();
+  auto g_c = (grad_out->dtype == ScalarType::Float32)
+                 ? grad_out->force_contiguous()
+                 : grad_out->cast(ScalarType::Float32)->force_contiguous();
+  auto dx = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+  if (numel == 0)
+    return (dtype == ScalarType::Float32) ? dx : dx->cast(dtype);
+
+  if (device_id < 0) {
+    const float *xp = x_c->cpu_f32();
+    const float *gp = g_c->cpu_f32();
+    float *dxp = dx->cpu_f32();
+    for (size_t i = 0; i < numel; ++i) {
+      float x = xp[i];
+      float g = gp[i];
+      if (op_type == 0u) {
+        float sp = (x > 20.0f) ? x : std::log1p(std::exp(x));
+        float tsp = std::tanh(sp);
+        float sig = 1.0f / (1.0f + std::exp(-x));
+        dxp[i] = g * (tsp + x * (1.0f - tsp * tsp) * sig);
+      } else if (op_type == 1u) {
+        if (x <= -3.0f)
+          dxp[i] = 0.0f;
+        else if (x >= 3.0f)
+          dxp[i] = g;
+        else
+          dxp[i] = g * ((2.0f * x + 3.0f) / 6.0f);
+      } else if (op_type == 2u) {
+        dxp[i] = (x >= 0.0f) ? g : (param * g);
+      } else if (op_type == 3u) {
+        dxp[i] = (x >= 0.0f) ? g : (g * param * std::exp(x));
+      } else {
+        dxp[i] = g;
+      }
+    }
+    return (dtype == ScalarType::Float32) ? dx : dx->cast(dtype);
+  }
+
+  struct {
+    uint32_t total_elements;
+    uint32_t op_type;
+    float param;
+    uint32_t _pad;
+  } pc{static_cast<uint32_t>(numel), op_type, param, 0u};
+
+  uint32_t groups = (static_cast<uint32_t>(numel) + 255u) / 256u;
+  auto x_buf = x_c->gpu_buf();
+  auto g_buf = g_c->gpu_buf();
+  auto dx_buf = dx->gpu_buf();
+  VulkanPipelineManager::instance().dispatch(
+      device_id, "autodiff_unary_bwd",
+      {x_buf, x_buf, g_buf, dx_buf, dx_buf}, &pc, sizeof(pc), groups);
+  return (dtype == ScalarType::Float32) ? dx : dx->cast(dtype);
+}
+
+std::shared_ptr<NativeTensor>
+NativeTensor::autodiff_binary_fwd(uint32_t op_type,
+                                  std::shared_ptr<NativeTensor> other,
+                                  float param) {
+  if (shape != other->shape || device_id != other->device_id) {
+    throw std::runtime_error(
+        "autodiff_binary_fwd: shapes and devices must match");
+  }
+  auto a_c = (dtype == ScalarType::Float32)
+                 ? force_contiguous()
+                 : cast(ScalarType::Float32)->force_contiguous();
+  auto b_c = (other->dtype == ScalarType::Float32)
+                 ? other->force_contiguous()
+                 : other->cast(ScalarType::Float32)->force_contiguous();
+  auto out = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+  if (numel == 0)
+    return (dtype == ScalarType::Float32) ? out : out->cast(dtype);
+
+  if (device_id < 0) {
+    const float *ap = a_c->cpu_f32();
+    const float *bp = b_c->cpu_f32();
+    float *yp = out->cpu_f32();
+    for (size_t i = 0; i < numel; ++i) {
+      float diff = ap[i] - bp[i];
+      float ad = std::abs(diff);
+      yp[i] = (ad < param) ? (0.5f * diff * diff / param) : (ad - 0.5f * param);
+    }
+    return (dtype == ScalarType::Float32) ? out : out->cast(dtype);
+  }
+
+  struct {
+    uint32_t total_elements;
+    uint32_t op_type;
+    float param;
+    uint32_t _pad;
+  } pc{static_cast<uint32_t>(numel), op_type, param, 0u};
+
+  uint32_t groups = (static_cast<uint32_t>(numel) + 255u) / 256u;
+  auto a_buf = a_c->gpu_buf();
+  auto b_buf = b_c->gpu_buf();
+  auto out_buf = out->gpu_buf();
+  VulkanPipelineManager::instance().dispatch(
+      device_id, "autodiff_binary_fwd",
+      {a_buf, b_buf, a_buf, out_buf, out_buf}, &pc, sizeof(pc), groups);
+  return (dtype == ScalarType::Float32) ? out : out->cast(dtype);
+}
+
+std::pair<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+NativeTensor::autodiff_binary_bwd(uint32_t op_type,
+                                  std::shared_ptr<NativeTensor> other,
+                                  std::shared_ptr<NativeTensor> grad_out,
+                                  float param) {
+  auto a_c = (dtype == ScalarType::Float32)
+                 ? force_contiguous()
+                 : cast(ScalarType::Float32)->force_contiguous();
+  auto b_c = (other->dtype == ScalarType::Float32)
+                 ? other->force_contiguous()
+                 : other->cast(ScalarType::Float32)->force_contiguous();
+  auto g_c = (grad_out->dtype == ScalarType::Float32)
+                 ? grad_out->force_contiguous()
+                 : grad_out->cast(ScalarType::Float32)->force_contiguous();
+  auto da = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+  auto db = std::make_shared<NativeTensor>(shape, device_id, ScalarType::Float32);
+  if (numel == 0)
+    return {da, db};
+
+  if (device_id < 0) {
+    const float *ap = a_c->cpu_f32();
+    const float *bp = b_c->cpu_f32();
+    const float *gp = g_c->cpu_f32();
+    float *dap = da->cpu_f32();
+    float *dbp = db->cpu_f32();
+    for (size_t i = 0; i < numel; ++i) {
+      float diff = ap[i] - bp[i];
+      float ad = std::abs(diff);
+      float d = (ad < param) ? (diff / param) : ((diff > 0.0f) ? 1.0f : -1.0f);
+      float g = gp[i];
+      dap[i] = g * d;
+      dbp[i] = -g * d;
+    }
+    return {(dtype == ScalarType::Float32) ? da : da->cast(dtype),
+            (other->dtype == ScalarType::Float32) ? db : db->cast(other->dtype)};
+  }
+
+  struct {
+    uint32_t total_elements;
+    uint32_t op_type;
+    float param;
+    uint32_t _pad;
+  } pc{static_cast<uint32_t>(numel), op_type, param, 0u};
+
+  uint32_t groups = (static_cast<uint32_t>(numel) + 255u) / 256u;
+  VulkanPipelineManager::instance().dispatch(
+      device_id, "autodiff_binary_bwd",
+      {a_c->gpu_buf(), b_c->gpu_buf(), g_c->gpu_buf(), da->gpu_buf(),
+       db->gpu_buf()},
+      &pc, sizeof(pc), groups);
+  return {(dtype == ScalarType::Float32) ? da : da->cast(dtype),
+          (other->dtype == ScalarType::Float32) ? db : db->cast(other->dtype)};
+}
 
 } // namespace vultorch

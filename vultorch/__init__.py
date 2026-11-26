@@ -24,7 +24,8 @@ from .tensor import (
     uint8,
     byte,
 )
-from .autograd import no_grad, is_grad_enabled, backward
+from .autograd import no_grad, enable_grad, is_grad_enabled, backward
+from .graph import VulkanGraph, compile
 from .testing import gradcheck
 from . import amp
 from . import nn
@@ -113,6 +114,37 @@ def ones_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_g
     dt = dtype if dtype is not None else t.dtype
     return ones(t.shape, device=dev, requires_grad=requires_grad, dtype=dt)
 
+def empty_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    dev = device if device is not None else t.device
+    dt = dtype if dtype is not None else t.dtype
+    return empty(t.shape, device=dev, requires_grad=requires_grad, dtype=dt)
+
+def full_like(t: Tensor, fill_value, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    dev = device if device is not None else t.device
+    dt = dtype if dtype is not None else t.dtype
+    return full(t.shape, fill_value, device=dev, requires_grad=requires_grad, dtype=dt)
+
+def rand_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    dev = device if device is not None else t.device
+    dt = dtype if dtype is not None else t.dtype
+    return rand(t.shape, device=dev, requires_grad=requires_grad, dtype=dt)
+
+def randn_like(t: Tensor, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
+    dev = device if device is not None else t.device
+    dt = dtype if dtype is not None else t.dtype
+    return randn(t.shape, device=dev, requires_grad=requires_grad, dtype=dt)
+
+def randint_like(t: Tensor, low: _builtins.int, high: Optional[_builtins.int] = None, device: Optional[Union[str, Device]] = None, dtype=None) -> Tensor:
+    dev = device if device is not None else t.device
+    dt = dtype if dtype is not None else t.dtype
+    return randint(low, high, size=t.shape, device=dev, dtype=dt)
+
+def randperm(n: _builtins.int, device: Optional[Union[str, Device]] = None, dtype=None) -> Tensor:
+    dt = parse_dtype(dtype) if dtype is not None else int64
+    r = rand(_builtins.int(n), device=device, dtype=float32)
+    _, idx = r.sort(dim=0, descending=False)
+    return idx if idx.dtype == dt else idx.cast(dt)
+
 def randn(*shape, device: Optional[Union[str, Device]] = None, requires_grad: _builtins.bool = False, dtype=None) -> Tensor:
     t = empty(*shape, device=device, requires_grad=requires_grad, dtype=dtype)
     seed, offset = _next_philox_state()
@@ -132,6 +164,16 @@ def randint(low: _builtins.int, high: Optional[_builtins.int] = None, size: Unio
     if isinstance(size, _builtins.int):
         size = (size,)
     dt = parse_dtype(dtype) if dtype is not None else int64
+    dev = resolve_device(device)
+    if dev.type == "vk" and len(size) > 0:
+        # Pure on-GPU Philox integer sampling (zero PCIe upload)
+        u = empty(*size, device=dev, dtype=float32)
+        seed, offset = _next_philox_state()
+        u._native.random_philox_(0, _builtins.float(low), _builtins.float(high), seed, offset, None)
+        floored = u.floor().clamp(min=_builtins.float(low), max=_builtins.float(high - 1))
+        out = floored.cast(dt)
+        out.requires_grad = requires_grad
+        return out
     np_dt = dt.numpy_dtype if dt.numpy_dtype is not None else np.int64
     arr = np.random.randint(low, high, size=size, dtype=np_dt)
     return tensor(arr, device=device, requires_grad=requires_grad, dtype=dt)
@@ -198,6 +240,241 @@ def gelu(x: Tensor) -> Tensor:
 
 def silu(x: Tensor) -> Tensor:
     return x.silu()
+
+def round(x: Tensor) -> Tensor:
+    return x.round()
+
+def ceil(x: Tensor) -> Tensor:
+    return x.ceil()
+
+def floor(x: Tensor) -> Tensor:
+    return x.floor()
+
+def trunc(x: Tensor) -> Tensor:
+    return x.trunc()
+
+def frac(x: Tensor) -> Tensor:
+    return x.frac()
+
+def square(x: Tensor) -> Tensor:
+    return x.square()
+
+def reciprocal(x: Tensor) -> Tensor:
+    return x.reciprocal()
+
+def neg(x: Tensor) -> Tensor:
+    return -x
+
+def pow(x: Tensor, exponent) -> Tensor:
+    return x ** exponent
+
+def exp2(x: Tensor) -> Tensor:
+    return x.exp2()
+
+def expm1(x: Tensor) -> Tensor:
+    return x.expm1()
+
+def log2(x: Tensor) -> Tensor:
+    return x.log2()
+
+def log10(x: Tensor) -> Tensor:
+    return x.log10()
+
+def log1p(x: Tensor) -> Tensor:
+    return x.log1p()
+
+def tan(x: Tensor) -> Tensor:
+    return x.tan()
+
+def asin(x: Tensor) -> Tensor:
+    return x.asin()
+
+def acos(x: Tensor) -> Tensor:
+    return x.acos()
+
+def atan(x: Tensor) -> Tensor:
+    return x.atan()
+
+def sinh(x: Tensor) -> Tensor:
+    return x.sinh()
+
+def cosh(x: Tensor) -> Tensor:
+    return x.cosh()
+
+def asinh(x: Tensor) -> Tensor:
+    return x.asinh()
+
+def acosh(x: Tensor) -> Tensor:
+    return x.acosh()
+
+def atanh(x: Tensor) -> Tensor:
+    return x.atanh()
+
+def erf(x: Tensor) -> Tensor:
+    return x.erf()
+
+def erfc(x: Tensor) -> Tensor:
+    return x.erfc()
+
+def isnan(x: Tensor) -> Tensor:
+    return x.isnan()
+
+def isinf(x: Tensor) -> Tensor:
+    return x.isinf()
+
+def isfinite(x: Tensor) -> Tensor:
+    return x.isfinite()
+
+def nan_to_num(x: Tensor, nan: _builtins.float = 0.0, posinf: Optional[_builtins.float] = None, neginf: Optional[_builtins.float] = None) -> Tensor:
+    return x.nan_to_num(nan=nan, posinf=posinf, neginf=neginf)
+
+def maximum(a: Tensor, b) -> Tensor:
+    return a.maximum(b)
+
+def minimum(a: Tensor, b) -> Tensor:
+    return a.minimum(b)
+
+def lerp(input: Tensor, end: Tensor, weight) -> Tensor:
+    return input.lerp(end, weight)
+
+def addcmul(input: Tensor, tensor1: Tensor, tensor2: Tensor, value: _builtins.float = 1.0) -> Tensor:
+    return input + value * (tensor1 * tensor2)
+
+def addcdiv(input: Tensor, tensor1: Tensor, tensor2: Tensor, value: _builtins.float = 1.0) -> Tensor:
+    return input + value * (tensor1 / tensor2)
+
+def eq(a: Tensor, b) -> Tensor:
+    return a == b
+
+def ne(a: Tensor, b) -> Tensor:
+    return a != b
+
+def lt(a: Tensor, b) -> Tensor:
+    return a < b
+
+def le(a: Tensor, b) -> Tensor:
+    return a <= b
+
+def gt(a: Tensor, b) -> Tensor:
+    return a > b
+
+def ge(a: Tensor, b) -> Tensor:
+    return a >= b
+
+def isclose(input: Tensor, other: Tensor, rtol: _builtins.float = 1e-5, atol: _builtins.float = 1e-8, equal_nan: _builtins.bool = False) -> Tensor:
+    diff = (input - other).abs()
+    tol = atol + rtol * other.abs()
+    res = diff <= tol
+    if equal_nan:
+        res = res | (input.isnan() & other.isnan())
+    return res
+
+def allclose(input: Tensor, other: Tensor, rtol: _builtins.float = 1e-5, atol: _builtins.float = 1e-8, equal_nan: _builtins.bool = False) -> _builtins.bool:
+    return _builtins.bool(isclose(input, other, rtol=rtol, atol=atol, equal_nan=equal_nan).all().item())
+
+def equal(input: Tensor, other: Tensor) -> _builtins.bool:
+    if input.shape != other.shape or input.dtype != other.dtype:
+        return False
+    return _builtins.bool((input == other).all().item())
+
+def logical_and(a: Tensor, b: Tensor) -> Tensor:
+    return a.logical_and(b)
+
+def logical_or(a: Tensor, b: Tensor) -> Tensor:
+    return a.logical_or(b)
+
+def logical_not(a: Tensor) -> Tensor:
+    return a.logical_not()
+
+def logical_xor(a: Tensor, b: Tensor) -> Tensor:
+    return a.logical_xor(b)
+
+def min(x: Tensor, dim: Optional[_builtins.int] = None, keepdim: _builtins.bool = False):
+    if not isinstance(x, Tensor):
+        return _builtins.min(x, dim) if dim is not None else _builtins.min(x)
+    return x.min(dim=dim, keepdim=keepdim)
+
+def amin(x: Tensor, dim: Optional[_builtins.int] = None, keepdim: _builtins.bool = False) -> Tensor:
+    return x.amin(dim=dim, keepdim=keepdim)
+
+def amax(x: Tensor, dim: Optional[_builtins.int] = None, keepdim: _builtins.bool = False) -> Tensor:
+    return x.amax(dim=dim, keepdim=keepdim)
+
+def all(x: Tensor, dim: Optional[_builtins.int] = None, keepdim: _builtins.bool = False):
+    if not isinstance(x, Tensor):
+        return _builtins.all(x)
+    return x.all(dim=dim, keepdim=keepdim)
+
+def any(x: Tensor, dim: Optional[_builtins.int] = None, keepdim: _builtins.bool = False):
+    if not isinstance(x, Tensor):
+        return _builtins.any(x)
+    return x.any(dim=dim, keepdim=keepdim)
+
+def argsort(x: Tensor, dim: _builtins.int = -1, descending: _builtins.bool = False) -> Tensor:
+    return x.argsort(dim=dim, descending=descending)
+
+def squeeze(x: Tensor, dim: Optional[_builtins.int] = None) -> Tensor:
+    return x.squeeze(dim) if dim is not None else x.squeeze()
+
+def unsqueeze(x: Tensor, dim: _builtins.int) -> Tensor:
+    return x.unsqueeze(dim)
+
+def flatten(x: Tensor, start_dim: _builtins.int = 0, end_dim: _builtins.int = -1) -> Tensor:
+    return x.flatten(start_dim=start_dim, end_dim=end_dim)
+
+def reshape(x: Tensor, shape) -> Tensor:
+    return x.reshape(shape)
+
+def clone(x: Tensor) -> Tensor:
+    return x.clone()
+
+def detach(x: Tensor) -> Tensor:
+    return x.detach()
+
+def masked_fill(x: Tensor, mask: Tensor, value: _builtins.float) -> Tensor:
+    return x.masked_fill(mask, value)
+
+def concat(tensors: List[Tensor], dim: _builtins.int = 0) -> Tensor:
+    return cat(tensors, dim=dim)
+
+def concatenate(tensors: List[Tensor], dim: _builtins.int = 0) -> Tensor:
+    return cat(tensors, dim=dim)
+
+def hstack(tensors: List[Tensor]) -> Tensor:
+    if tensors[0].ndim == 1:
+        return cat(tensors, dim=0)
+    return cat(tensors, dim=1)
+
+def vstack(tensors: List[Tensor]) -> Tensor:
+    t_list = [t.unsqueeze(0) if t.ndim == 1 else t for t in tensors]
+    return cat(t_list, dim=0)
+
+def tile(x: Tensor, dims) -> Tensor:
+    if isinstance(dims, _builtins.int):
+        dims = (dims,)
+    return x.repeat(*dims)
+
+def movedim(x: Tensor, source: _builtins.int, destination: _builtins.int) -> Tensor:
+    ndim = x.ndim
+    src = source if source >= 0 else source + ndim
+    dst = destination if destination >= 0 else destination + ndim
+    order = [i for i in range(ndim) if i != src]
+    order.insert(dst, src)
+    return x.permute(order)
+
+moveaxis = movedim
+
+def swapaxes(x: Tensor, axis0: _builtins.int, axis1: _builtins.int) -> Tensor:
+    return x.transpose(axis0, axis1)
+
+swapdims = swapaxes
+
+def broadcast_to(x: Tensor, shape) -> Tensor:
+    return x.expand(*shape)
+
+def unbind(x: Tensor, dim: _builtins.int = 0):
+    norm_dim = dim if dim >= 0 else dim + x.ndim
+    return tuple(t.squeeze(norm_dim) for t in x.split(1, dim=norm_dim))
 
 def softmax(x: Tensor, dim: int = -1) -> Tensor:
     return x.softmax(dim=dim)

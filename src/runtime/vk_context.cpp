@@ -1,4 +1,5 @@
 #include "vk_context.hpp"
+#include "vk_graph.hpp"
 #include "vk_pipeline.hpp"
 #include <cstring>
 #include <sstream>
@@ -299,6 +300,21 @@ void VulkanDeviceContext::record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize s
                                       std::shared_ptr<VulkanBuffer> dst_keep) {
     std::lock_guard<std::mutex> lock(submit_mutex);
 
+    if (active_graph != nullptr) {
+        VkCommandBuffer gcmd = active_graph->cmd;
+        VkBufferCopy copy_region{};
+        copy_region.srcOffset = src_offset;
+        copy_region.dstOffset = dst_offset;
+        copy_region.size = size_bytes;
+        vkCmdCopyBuffer(gcmd, src, dst, 1, &copy_region);
+        add_compute_barrier(gcmd);
+        if (src_keep) active_graph->pinned_buffers.push_back(std::move(src_keep));
+        if (dst_keep) active_graph->pinned_buffers.push_back(std::move(dst_keep));
+        ++active_graph->dispatches;
+        dispatches_recorded.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
     open_batch_locked();
     Slot& slot = slots[static_cast<size_t>(open_slot)];
     VkCommandBuffer cmd = slot.cmd;
@@ -320,6 +336,25 @@ void VulkanDeviceContext::record_copy(VkBuffer src, VkBuffer dst, VkDeviceSize s
     if (ops_in_batch >= effective_max_ops_per_batch()) {
         flush_locked();
     }
+}
+
+VkCommandBuffer VulkanDeviceContext::active_graph_cmd() const {
+    return active_graph ? active_graph->cmd : VK_NULL_HANDLE;
+}
+
+void VulkanDeviceContext::finish_graph_dispatch(
+    const DescriptorAllocation& descriptor,
+    const std::vector<std::shared_ptr<VulkanBuffer>>& buffers) {
+    if (!active_graph) return;
+    if (descriptor.set != VK_NULL_HANDLE) {
+        active_graph->owned_descriptors.push_back(descriptor);
+    }
+    if (!buffers.empty()) {
+        active_graph->pinned_buffers.insert(
+            active_graph->pinned_buffers.end(), buffers.begin(), buffers.end());
+    }
+    ++active_graph->dispatches;
+    dispatches_recorded.fetch_add(1, std::memory_order_relaxed);
 }
 
 void VulkanDeviceContext::open_batch_locked() {
@@ -436,6 +471,11 @@ void VulkanDeviceContext::synchronize_locked() {
         }
     }
     pending_descriptors.clear();
+
+    if (graph_submitted_since_sync) {
+        vkQueueWaitIdle(compute_queue);
+        graph_submitted_since_sync = false;
+    }
 }
 
 void VulkanDeviceContext::flush() {

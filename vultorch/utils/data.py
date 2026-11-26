@@ -99,6 +99,18 @@ class DataLoader:
             np.random.shuffle(indices)
 
         if isinstance(self.dataset, TensorDataset):
+            first_dev = self.dataset.tensors[0].device
+            if self.shuffle and first_dev.type == "vk":
+                # Pure on-GPU permutation (zero per-batch PCIe index upload)
+                perm = vultorch.randperm(n, device=first_dev, dtype=vultorch.int32)
+                for start in range(0, n, self.batch_size):
+                    end = min(start + self.batch_size, n)
+                    if self.drop_last and (end - start) < self.batch_size:
+                        break
+                    idx_t = perm[start:end]
+                    batched = [t.index_select(0, idx_t if idx_t.device == t.device else idx_t.to(t.device)) for t in self.dataset.tensors]
+                    yield self._move(tuple(batched))
+                return
             for start in range(0, n, self.batch_size):
                 end = min(start + self.batch_size, n)
                 if self.drop_last and (end - start) < self.batch_size:

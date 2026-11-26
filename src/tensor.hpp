@@ -19,6 +19,7 @@ struct TensorStorage {
   std::vector<uint8_t> cpu_bytes;
   std::shared_ptr<VulkanBuffer> gpu_buffer;
   uint64_t id = 0;
+  uint32_t version = 0;
 
   static uint64_t next_id() {
     static std::atomic<uint64_t> counter{1};
@@ -66,6 +67,11 @@ public:
   size_t itemsize() const { return element_size(dtype); }
   size_t nbytes() const { return numel * itemsize(); }
   uint64_t storage_id() const { return storage ? storage->id : 0; }
+  uint32_t version() const { return storage ? storage->version : 0; }
+  void bump_version() {
+    if (storage)
+      ++storage->version;
+  }
   uintptr_t data_ptr() const;
   std::string dtype_str() const { return dtype_name(dtype); }
 
@@ -324,6 +330,19 @@ public:
   static bool
   amp_unscale_and_check(const std::vector<std::shared_ptr<NativeTensor>> &grads,
                         float inv_scale);
+
+  std::shared_ptr<NativeTensor> autodiff_unary_fwd(uint32_t op_type,
+                                                   float param = 0.0f);
+  std::shared_ptr<NativeTensor>
+  autodiff_unary_bwd(uint32_t op_type, std::shared_ptr<NativeTensor> grad_out,
+                     float param = 0.0f);
+  std::shared_ptr<NativeTensor>
+  autodiff_binary_fwd(uint32_t op_type, std::shared_ptr<NativeTensor> other,
+                      float param = 1.0f);
+  std::pair<std::shared_ptr<NativeTensor>, std::shared_ptr<NativeTensor>>
+  autodiff_binary_bwd(uint32_t op_type, std::shared_ptr<NativeTensor> other,
+                      std::shared_ptr<NativeTensor> grad_out,
+                      float param = 1.0f);
 
   std::shared_ptr<NativeTensor>
   layernorm(std::shared_ptr<NativeTensor> gamma = nullptr,

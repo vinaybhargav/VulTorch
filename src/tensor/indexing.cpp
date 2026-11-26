@@ -519,6 +519,7 @@ void NativeTensor::index_add_(int64_t dim,
   }
 
   auto idx_i32 = ensure_int32_for_index(index);
+  bump_version();
 
   if (device_id == -1) {
     if (src->numel == 0)

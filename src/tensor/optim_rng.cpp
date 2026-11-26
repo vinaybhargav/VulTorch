@@ -28,6 +28,7 @@ void NativeTensor::adam_step_(const std::shared_ptr<NativeTensor> &grad,
   if (step < 1) {
     throw std::runtime_error("adam_step_: step must be >= 1");
   }
+  bump_version();
 
   // Bias corrections in double: beta^t underflows float precision for large t.
   const float bias_c1 = static_cast<float>(
@@ -104,6 +105,7 @@ void NativeTensor::sgd_step_(const std::shared_ptr<NativeTensor> &grad,
   if (!is_floating_point(dtype)) {
     throw std::runtime_error("sgd_step_: parameter must be floating-point");
   }
+  bump_version();
   if (dtype != ScalarType::Float32) {
     auto p_f32 = cast(ScalarType::Float32);
     auto g_f32 = (grad->dtype == ScalarType::Float32)
@@ -242,6 +244,7 @@ void NativeTensor::random_philox_(uint32_t mode, float p1, float p2,
     copy_from_native(dtype == ScalarType::Float32 ? tmp : tmp->cast(dtype));
     return;
   }
+  bump_version();
 
   const uint32_t seed_lo = static_cast<uint32_t>(seed & 0xFFFFFFFFull);
   const uint32_t seed_hi = static_cast<uint32_t>(seed >> 32ull);
