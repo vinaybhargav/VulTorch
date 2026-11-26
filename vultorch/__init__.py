@@ -31,6 +31,7 @@ from . import amp
 from . import nn
 from . import optim
 from . import utils
+from .serialization import save_safetensors, load_safetensors
 from . import _vultorch_backend as _backend
 
 import builtins as _builtins

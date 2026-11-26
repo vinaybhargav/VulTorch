@@ -1638,6 +1638,7 @@ class CrossEntropyLoss(Module):
 
 from . import functional
 from . import functional as F
+from . import utils
 
 # ----------------------------------------------------------------------------
 # Multi-GPU Container (`nn.MultiGPU` and alias `nn.DataParallel`)

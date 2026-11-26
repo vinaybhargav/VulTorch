@@ -7,6 +7,7 @@ from typing import List, Dict, Any, Iterable
 import vultorch
 from ..tensor import Tensor
 from ..autograd import no_grad
+from . import lr_scheduler
 
 class Optimizer:
     def __init__(self, params: Iterable[Tensor], defaults: Dict[str, Any]):
@@ -25,6 +26,45 @@ class Optimizer:
             for p in group["params"]:
                 if p.grad is not None:
                     p.grad = None
+
+    def state_dict(self) -> Dict[str, Any]:
+        param_mappings = {}
+        for i, group in enumerate(self.param_groups):
+            for j, p in enumerate(group["params"]):
+                param_mappings[p] = (i, j)
+
+        state_out = {}
+        for p, s in self.state.items():
+            if p in param_mappings:
+                state_out[param_mappings[p]] = {
+                    k: v.clone() if isinstance(v, Tensor) else v
+                    for k, v in s.items()
+                }
+
+        groups_out = []
+        for group in self.param_groups:
+            g = {k: v for k, v in group.items() if k != "params"}
+            groups_out.append(g)
+
+        return {"state": state_out, "param_groups": groups_out}
+
+    def load_state_dict(self, state_dict: Dict[str, Any]):
+        for group, g_saved in zip(self.param_groups, state_dict.get("param_groups", [])):
+            group.update(g_saved)
+
+        param_lookup = {}
+        for i, group in enumerate(self.param_groups):
+            for j, p in enumerate(group["params"]):
+                param_lookup[(i, j)] = p
+
+        for key, s in state_dict.get("state", {}).items():
+            k_tuple = tuple(key) if isinstance(key, (list, tuple)) else key
+            if k_tuple in param_lookup:
+                p = param_lookup[k_tuple]
+                self.state[p] = {
+                    k: v.clone() if isinstance(v, Tensor) else v
+                    for k, v in s.items()
+                }
 
     def step(self):
         # Parameter updates are not differentiable and must not extend the graph.
