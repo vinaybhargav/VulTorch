@@ -1682,6 +1682,9 @@ class MultiGPU(Module):
         self._replicas_synced: bool = False
         self.sync_every_forward: bool = True
         self._grad_reduced_this_step: bool = False
+        # Closed-loop dynamic load balancer state
+        self._measured_throughputs: Dict[str, float] = {}
+        self._step_count: int = 0
 
     def _get_pool(self) -> ThreadPoolExecutor:
         if self.pool is None:
@@ -1699,10 +1702,27 @@ class MultiGPU(Module):
         n_devs = len(self.device_ids)
         if n_devs <= 1:
             return [batch_size]
+
+        # Automatic small batch bypass: if batch_size is too small (< 64), scatter/gather overhead
+        # across PCIe exceeds secondary GPU speedup. Route entire batch to primary GPU (device 0).
+        if self.balance in (True, "auto", "tflops") and batch_size < 64:
+            splits = [0] * n_devs
+            splits[0] = batch_size
+            return splits
+
         if self.device_weights is not None:
             return vultorch.vulkan.compute_split_sizes(
                 batch_size, self.device_ids, weights=self.device_weights
             )
+
+        # Closed-loop adaptive balance: combine static GEMM TFLOPS calibration with measured per-step latency
+        if self.balance == "auto" and len(self._measured_throughputs) == n_devs and self._step_count > 2:
+            dynamic_weights = [self._measured_throughputs[d] for d in self.device_ids]
+            total_w = sum(dynamic_weights)
+            if total_w > 0:
+                norm_w = [w / total_w for w in dynamic_weights]
+                return vultorch.vulkan.compute_split_sizes(batch_size, self.device_ids, weights=norm_w)
+
         if self.balance in (True, "tflops", "auto"):
             return vultorch.vulkan.compute_split_sizes(batch_size, self.device_ids)
         # Equal split fallback (balance=False or balance="equal")
@@ -1853,16 +1873,37 @@ class MultiGPU(Module):
         self._replicas_synced = True
         self._grad_reduced_this_step = False
 
+        import time
+
         def run_device(dev_id, start, end):
+            t_start = time.perf_counter()
             rep = self.replicas[dev_id]
             chunk_inputs = self._slice_tree(inputs, start, end, dev_id)
             chunk_kwargs = self._slice_tree(kwargs, start, end, dev_id)
-            return rep(*chunk_inputs, **chunk_kwargs)
+            out = rep(*chunk_inputs, **chunk_kwargs)
+            # Sync device to measure true completion time
+            if dev_id.startswith("vk"):
+                vultorch.vulkan.synchronize(dev_id)
+            t_elapsed = max(time.perf_counter() - t_start, 1e-6)
+            return out, (dev_id, end - start, t_elapsed)
 
         pool = self._get_pool()
         futures = [pool.submit(run_device, dev, s, e) for dev, s, e in chunks]
-        results = [f.result() for f in futures]
+        results_and_times = [f.result() for f in futures]
+        results = [rt[0] for rt in results_and_times]
         gathered = self._gather_outputs(results, target_device)
+
+        # Update closed-loop throughput measurements
+        self._step_count += 1
+        alpha = 0.25
+        for _, (dev_id, chunk_sz, elapsed) in enumerate(rt[1] for rt in results_and_times):
+            throughput = float(chunk_sz) / elapsed
+            if dev_id in self._measured_throughputs:
+                self._measured_throughputs[dev_id] = (
+                    (1.0 - alpha) * self._measured_throughputs[dev_id] + alpha * throughput
+                )
+            else:
+                self._measured_throughputs[dev_id] = throughput
 
         # Attach automatic post-backward hook (via weakref so no reference cycle keeps MultiGPU alive)
         first_out = self._find_first_tensor(gathered)
