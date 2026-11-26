@@ -1931,9 +1931,9 @@ class MultiGPU(Module):
         if n_devs <= 1:
             return [batch_size]
 
-        # Automatic small batch bypass: if batch_size is too small (< 64), scatter/gather overhead
-        # across PCIe exceeds secondary GPU speedup. Route entire batch to primary GPU (device 0).
-        if self.balance in (True, "auto", "tflops") and batch_size < 64:
+        # Automatic small batch bypass when explicitly in "auto" mode with batch < n_devs
+        # Otherwise for tflops/equal splits, ensure every device gets at least 1 item when batch >= n_devs
+        if self.balance == "auto" and batch_size < n_devs:
             splits = [0] * n_devs
             splits[0] = batch_size
             return splits
