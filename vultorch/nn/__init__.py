@@ -1639,9 +1639,236 @@ class CrossEntropyLoss(Module):
 from . import functional
 from . import functional as F
 from . import utils
+from . import init
 
 # ----------------------------------------------------------------------------
-# Multi-GPU Container (`nn.MultiGPU` and alias `nn.DataParallel`)
+# Recurrent Layers (RNN, LSTM, GRU)
+# ----------------------------------------------------------------------------
+class RNNCell(Module):
+    def __init__(self, input_size: int, hidden_size: int, nonlinearity: str = "tanh", bias: bool = True):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.nonlinearity = nonlinearity
+        self.weight_ih = Parameter(vultorch.empty(hidden_size, input_size))
+        self.weight_hh = Parameter(vultorch.empty(hidden_size, hidden_size))
+        if bias:
+            self.bias_ih = Parameter(vultorch.zeros(hidden_size))
+            self.bias_hh = Parameter(vultorch.zeros(hidden_size))
+        else:
+            self.bias_ih = None
+            self.bias_hh = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        std = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0.1
+        init.uniform_(self.weight_ih, -std, std)
+        init.uniform_(self.weight_hh, -std, std)
+
+    def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tensor:
+        if hx is None:
+            hx = vultorch.zeros(input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype)
+        gate = input @ self.weight_ih.t() + hx @ self.weight_hh.t()
+        if self.bias_ih is not None:
+            gate = gate + self.bias_ih + self.bias_hh
+        return gate.tanh() if self.nonlinearity == "tanh" else gate.relu()
+
+
+class LSTMCell(Module):
+    def __init__(self, input_size: int, hidden_size: int, bias: bool = True):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.weight_ih = Parameter(vultorch.empty(4 * hidden_size, input_size))
+        self.weight_hh = Parameter(vultorch.empty(4 * hidden_size, hidden_size))
+        if bias:
+            self.bias_ih = Parameter(vultorch.zeros(4 * hidden_size))
+            self.bias_hh = Parameter(vultorch.zeros(4 * hidden_size))
+        else:
+            self.bias_ih = None
+            self.bias_hh = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        std = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0.1
+        init.uniform_(self.weight_ih, -std, std)
+        init.uniform_(self.weight_hh, -std, std)
+
+    def forward(self, input: Tensor, hx: Optional[Tuple[Tensor, Tensor]] = None) -> Tuple[Tensor, Tensor]:
+        if hx is None:
+            h = vultorch.zeros(input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype)
+            c = vultorch.zeros(input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype)
+        else:
+            h, c = hx
+        gates = input @ self.weight_ih.t() + h @ self.weight_hh.t()
+        if self.bias_ih is not None:
+            gates = gates + self.bias_ih + self.bias_hh
+        H = self.hidden_size
+        i_gate = gates[:, 0:H].sigmoid()
+        f_gate = gates[:, H:2*H].sigmoid()
+        g_gate = gates[:, 2*H:3*H].tanh()
+        o_gate = gates[:, 3*H:4*H].sigmoid()
+        c_next = f_gate * c + i_gate * g_gate
+        h_next = o_gate * c_next.tanh()
+        return h_next, c_next
+
+
+class GRUCell(Module):
+    def __init__(self, input_size: int, hidden_size: int, bias: bool = True):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.weight_ih = Parameter(vultorch.empty(3 * hidden_size, input_size))
+        self.weight_hh = Parameter(vultorch.empty(3 * hidden_size, hidden_size))
+        if bias:
+            self.bias_ih = Parameter(vultorch.zeros(3 * hidden_size))
+            self.bias_hh = Parameter(vultorch.zeros(3 * hidden_size))
+        else:
+            self.bias_ih = None
+            self.bias_hh = None
+        self.reset_parameters()
+
+    def reset_parameters(self):
+        std = 1.0 / math.sqrt(self.hidden_size) if self.hidden_size > 0 else 0.1
+        init.uniform_(self.weight_ih, -std, std)
+        init.uniform_(self.weight_hh, -std, std)
+
+    def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tensor:
+        if hx is None:
+            hx = vultorch.zeros(input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype)
+        H = self.hidden_size
+        gi = input @ self.weight_ih.t()
+        gh = hx @ self.weight_hh.t()
+        if self.bias_ih is not None:
+            gi = gi + self.bias_ih
+            gh = gh + self.bias_hh
+        r = (gi[:, 0:H] + gh[:, 0:H]).sigmoid()
+        z = (gi[:, H:2*H] + gh[:, H:2*H]).sigmoid()
+        n = (gi[:, 2*H:3*H] + r * gh[:, 2*H:3*H]).tanh()
+        h_next = (1.0 - z) * n + z * hx
+        return h_next
+
+
+class LSTM(Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, bias: bool = True, batch_first: bool = False):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.batch_first = batch_first
+        self.layers = ModuleList([
+            LSTMCell(input_size if i == 0 else hidden_size, hidden_size, bias=bias)
+            for i in range(num_layers)
+        ])
+
+    def forward(self, input: Tensor, hx: Optional[Tuple[Tensor, Tensor]] = None) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+        if self.batch_first:
+            # (B, T, D) -> (T, B, D)
+            input = input.transpose(0, 1)
+        seq_len, batch_size, _ = input.shape
+        if hx is None:
+            h_0 = vultorch.zeros(self.num_layers, batch_size, self.hidden_size, device=input.device, dtype=input.dtype)
+            c_0 = vultorch.zeros(self.num_layers, batch_size, self.hidden_size, device=input.device, dtype=input.dtype)
+        else:
+            h_0, c_0 = hx
+
+        h_out_layers = []
+        c_out_layers = []
+        cur_input = input
+
+        for layer_idx, cell in enumerate(self.layers):
+            layer_h = h_0[layer_idx]
+            layer_c = c_0[layer_idx]
+            step_outputs = []
+            for t in range(seq_len):
+                layer_h, layer_c = cell(cur_input[t], (layer_h, layer_c))
+                step_outputs.append(layer_h.unsqueeze(0))
+            cur_input = vultorch.cat(step_outputs, dim=0)
+            h_out_layers.append(layer_h.unsqueeze(0))
+            c_out_layers.append(layer_c.unsqueeze(0))
+
+        out = cur_input
+        if self.batch_first:
+            out = out.transpose(0, 1)
+        h_n = vultorch.cat(h_out_layers, dim=0)
+        c_n = vultorch.cat(c_out_layers, dim=0)
+        return out, (h_n, c_n)
+
+
+class GRU(Module):
+    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, bias: bool = True, batch_first: bool = False):
+        super().__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.batch_first = batch_first
+        self.layers = ModuleList([
+            GRUCell(input_size if i == 0 else hidden_size, hidden_size, bias=bias)
+            for i in range(num_layers)
+        ])
+
+    def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
+        if self.batch_first:
+            input = input.transpose(0, 1)
+        seq_len, batch_size, _ = input.shape
+        if hx is None:
+            h_0 = vultorch.zeros(self.num_layers, batch_size, self.hidden_size, device=input.device, dtype=input.dtype)
+        else:
+            h_0 = hx
+
+        h_out_layers = []
+        cur_input = input
+        for layer_idx, cell in enumerate(self.layers):
+            layer_h = h_0[layer_idx]
+            step_outputs = []
+            for t in range(seq_len):
+                layer_h = cell(cur_input[t], layer_h)
+                step_outputs.append(layer_h.unsqueeze(0))
+            cur_input = vultorch.cat(step_outputs, dim=0)
+            h_out_layers.append(layer_h.unsqueeze(0))
+
+        out = cur_input
+        if self.batch_first:
+            out = out.transpose(0, 1)
+        h_n = vultorch.cat(h_out_layers, dim=0)
+        return out, h_n
+
+
+# ----------------------------------------------------------------------------
+# Transformer Containers
+# ----------------------------------------------------------------------------
+class TransformerEncoderLayer(Module):
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1, activation: str = "relu"):
+        super().__init__()
+        self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
+        self.linear1 = Linear(d_model, dim_feedforward)
+        self.linear2 = Linear(dim_feedforward, d_model)
+        self.norm1 = LayerNorm(d_model)
+        self.norm2 = LayerNorm(d_model)
+        self.dropout = Dropout(dropout)
+        self.activation = ReLU() if activation == "relu" else GELU()
+
+    def forward(self, src: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        # Pre-LN or Post-LN standard transformer layer
+        attn_out, _ = self.self_attn(src, src, src, attn_mask=mask)
+        x = self.norm1(src + self.dropout(attn_out))
+        ff_out = self.linear2(self.dropout(self.activation(self.linear1(x))))
+        x = self.norm2(x + self.dropout(ff_out))
+        return x
+
+
+class TransformerEncoder(Module):
+    def __init__(self, encoder_layer: TransformerEncoderLayer, num_layers: int):
+        super().__init__()
+        import copy
+        self.layers = ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
+
+    def forward(self, src: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        out = src
+        for layer in self.layers:
+            out = layer(out, mask=mask)
+        return out
+
 # ----------------------------------------------------------------------------
 class MultiGPU(Module):
     """
