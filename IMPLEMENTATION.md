@@ -288,7 +288,7 @@ Training or running inference on modern Transformers (GPT-2, LLaMA, ViT, Whisper
 
 ---
 
-## Phase 5: Custom `autograd.Function`, Slang Native AutoDiff (`[Differentiable]`), and Vulkan Graph Capture
+## Phase 5: Custom `autograd.Function`, Slang Native AutoDiff (`[Differentiable]`), and Vulkan Graph Capture (Done)
 
 ### Problem Statement
 PyTorch power users rely on custom `autograd.Function`, higher-order gradients (`autograd.grad`), activation checkpointing, and `torch.cuda.CUDAGraph` / `torch.compile` to eliminate Python interpreter overhead on small-batch or deep-network workloads.
@@ -340,19 +340,19 @@ To ensure users and ported PyTorch models never fall back to `.numpy()` over PCI
   - Expose `F.*` wrappers for existing GPU kernels: `F.conv1d`, `F.conv2d`, `F.conv_transpose2d`, `F.max_pool2d`, `F.avg_pool2d`, `F.adaptive_avg_pool2d`, `F.layer_norm`, `F.rms_norm`, `F.batch_norm`, `F.group_norm`, `F.dropout`, `F.embedding`, `F.cross_entropy`, `F.mse_loss`, `F.interpolate`, `F.one_hot`.
   - Add functional + module ops: `F.leaky_relu`/`nn.LeakyReLU`, `F.elu`/`nn.ELU`, `F.selu`, `F.mish`/`nn.Mish`, `F.hardswish`/`nn.Hardswish`, `F.hardsigmoid`, `F.l1_loss`/`nn.L1Loss`, `F.smooth_l1_loss`/`nn.SmoothL1Loss`, `F.nll_loss`, `F.binary_cross_entropy`, `F.binary_cross_entropy_with_logits`/`nn.BCEWithLogitsLoss`, `F.kl_div`, `F.normalize`, `F.cosine_similarity`/`nn.CosineSimilarity`, `nn.Identity`, `nn.Upsample`, `nn.ParameterList`, `nn.ModuleDict`.
 
-### Phase 5 Acceptance Criteria (Must Pass Before Starting Phase 6)
-- [ ] **Autograd Completeness:**
+### Phase 5 Acceptance Criteria (Done)
+- [x] **Autograd Completeness:**
   - Custom multi-input, multi-output `vultorch.autograd.Function` subclasses pass `gradcheck`.
   - In-place mutation of a saved activation tensor raises `RuntimeError("one of the variables needed for gradient computation has been modified by an inplace operation")`.
   - `vultorch.utils.checkpoint` produces bit-identical gradients to uncheckpointed execution while reducing peak activation memory on a 12-layer MLP/Transformer by **$\ge 60\%$**.
-- [ ] **Slang `[Differentiable]` Gate:**
+- [x] **Slang `[Differentiable]` Gate:**
   - All Slang auto-differentiated kernels (`SmoothL1Loss`, `Mish`, `HardSwish`, `CosineSimilarity`) pass finite-difference `gradcheck` to `rtol=1e-4, atol=1e-4`.
-- [ ] **`VulkanGraph` Replay Speedup Gate:**
+- [x] **`VulkanGraph` Replay Speedup Gate:**
   - On a 6-layer small-batch MLP (`batch = 32, hidden = 256`, ~40 kernel dispatches per step where CPU launch overhead dominates), `graph.replay()` reduces full training step wall time by **$\ge 2.0\times$** on `vk:1` and `vk:0` with bit-identical parameter updates.
-- [ ] **Ease-of-Use & Transparent `@vultorch.compile` Gate:**
+- [x] **Ease-of-Use & Transparent `@vultorch.compile` Gate:**
   - Decorating any function or `nn.Module` with `@vultorch.compile` (or calling `model = vultorch.compile(model)`) requires **zero manual graph capture boilerplate** (`VulkanGraph` is captured, cached by input shape/dtype, and safely invalidated or re-captured on dynamic shape changes behind the scenes).
   - Custom operations written with `vultorch.autograd.Function` follow the exact PyTorch `forward(ctx, ...)` / `backward(ctx, ...)` signature so users can copy-paste custom PyTorch autograd functions without modification.
-- [ ] **Zero-Roundtrip GPU Helper & Parity Gate:**
+- [x] **Zero-Roundtrip GPU Helper & Parity Gate:**
   - All new math/elementwise/comparison/NaN-check ops (`round`, `ceil`, `floor`, `trunc`, `pow`, `erf`, `isnan`, `isclose`, `lerp`, `maximum`, `minimum`, etc.), GPU constructors (`randint`, `arange`, `linspace`, `eye`, `randperm`, `*_like`), and `F.*` wrappers execute 100% in Slang on `vk:0`/`vk:1` with **zero `.numpy()` fallbacks** and zero PCIe roundtrips during training/inference steps.
   - All differentiable new ops (`pow`, `square`, `reciprocal`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `erf`, `lerp`, `maximum`, `minimum`, `F.l1_loss`, `F.binary_cross_entropy_with_logits`, etc.) pass `gradcheck` across `cpu`, `vk:0`, and `vk:1`.
 
@@ -462,7 +462,7 @@ flowchart TD
     P2["Phase 2 (Done)<br/>Zero-Copy Strided Views (as_strided), Multi-Dtype (fp16/int64/bool),<br/>2-Level Arena Sub-Allocator & Persistent Staging Ring"]
     P3["Phase 3 (Done)<br/>where/gather/scatter, Multi-Axis cat/pad/tril,<br/>cumsum/sort/topk, im2col+GEMM Conv2d, BatchNorm2d/GroupNorm"]
     P4["Phase 4 (Done)<br/>Slang FlashAttention-2 (Fwd+Bwd), RoPE, SwiGLU, Snake/Mamba,<br/>IEpilogue Fusion, amp.autocast + GradScaler, int4/int8 Linear, MultiGPU(['all'])"]
-    P5["Phase 5: Autograd, Graph Capture & Zero-PCIe Parity<br/>autograd.Function, Checkpointing, Slang [Differentiable],<br/>VulkanGraph (@vultorch.compile), GPU Math/F.* Parity"]
+    P5["Phase 5 (Done)<br/>autograd.Function, Checkpointing, Slang [Differentiable],<br/>VulkanGraph (@vultorch.compile), GPU Math/F.* Parity"]
     P6["Phase 6: Async Multi-GPU & Real-World PyTorch Parity<br/>Timeline Semaphore DMA, Closed-Loop Balancer, Safetensors/DLPack,<br/>RNN/LSTM/GRU, nn.init, einsum, linalg/fft, LR Schedulers"]
     P7["Phase 7: AI Discoverability & Release Polish<br/>llms.txt + llms-full.txt, AGENTS.md,<br/>Canonical examples/ Cookbook, py.typed & PyPI Metadata"]
 
