@@ -358,10 +358,33 @@ To ensure users and ported PyTorch models never fall back to `.numpy()` over PCI
 
 ---
 
-## Phase 6: Async Multi-GPU Timeline Semaphores, Dynamic Load Balancing, and Ecosystem Interop
+## Phase 6: Modern Vulkan Performance APIs, Async Multi-GPU, and Ecosystem Interop
 
 ### Problem Statement
-To make VulTorch a production-ready drop-in replacement for PyTorch on multi-vendor systems, multi-GPU training must overlap backward compute with gradient reduction, dynamically adapt to thermal throttling/PCIe contention, and load/save standard `.safetensors` and PyTorch checkpoints directly.
+To maximize compute throughput and eliminate CPU driver overhead, VulTorch must leverage modern Vulkan 1.2/1.3 APIs (`VK_KHR_push_descriptor`, `VK_EXT_shader_atomic_float`, wave/subgroup operations, persistent `VkPipelineCache`, and `VK_KHR_timeline_semaphore`). Furthermore, multi-GPU training must overlap backward compute with transfer queues, dynamically adapt to thermal throttling, and provide 1:1 PyTorch ecosystem compatibility (`.safetensors`, `einsum`, `linalg`, `nn.init`, LR schedulers).
+
+---
+
+### 6.0 Modern Vulkan Compute Acceleration APIs (`src/runtime/` & `shaders/`)
+Low-level Vulkan 1.2+ and extension capabilities to maximize GPU ALU utilization and eliminate CPU command-recording bottlenecks:
+- **`VK_KHR_push_descriptor` (`vkCmdPushDescriptorSetKHR`) & Bindless Buffers:**
+  - **Where it is used:** `src/runtime/vk_pipeline.cpp` (`VulkanPipelineManager::dispatch`), `src/runtime/vk_context.cpp`.
+  - **Function & Impact:** Replaces traditional `VkDescriptorPool` and `vkAllocateDescriptorSets` / `vkUpdateDescriptorSets` calls on elementwise, unary, binary, and math dispatch loops. Direct buffer binding into the command buffer avoids descriptor pool exhaustion, pool resizing locks, and CPU driver dispatch overhead.
+- **`VK_EXT_shader_atomic_float` / `VK_EXT_shader_atomic_float2`:**
+  - **Where it is used:** `shaders/indexing.slang` (`atomic_add_f32_buf2` used by `scatter_add`, `index_add`, `embedding_backward`), `shaders/manip.slang` (`pad_atomic_add_f32`), and `shaders/conv2d_im2col.slang`.
+  - **Function & Impact:** Replaces the software CAS loop (`InterlockedCompareExchange` in a `while(true)` spinlock) with native hardware `atomicAdd` on floating-point storage buffers at the memory controller level. Resolves catastrophic thread serialization under high index contention.
+- **Register-Level Subgroup / Wave Intrinsics in Reductions:**
+  - **Where it is used:** `shaders/reduction.slang` (`sum`, `mean`, `prod`), `shaders/softmax.slang`, `shaders/layernorm.slang`, `shaders/batchnorm.slang`, and `shaders/groupnorm.slang`.
+  - **Function & Impact:** Replaces multi-step `groupshared float[]` tree reductions and `GroupMemoryBarrierWithGroupSync()` barriers with subgroup shuffle intrinsics (`WaveActiveSum`, `WaveActiveMax`, `WaveReadLaneAt` / `subgroupAdd`). Intra-warp reductions execute directly in registers with single-cycle latency and zero L1 bank conflicts, with shared memory used only for cross-subgroup aggregation.
+- **Subgroup Size Control (`VK_EXT_subgroup_size_control`):**
+  - **Where it is used:** `src/runtime/vk_context.cpp` (`create_logical_device`), Slang compilation flags, and `src/tensor/matmul.cpp`.
+  - **Function & Impact:** Explicitly requests full subgroups and matches hardware wave sizes (e.g. 32 on NVIDIA, 32 or 64 on AMD, 16 or 32 on Intel Iris Xe) via `VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT` to eliminate tail divergence.
+- **Floating-Point Denormal Flush-to-Zero (`VK_KHR_shader_float_controls`):**
+  - **Where it is used:** `src/runtime/vk_context.cpp` (Device creation & pipeline specialization constants).
+  - **Function & Impact:** Enables `shaderDenormFlushToZeroFloat32` and `shaderDenormFlushToZeroFloat16`. Prevents underflowing gradients and activations from dropping ALU execution units into multi-cycle microcode recovery stalls.
+- **Persistent Pipeline Cache (`VkPipelineCache` on Disk):**
+  - **Where it is used:** `src/runtime/vk_pipeline.cpp` (`VulkanPipelineManager` init and teardown).
+  - **Function & Impact:** Loads serialized driver pipeline cache from `~/.cache/vultorch/pipelines.bin` at startup and saves via `vkGetPipelineCacheData` on engine shutdown. Eliminates driver JIT SPIR-V compilation lag across Python runs.
 
 ---
 
@@ -402,6 +425,11 @@ To make VulTorch a production-ready drop-in replacement for PyTorch on multi-ven
   - `vultorch.save` / `vultorch.load` supporting `map_location` and `weights_only`, and `DataLoader` supporting `num_workers` and `pin_memory` (backed by the persistent Vulkan staging ring).
 
 ### Phase 6 Acceptance Criteria (Must Pass Before Starting Phase 7)
+- [ ] **Vulkan 1.2+ Performance Acceleration Gate:**
+  - `VK_KHR_push_descriptor` or bindless path avoids descriptor pool allocation overhead during elementwise/math dispatches.
+  - Software compare-and-swap loop in `shaders/indexing.slang` is replaced by native hardware float atomics (`VK_EXT_shader_atomic_float`), showing $\ge 3\times$ speedup on high-contention `scatter_add_` / `index_add_`.
+  - Reductions (`sum`, `softmax`, `layernorm`) utilize subgroup shuffle instructions (`WaveActiveSum` / `WaveActiveMax`), reducing reduction kernel latency by $\ge 2\times$.
+  - `VkPipelineCache` writes to and loads from disk cache (`~/.cache/vultorch/pipelines.bin`), cutting subsequent process startup and warmup dispatch times by $\ge 80\%$.
 - [ ] **Closed-Loop Multi-GPU Scaling Gate:**
   - On heterogeneous `[vk:0, vk:1]` (Intel Iris Xe + NVIDIA MX450), `DataParallel(..., balance="auto")`:
     - Never runs slower than the fastest single GPU (`vk:1`) on small batches (automatically routing `[0, B]` when PCIe transfer > iGPU savings).
@@ -463,7 +491,7 @@ flowchart TD
     P3["Phase 3 (Done)<br/>where/gather/scatter, Multi-Axis cat/pad/tril,<br/>cumsum/sort/topk, im2col+GEMM Conv2d, BatchNorm2d/GroupNorm"]
     P4["Phase 4 (Done)<br/>Slang FlashAttention-2 (Fwd+Bwd), RoPE, SwiGLU, Snake/Mamba,<br/>IEpilogue Fusion, amp.autocast + GradScaler, int4/int8 Linear, MultiGPU(['all'])"]
     P5["Phase 5 (Done)<br/>autograd.Function, Checkpointing, Slang [Differentiable],<br/>VulkanGraph (@vultorch.compile), GPU Math/F.* Parity"]
-    P6["Phase 6: Async Multi-GPU & Real-World PyTorch Parity<br/>Timeline Semaphore DMA, Closed-Loop Balancer, Safetensors/DLPack,<br/>RNN/LSTM/GRU, nn.init, einsum, linalg/fft, LR Schedulers"]
+    P6["Phase 6: Modern Vulkan APIs, Async Multi-GPU & PyTorch Parity<br/>Push Descriptors, Atomic Float, Subgroup Shuffles, Pipeline Cache,<br/>Timeline Semaphore DMA, Closed-Loop Balancer, Safetensors/DLPack,<br/>RNN/LSTM/GRU, nn.init, einsum, linalg/fft, LR Schedulers"]
     P7["Phase 7: AI Discoverability & Release Polish<br/>llms.txt + llms-full.txt, AGENTS.md,<br/>Canonical examples/ Cookbook, py.typed & PyPI Metadata"]
 
     P0 --> P1 --> P2 --> P3 --> P4 --> P5 --> P6 --> P7
