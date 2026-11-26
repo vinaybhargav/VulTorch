@@ -36,6 +36,8 @@ struct DeviceCapabilities {
   bool storage_16bit = false;
   bool subgroup_basic = false;
   bool subgroup_arithmetic = false;
+  bool subgroup_size_control = false;
+  bool shader_atomic_float = false;
   // A 16x16x16 f16 x f16 -> f32 cooperative-matrix configuration at subgroup
   // scope. Required by shaders/matmul_coopmat.comp.
   bool fp16_coopmat_16x16 = false;

@@ -102,11 +102,44 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
     vkEnumerateDeviceExtensionProperties(physical_device, nullptr, &ext_count, available_exts.data());
 
     std::vector<const char*> enabled_extensions;
+    bool has_atomic_float_ext = false;
+    bool has_subgroup_size_ctrl_ext = false;
     for (const auto& e : available_exts) {
         if (std::strcmp(e.extensionName, "VK_KHR_cooperative_matrix") == 0) {
             has_cooperative_matrix = true;
             enabled_extensions.push_back("VK_KHR_cooperative_matrix");
-            break;
+        } else if (std::strcmp(e.extensionName, "VK_EXT_shader_atomic_float") == 0) {
+            has_atomic_float_ext = true;
+        } else if (std::strcmp(e.extensionName, "VK_EXT_subgroup_size_control") == 0) {
+            has_subgroup_size_ctrl_ext = true;
+        }
+    }
+
+    // Check if the device genuinely supports float32 buffer atomic add
+    VkPhysicalDeviceShaderAtomicFloatFeaturesEXT atomic_float_features{};
+    atomic_float_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_ATOMIC_FLOAT_FEATURES_EXT;
+    if (has_atomic_float_ext) {
+        VkPhysicalDeviceFeatures2 test_feats{};
+        test_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        test_feats.pNext = &atomic_float_features;
+        vkGetPhysicalDeviceFeatures2(physical_device, &test_feats);
+        if (atomic_float_features.shaderBufferFloat32AtomicAdd) {
+            capabilities.shader_atomic_float = true;
+            enabled_extensions.push_back("VK_EXT_shader_atomic_float");
+        }
+    }
+
+    // Check if the device supports subgroup size control
+    VkPhysicalDeviceSubgroupSizeControlFeaturesEXT ssc_features{};
+    ssc_features.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SUBGROUP_SIZE_CONTROL_FEATURES_EXT;
+    if (has_subgroup_size_ctrl_ext) {
+        VkPhysicalDeviceFeatures2 test_feats{};
+        test_feats.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2;
+        test_feats.pNext = &ssc_features;
+        vkGetPhysicalDeviceFeatures2(physical_device, &test_feats);
+        if (ssc_features.subgroupSizeControl) {
+            capabilities.subgroup_size_control = true;
+            enabled_extensions.push_back("VK_EXT_subgroup_size_control");
         }
     }
 
@@ -118,8 +151,19 @@ VulkanDeviceContext::VulkanDeviceContext(uint32_t id, VkPhysicalDevice pdev)
     enabled_float16.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_SHADER_FLOAT16_INT8_FEATURES;
     enabled_float16.shaderFloat16 = capabilities.float16_arithmetic ? VK_TRUE : VK_FALSE;
     enabled_float16.shaderInt8 = supported_shader_int8 ? VK_TRUE : VK_FALSE;
+
+    void** chain_tail = &enabled_float16.pNext;
     if (has_cooperative_matrix) {
-        enabled_float16.pNext = &coop_features;
+        *chain_tail = &coop_features;
+        chain_tail = &coop_features.pNext;
+    }
+    if (capabilities.shader_atomic_float) {
+        *chain_tail = &atomic_float_features;
+        chain_tail = &atomic_float_features.pNext;
+    }
+    if (capabilities.subgroup_size_control) {
+        *chain_tail = &ssc_features;
+        chain_tail = &ssc_features.pNext;
     }
 
     VkPhysicalDevice16BitStorageFeatures enabled_16bit{};

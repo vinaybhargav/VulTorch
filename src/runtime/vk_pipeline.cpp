@@ -2,17 +2,94 @@
 #include <fstream>
 #include <iostream>
 #include <stdexcept>
+#include <filesystem>
+#include <cstdlib>
 
 namespace vultorch {
 
+namespace {
+
+std::string get_pipeline_cache_path(uint32_t device_id) {
+  const char *home = std::getenv("HOME");
+  std::filesystem::path dir;
+  if (home && *home) {
+    dir = std::filesystem::path(home) / ".cache" / "vultorch";
+  } else {
+    dir = std::filesystem::temp_directory_path() / "vultorch_cache";
+  }
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  return (dir / ("pipeline_cache_dev" + std::to_string(device_id) + ".bin")).string();
+}
+
+} // namespace
+
 VulkanPipelineManager::VulkanPipelineManager() { shader_dir = "shaders"; }
+
+VkPipelineCache VulkanPipelineManager::get_or_load_pipeline_cache(uint32_t device_id, VkDevice device) {
+  auto it = vk_pipeline_caches.find(device_id);
+  if (it != vk_pipeline_caches.end()) {
+    return it->second;
+  }
+
+  std::string cache_path = get_pipeline_cache_path(device_id);
+  std::vector<char> cache_data;
+  std::ifstream f(cache_path, std::ios::binary | std::ios::ate);
+  if (f.is_open()) {
+    size_t sz = f.tellg();
+    if (sz >= 16) { // Vulkan pipeline cache header is at least 16 bytes
+      f.seekg(0);
+      cache_data.resize(sz);
+      f.read(cache_data.data(), sz);
+    }
+  }
+
+  VkPipelineCacheCreateInfo ci{};
+  ci.sType = VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO;
+  if (!cache_data.empty()) {
+    ci.initialDataSize = cache_data.size();
+    ci.pInitialData = cache_data.data();
+  }
+
+  VkPipelineCache pcache = VK_NULL_HANDLE;
+  VkResult res = vkCreatePipelineCache(device, &ci, nullptr, &pcache);
+  if (res != VK_SUCCESS) {
+    // Fall back to empty cache if driver rejects stale or mismatched cache data
+    ci.initialDataSize = 0;
+    ci.pInitialData = nullptr;
+    vkCreatePipelineCache(device, &ci, nullptr, &pcache);
+  }
+
+  vk_pipeline_caches[device_id] = pcache;
+  return pcache;
+}
+
+void VulkanPipelineManager::save_pipeline_cache(uint32_t device_id, VkDevice device, VkPipelineCache pcache) {
+  if (device == VK_NULL_HANDLE || pcache == VK_NULL_HANDLE) return;
+  size_t data_size = 0;
+  VkResult res = vkGetPipelineCacheData(device, pcache, &data_size, nullptr);
+  if (res != VK_SUCCESS || data_size == 0) return;
+
+  std::vector<char> data(data_size);
+  res = vkGetPipelineCacheData(device, pcache, &data_size, data.data());
+  if (res == VK_SUCCESS && data_size > 0) {
+    std::string cache_path = get_pipeline_cache_path(device_id);
+    std::ofstream out(cache_path, std::ios::binary | std::ios::trunc);
+    if (out.is_open()) {
+      out.write(data.data(), data_size);
+    }
+  }
+}
 
 void VulkanPipelineManager::clear() {
   std::lock_guard<std::mutex> lock(cache_mutex);
   for (auto &dev_pair : cache) {
+    uint32_t dev_id = dev_pair.first;
+    VkDevice dev = VK_NULL_HANDLE;
     for (auto &pipe_pair : dev_pair.second) {
       PipelineRecord &rec = pipe_pair.second;
       if (rec.device != VK_NULL_HANDLE) {
+        dev = rec.device;
         if (rec.compute_pipeline != VK_NULL_HANDLE) {
           vkDestroyPipeline(rec.device, rec.compute_pipeline, nullptr);
           rec.compute_pipeline = VK_NULL_HANDLE;
@@ -36,7 +113,13 @@ void VulkanPipelineManager::clear() {
         rec.device = VK_NULL_HANDLE;
       }
     }
+    auto it_c = vk_pipeline_caches.find(dev_id);
+    if (it_c != vk_pipeline_caches.end() && it_c->second != VK_NULL_HANDLE && dev != VK_NULL_HANDLE) {
+      save_pipeline_cache(dev_id, dev, it_c->second);
+      vkDestroyPipelineCache(dev, it_c->second, nullptr);
+    }
   }
+  vk_pipeline_caches.clear();
   cache.clear();
 }
 
@@ -145,7 +228,7 @@ PipelineRecord &VulkanPipelineManager::get_or_create_pipeline(
                              shader_name);
   }
 
-  // 4. Create Compute Pipeline
+  // 4. Create Compute Pipeline (backed by persistent VkPipelineCache & Subgroup Size Control)
   VkComputePipelineCreateInfo pipeline_info{};
   pipeline_info.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
   pipeline_info.layout = rec.pipeline_layout;
@@ -155,12 +238,32 @@ PipelineRecord &VulkanPipelineManager::get_or_create_pipeline(
   pipeline_info.stage.module = rec.shader_module;
   pipeline_info.stage.pName = "main";
 
-  res = vkCreateComputePipelines(dev->device, VK_NULL_HANDLE, 1, &pipeline_info,
+  VkPipelineShaderStageRequiredSubgroupSizeCreateInfoEXT req_subgroup_size{};
+  req_subgroup_size.sType =
+      VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_REQUIRED_SUBGROUP_SIZE_CREATE_INFO_EXT;
+  if (dev->capabilities.subgroup_size_control && dev->capabilities.subgroup_size > 0) {
+    req_subgroup_size.requiredSubgroupSize = dev->capabilities.subgroup_size;
+    pipeline_info.stage.pNext = &req_subgroup_size;
+    pipeline_info.stage.flags =
+        VK_PIPELINE_SHADER_STAGE_CREATE_REQUIRE_FULL_SUBGROUPS_BIT_EXT;
+  }
+
+  VkPipelineCache pcache = get_or_load_pipeline_cache(device_id, dev->device);
+  res = vkCreateComputePipelines(dev->device, pcache, 1, &pipeline_info,
                                  nullptr, &rec.compute_pipeline);
+  if (res != VK_SUCCESS) {
+    // If driver rejects subgroup size hint for this particular shader, retry without it
+    pipeline_info.stage.pNext = nullptr;
+    pipeline_info.stage.flags = 0;
+    res = vkCreateComputePipelines(dev->device, pcache, 1, &pipeline_info,
+                                   nullptr, &rec.compute_pipeline);
+  }
   if (res != VK_SUCCESS) {
     throw std::runtime_error("vkCreateComputePipelines failed for " +
                              shader_name);
   }
+  // Periodically flush pipeline cache state
+  save_pipeline_cache(device_id, dev->device, pcache);
 
   // 5. Create Descriptor Pool
   // One set per dispatch, and a set is only freed once its batch has retired,

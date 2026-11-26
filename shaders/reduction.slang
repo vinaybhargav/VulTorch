@@ -10,7 +10,7 @@ struct ReductionParams {
 [[vk::binding(1, 0)]] RWStructuredBuffer<float> dataOut;
 
 static const uint WG_SIZE = 256u;
-static groupshared float s_data[WG_SIZE];
+static groupshared float s_wave_acc[32]; // Up to 32 subgroups (min subgroup size 8)
 
 float reduce_op(float a, float b, uint op) {
     if (op == 0u) return a + b;
@@ -26,6 +26,13 @@ float init_val(uint op) {
     return 0.0;
 }
 
+float wave_reduce(float val, uint op) {
+    if (op == 0u) return WaveActiveSum(val);
+    if (op == 1u) return WaveActiveMax(val);
+    if (op == 2u) return WaveActiveMin(val);
+    return WaveActiveSum(val);
+}
+
 [shader("compute")] [numthreads(256, 1, 1)]
 void reduction(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
     uint row = gid.y;
@@ -39,17 +46,25 @@ void reduction(uint3 gid : SV_GroupID, uint3 lid : SV_GroupThreadID) {
         acc = reduce_op(acc, dataIn[row_offset + i], pc.op_type);
     }
 
-    s_data[tid] = acc;
+    // Step 1: Intra-subgroup reduction using single-cycle register operations
+    float wave_val = wave_reduce(acc, pc.op_type);
+
+    uint wave_size = WaveGetLaneCount();
+    uint lane_id = WaveGetLaneIndex();
+    uint subgroup_id = tid / wave_size;
+    uint num_subgroups = (WG_SIZE + wave_size - 1u) / wave_size;
+
+    if (lane_id == 0u) {
+        s_wave_acc[subgroup_id] = wave_val;
+    }
     GroupMemoryBarrierWithGroupSync();
 
-    for (uint s = WG_SIZE / 2u; s > 0u; s >>= 1u) {
-        if (tid < s) {
-            s_data[tid] = reduce_op(s_data[tid], s_data[tid + s], pc.op_type);
+    // Step 2: Leader subgroup reduces results from all subgroups
+    if (tid < wave_size) {
+        float sub_val = (tid < num_subgroups) ? s_wave_acc[tid] : init_val(pc.op_type);
+        float final_val = wave_reduce(sub_val, pc.op_type);
+        if (tid == 0u) {
+            dataOut[row] = final_val;
         }
-        GroupMemoryBarrierWithGroupSync();
-    }
-
-    if (tid == 0u) {
-        dataOut[row] = s_data[0];
     }
 }

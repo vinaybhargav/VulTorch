@@ -29,11 +29,15 @@ private:
     std::mutex cache_mutex;
     // Map: device_id -> (shader_name -> PipelineRecord)
     std::unordered_map<uint32_t, std::unordered_map<std::string, PipelineRecord>> cache;
+    // Map: device_id -> VkPipelineCache
+    std::unordered_map<uint32_t, VkPipelineCache> vk_pipeline_caches;
 
     VulkanPipelineManager();
     ~VulkanPipelineManager();
 
     std::vector<uint32_t> read_spirv_file(const std::string& filepath);
+    VkPipelineCache get_or_load_pipeline_cache(uint32_t device_id, VkDevice device);
+    void save_pipeline_cache(uint32_t device_id, VkDevice device, VkPipelineCache pcache);
 
     VkDescriptorSet allocate_descriptor_set(const std::shared_ptr<VulkanDeviceContext>& dev,
                                             PipelineRecord& record,
