@@ -31,6 +31,8 @@ from . import amp
 from . import nn
 from . import optim
 from . import utils
+from . import linalg
+from . import fft
 from .serialization import save_safetensors, load_safetensors
 from . import _vultorch_backend as _backend
 
@@ -695,6 +697,46 @@ def load(f):
     import pickle
     with open(f, 'rb') as fp:
         return pickle.load(fp)
+
+# ----------------------------------------------------------------------------
+# Contractions & Matrix Operations
+# ----------------------------------------------------------------------------
+def mm(input: Tensor, mat2: Tensor) -> Tensor:
+    return input.matmul(mat2)
+
+def bmm(input: Tensor, mat2: Tensor) -> Tensor:
+    return input.bmm(mat2)
+
+def addmm(input: Tensor, mat1: Tensor, mat2: Tensor, beta: _builtins.float = 1.0, alpha: _builtins.float = 1.0) -> Tensor:
+    return input * beta + (mat1 @ mat2) * alpha
+
+def baddbmm(input: Tensor, batch1: Tensor, batch2: Tensor, beta: _builtins.float = 1.0, alpha: _builtins.float = 1.0) -> Tensor:
+    return input * beta + batch1.bmm(batch2) * alpha
+
+def dot(tensor1: Tensor, tensor2: Tensor) -> Tensor:
+    if tensor1.dim() != 1 or tensor2.dim() != 1:
+        raise RuntimeError("1D tensors expected for dot")
+    return (tensor1 * tensor2).sum()
+
+def mv(mat: Tensor, vec: Tensor) -> Tensor:
+    if mat.dim() != 2 or vec.dim() != 1:
+        raise RuntimeError("2D matrix and 1D vector expected for mv")
+    return (mat @ vec.unsqueeze(1)).squeeze(1)
+
+def outer(vec1: Tensor, vec2: Tensor) -> Tensor:
+    if vec1.dim() != 1 or vec2.dim() != 1:
+        raise RuntimeError("1D vectors expected for outer")
+    return vec1.unsqueeze(1) @ vec2.unsqueeze(0)
+
+def einsum(equation: str, *operands: Tensor) -> Tensor:
+    """Evaluates Einstein summation convention on the operands."""
+    import numpy as np
+    eq = equation.replace(" ", "")
+    ops_np = [op.cpu().numpy() for op in operands]
+    res_np = np.einsum(eq, *ops_np)
+    first_op = operands[0]
+    return tensor(res_np, device=first_op.device, dtype=first_op.dtype)
+
 
 # Vulkan System and Diagnostics
 class _VulkanInfo:
