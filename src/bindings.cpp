@@ -12,212 +12,206 @@
 namespace py = pybind11;
 using namespace vultorch;
 
-namespace {
+namespace
+{
 
-py::dtype scalar_type_to_numpy_dtype(ScalarType dt) {
-  switch (dt) {
-  case ScalarType::Float32:
+py::dtype scalar_type_to_numpy_dtype(ScalarType dt)
+{
+    switch (dt)
+    {
+    case ScalarType::Float32:
+        return py::dtype("float32");
+    case ScalarType::Float16:
+        return py::dtype("float16");
+    case ScalarType::BFloat16:
+        return py::dtype("float32"); // Exposed as fp32 to NumPy
+    case ScalarType::Int32:
+        return py::dtype("int32");
+    case ScalarType::Int64:
+        return py::dtype("int64");
+    case ScalarType::Bool:
+        return py::dtype("bool");
+    case ScalarType::UInt8:
+        return py::dtype("uint8");
+    }
     return py::dtype("float32");
-  case ScalarType::Float16:
-    return py::dtype("float16");
-  case ScalarType::BFloat16:
-    return py::dtype("float32"); // Exposed as fp32 to NumPy
-  case ScalarType::Int32:
-    return py::dtype("int32");
-  case ScalarType::Int64:
-    return py::dtype("int64");
-  case ScalarType::Bool:
-    return py::dtype("bool");
-  case ScalarType::UInt8:
-    return py::dtype("uint8");
-  }
-  return py::dtype("float32");
 }
 
-ScalarType infer_scalar_type_from_numpy(const py::array &arr) {
-  const py::dtype dt = arr.dtype();
-  if (dt.is(py::dtype("float32")) || dt.is(py::dtype("float64")))
+ScalarType infer_scalar_type_from_numpy(const py::array &arr)
+{
+    const py::dtype dt = arr.dtype();
+    if (dt.is(py::dtype("float32")) || dt.is(py::dtype("float64")))
+        return ScalarType::Float32;
+    if (dt.is(py::dtype("float16")))
+        return ScalarType::Float16;
+    if (dt.is(py::dtype("int32")))
+        return ScalarType::Int32;
+    if (dt.is(py::dtype("int64")))
+        return ScalarType::Int64;
+    if (dt.is(py::dtype("bool")))
+        return ScalarType::Bool;
+    if (dt.is(py::dtype("uint8")))
+        return ScalarType::UInt8;
     return ScalarType::Float32;
-  if (dt.is(py::dtype("float16")))
-    return ScalarType::Float16;
-  if (dt.is(py::dtype("int32")))
-    return ScalarType::Int32;
-  if (dt.is(py::dtype("int64")))
-    return ScalarType::Int64;
-  if (dt.is(py::dtype("bool")))
-    return ScalarType::Bool;
-  if (dt.is(py::dtype("uint8")))
-    return ScalarType::UInt8;
-  return ScalarType::Float32;
 }
 
-py::array ensure_contiguous_numpy_for_dtype(const py::array &arr,
-                                            ScalarType target_dt) {
-  py::dtype target_np = scalar_type_to_numpy_dtype(target_dt);
-  const bool is_c = (arr.flags() & py::array::c_style) != 0;
-  if (is_c && arr.dtype().is(target_np)) {
-    return arr;
-  }
-  py::module_ np = py::module_::import("numpy");
-  return np.attr("ascontiguousarray")(arr, target_np).cast<py::array>();
+py::array ensure_contiguous_numpy_for_dtype(const py::array &arr, ScalarType target_dt)
+{
+    py::dtype target_np = scalar_type_to_numpy_dtype(target_dt);
+    const bool is_c = (arr.flags() & py::array::c_style) != 0;
+    if (is_c && arr.dtype().is(target_np))
+    {
+        return arr;
+    }
+    py::module_ np = py::module_::import("numpy");
+    return np.attr("ascontiguousarray")(arr, target_np).cast<py::array>();
 }
 
 } // namespace
 
-PYBIND11_MODULE(_vultorch_backend, m) {
-  m.doc() = "VulTorch: High-Performance Vulkan-Native Deep Learning Engine";
+PYBIND11_MODULE(_vultorch_backend, m)
+{
+    m.doc() = "VulTorch: High-Performance Vulkan-Native Deep Learning Engine";
 
-  // Ensure Vulkan pipelines and pooled buffers are cleaned up before Python
-  // process teardown (while GPU drivers and ThreadPoolExecutor are still
-  // cleanly shutting down).
-  auto atexit = py::module_::import("atexit");
-  atexit.attr("register")(py::cpp_function([]() {
-    py::gil_scoped_release release;
-    VulkanManager::instance_ref().synchronize_all();
-    VulkanGraph::release_all();
-    VulkanMemoryManager::instance().shutdown();
-    VulkanPipelineManager::instance().clear();
-  }));
+    // Ensure Vulkan pipelines and pooled buffers are cleaned up before Python
+    // process teardown (while GPU drivers and ThreadPoolExecutor are still
+    // cleanly shutting down).
+    auto atexit = py::module_::import("atexit");
+    atexit.attr("register")(py::cpp_function(
+        []()
+        {
+            py::gil_scoped_release release;
+            VulkanManager::instance_ref().synchronize_all();
+            VulkanGraph::release_all();
+            VulkanMemoryManager::instance().shutdown();
+            VulkanPipelineManager::instance().clear();
+        }));
 
-  // Vulkan Device & Manager functions
-  m.def("get_device_count",
-        []() { return VulkanManager::instance_ref().get_device_count(); });
+    // Vulkan Device & Manager functions
+    m.def("get_device_count", []() { return VulkanManager::instance_ref().get_device_count(); });
 
-  m.def("get_device_info", [](uint32_t device_id) {
-    auto info = VulkanManager::instance_ref().get_device_info(device_id);
-    py::dict d;
-    d["id"] = info.id;
-    d["name"] = info.name;
-    d["vendor"] = info.vendor;
-    d["api_version"] =
-        std::to_string(info.api_major) + "." + std::to_string(info.api_minor);
-    d["total_memory"] = info.total_memory;
-    d["is_discrete"] = info.is_discrete;
-    d["has_cooperative_matrix"] = info.has_cooperative_matrix;
-    d["vendor_id"] = info.vendor_id;
-    d["device_id"] = info.device_id;
+    m.def("get_device_info",
+          [](uint32_t device_id)
+          {
+              auto info = VulkanManager::instance_ref().get_device_info(device_id);
+              py::dict d;
+              d["id"] = info.id;
+              d["name"] = info.name;
+              d["vendor"] = info.vendor;
+              d["api_version"] =
+                  std::to_string(info.api_major) + "." + std::to_string(info.api_minor);
+              d["total_memory"] = info.total_memory;
+              d["is_discrete"] = info.is_discrete;
+              d["has_cooperative_matrix"] = info.has_cooperative_matrix;
+              d["vendor_id"] = info.vendor_id;
+              d["device_id"] = info.device_id;
 
-    py::dict caps;
-    caps["subgroup_size"] = info.capabilities.subgroup_size;
-    caps["max_workgroup_invocations"] =
-        info.capabilities.max_workgroup_invocations;
-    caps["max_shared_memory_bytes"] = info.capabilities.max_shared_memory_bytes;
-    caps["float16_arithmetic"] = info.capabilities.float16_arithmetic;
-    caps["storage_16bit"] = info.capabilities.storage_16bit;
-    caps["subgroup_basic"] = info.capabilities.subgroup_basic;
-    caps["subgroup_arithmetic"] = info.capabilities.subgroup_arithmetic;
-    caps["shader_atomic_float"] = info.capabilities.shader_atomic_float;
-    caps["fp16_coopmat_16x16"] = info.capabilities.fp16_coopmat_16x16;
-    d["capabilities"] = caps;
+              py::dict caps;
+              caps["subgroup_size"] = info.capabilities.subgroup_size;
+              caps["max_workgroup_invocations"] = info.capabilities.max_workgroup_invocations;
+              caps["max_shared_memory_bytes"] = info.capabilities.max_shared_memory_bytes;
+              caps["float16_arithmetic"] = info.capabilities.float16_arithmetic;
+              caps["storage_16bit"] = info.capabilities.storage_16bit;
+              caps["subgroup_basic"] = info.capabilities.subgroup_basic;
+              caps["subgroup_arithmetic"] = info.capabilities.subgroup_arithmetic;
+              caps["shader_atomic_float"] = info.capabilities.shader_atomic_float;
+              caps["fp16_coopmat_16x16"] = info.capabilities.fp16_coopmat_16x16;
+              d["capabilities"] = caps;
 
-    py::list configs;
-    for (const auto &c : info.cooperative_matrix_configs) {
-      py::dict cd;
-      cd["M"] = c.M;
-      cd["N"] = c.N;
-      cd["K"] = c.K;
-      cd["a_type"] = c.a_type;
-      cd["b_type"] = c.b_type;
-      cd["c_type"] = c.c_type;
-      cd["result_type"] = c.result_type;
-      cd["scope"] = c.scope;
-      configs.append(cd);
-    }
-    d["cooperative_matrix_configs"] = configs;
-    return d;
-  });
+              py::list configs;
+              for (const auto &c : info.cooperative_matrix_configs)
+              {
+                  py::dict cd;
+                  cd["M"] = c.M;
+                  cd["N"] = c.N;
+                  cd["K"] = c.K;
+                  cd["a_type"] = c.a_type;
+                  cd["b_type"] = c.b_type;
+                  cd["c_type"] = c.c_type;
+                  cd["result_type"] = c.result_type;
+                  cd["scope"] = c.scope;
+                  configs.append(cd);
+              }
+              d["cooperative_matrix_configs"] = configs;
+              return d;
+          });
 
-  m.def("get_all_devices", []() {
-    auto list = VulkanManager::instance_ref().get_all_device_info();
-    py::list pylist;
-    for (const auto &info : list) {
-      py::dict d;
-      d["id"] = info.id;
-      d["name"] = info.name;
-      d["vendor"] = info.vendor;
-      d["api_version"] =
-          std::to_string(info.api_major) + "." + std::to_string(info.api_minor);
-      d["total_memory"] = info.total_memory;
-      d["is_discrete"] = info.is_discrete;
-      d["has_cooperative_matrix"] = info.has_cooperative_matrix;
-      d["cooperative_matrix_configs_count"] =
-          info.cooperative_matrix_configs.size();
-      pylist.append(d);
-    }
-    return pylist;
-  });
+    m.def("get_all_devices",
+          []()
+          {
+              auto list = VulkanManager::instance_ref().get_all_device_info();
+              py::list pylist;
+              for (const auto &info : list)
+              {
+                  py::dict d;
+                  d["id"] = info.id;
+                  d["name"] = info.name;
+                  d["vendor"] = info.vendor;
+                  d["api_version"] =
+                      std::to_string(info.api_major) + "." + std::to_string(info.api_minor);
+                  d["total_memory"] = info.total_memory;
+                  d["is_discrete"] = info.is_discrete;
+                  d["has_cooperative_matrix"] = info.has_cooperative_matrix;
+                  d["cooperative_matrix_configs_count"] = info.cooperative_matrix_configs.size();
+                  pylist.append(d);
+              }
+              return pylist;
+          });
 
-  m.def(
-      "synchronize",
-      [](int device_id) {
-        if (device_id >= 0) {
-          VulkanManager::instance_ref().synchronize_device(device_id);
-        }
-      },
-      py::arg("device_id") = 0, py::call_guard<py::gil_scoped_release>());
+    m.def(
+        "synchronize",
+        [](int device_id)
+        {
+            if (device_id >= 0)
+            {
+                VulkanManager::instance_ref().synchronize_device(device_id);
+            }
+        },
+        py::arg("device_id") = 0, py::call_guard<py::gil_scoped_release>());
 
-  m.def(
-      "synchronize_all",
-      []() { VulkanManager::instance_ref().synchronize_all(); },
-      py::call_guard<py::gil_scoped_release>());
+    m.def(
+        "synchronize_all", []() { VulkanManager::instance_ref().synchronize_all(); },
+        py::call_guard<py::gil_scoped_release>());
 
-  m.def("set_shader_directory", [](const std::string &dir) {
-    VulkanPipelineManager::instance().set_shader_directory(dir);
-  });
+    m.def("set_shader_directory", [](const std::string &dir)
+          { VulkanPipelineManager::instance().set_shader_directory(dir); });
 
-  m.def("get_shader_directory", []() {
-    return VulkanPipelineManager::instance().get_shader_directory();
-  });
+    m.def("get_shader_directory",
+          []() { return VulkanPipelineManager::instance().get_shader_directory(); });
 
-  m.def(
-      "recorded_dispatches",
-      [](uint32_t device_id) {
-        return VulkanManager::instance_ref()
-            .get_device(device_id)
-            ->recorded_dispatches();
-      },
-      py::arg("device_id") = 0);
+    m.def(
+        "recorded_dispatches", [](uint32_t device_id)
+        { return VulkanManager::instance_ref().get_device(device_id)->recorded_dispatches(); },
+        py::arg("device_id") = 0);
 
-  m.def(
-      "submitted_batches",
-      [](uint32_t device_id) {
-        return VulkanManager::instance_ref()
-            .get_device(device_id)
-            ->submitted_batches();
-      },
-      py::arg("device_id") = 0);
+    m.def(
+        "submitted_batches", [](uint32_t device_id)
+        { return VulkanManager::instance_ref().get_device(device_id)->submitted_batches(); },
+        py::arg("device_id") = 0);
 
-  m.def(
-      "driver_allocation_count",
-      [](int device_id) {
-        return VulkanMemoryManager::instance().driver_allocation_count(
-            device_id);
-      },
-      py::arg("device_id") = -1);
+    m.def(
+        "driver_allocation_count", [](int device_id)
+        { return VulkanMemoryManager::instance().driver_allocation_count(device_id); },
+        py::arg("device_id") = -1);
 
-  m.def(
-      "active_arena_bytes",
-      [](int device_id) {
-        return VulkanMemoryManager::instance().active_arena_bytes(device_id);
-      },
-      py::arg("device_id") = -1);
+    m.def(
+        "active_arena_bytes",
+        [](int device_id) { return VulkanMemoryManager::instance().active_arena_bytes(device_id); },
+        py::arg("device_id") = -1);
 
-  m.def(
-      "reserved_arena_bytes",
-      [](int device_id) {
-        return VulkanMemoryManager::instance().reserved_arena_bytes(device_id);
-      },
-      py::arg("device_id") = -1);
+    m.def(
+        "reserved_arena_bytes", [](int device_id)
+        { return VulkanMemoryManager::instance().reserved_arena_bytes(device_id); },
+        py::arg("device_id") = -1);
 
-  m.def("pooled_buffer_count",
-        []() { return VulkanMemoryManager::instance().pooled_buffer_count(); });
+    m.def("pooled_buffer_count",
+          []() { return VulkanMemoryManager::instance().pooled_buffer_count(); });
 
-  m.def("live_allocation_count", []() {
-    return VulkanMemoryManager::instance().live_allocation_count();
-  });
+    m.def("live_allocation_count",
+          []() { return VulkanMemoryManager::instance().live_allocation_count(); });
 
-  // NativeTensor Bindings
-  py::class_<NativeTensor, std::shared_ptr<NativeTensor>>(m, "NativeTensor")
+    // NativeTensor Bindings
+    py::class_<NativeTensor, std::shared_ptr<NativeTensor>>(m, "NativeTensor")
       .def(py::init([](const std::vector<int64_t> &shape, int dev_id,
                        const std::string &dt) {
              return std::make_shared<NativeTensor>(shape, dev_id,
@@ -588,17 +582,13 @@ PYBIND11_MODULE(_vultorch_backend, m) {
           },
           py::arg("array"), py::arg("device_id") = 0, py::arg("dtype") = "");
 
-  py::class_<VulkanGraph>(m, "VulkanGraph")
-      .def(py::init<uint32_t>(), py::arg("device_id") = 0)
-      .def("capture_begin", &VulkanGraph::capture_begin,
-           py::call_guard<py::gil_scoped_release>())
-      .def("capture_end", &VulkanGraph::capture_end,
-           py::call_guard<py::gil_scoped_release>())
-      .def("replay", &VulkanGraph::replay,
-           py::call_guard<py::gil_scoped_release>())
-      .def("release", &VulkanGraph::release,
-           py::call_guard<py::gil_scoped_release>())
-      .def_property_readonly("device_id", &VulkanGraph::device_id)
-      .def_property_readonly("num_dispatches", &VulkanGraph::num_dispatches)
-      .def_property_readonly("is_captured", &VulkanGraph::is_captured);
+    py::class_<VulkanGraph>(m, "VulkanGraph")
+        .def(py::init<uint32_t>(), py::arg("device_id") = 0)
+        .def("capture_begin", &VulkanGraph::capture_begin, py::call_guard<py::gil_scoped_release>())
+        .def("capture_end", &VulkanGraph::capture_end, py::call_guard<py::gil_scoped_release>())
+        .def("replay", &VulkanGraph::replay, py::call_guard<py::gil_scoped_release>())
+        .def("release", &VulkanGraph::release, py::call_guard<py::gil_scoped_release>())
+        .def_property_readonly("device_id", &VulkanGraph::device_id)
+        .def_property_readonly("num_dispatches", &VulkanGraph::num_dispatches)
+        .def_property_readonly("is_captured", &VulkanGraph::is_captured);
 }
