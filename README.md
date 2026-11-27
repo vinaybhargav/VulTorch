@@ -13,7 +13,6 @@
   <a href="#-architecture--performance-stack">Architecture</a> •
   <a href="#-quick-start">Quick Start</a> •
   <a href="#-examples--cookbook">Cookbook</a> •
-  <a href="#-benchmarks">Benchmarks</a> •
   <a href="#-building--developing">Build</a> •
   <a href="#-agent--developer-resources">Agents & LLMs</a> •
   <a href="#-license">License</a>
@@ -284,24 +283,6 @@ torch.save_safetensors(model.state_dict(), "model.safetensors")
 state_dict = torch.load_safetensors("model.safetensors", device="vk:0")
 model.load_state_dict(state_dict)
 ```
-
----
-
-## 🏆 Benchmarks
-
-### Neural Text Compression: VulTorch vs CMIX & LZMA -9
-
-Tested on the standard 2,048-byte English text benchmark comparing standard **LZMA -9**, the world-record CPU compressor **CMIX v21**, and **VulTorch Multi-GPU Neural Compressor**:
-
-| Compressor | Compressed Size | Compression Ratio | Bits / Byte | Total Comp Time | Decomp Time | Lossless Match |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| **LZMA -9** *(Maximum Preset)* | 663 bytes | 32.37% | 2.59 b/B | **0.007 s** | **1.8 ms** | [PASS] |
-| **CMIX v21** *(World Record)* | 345 bytes | 16.85% | 1.35 b/B | 40.39 s | 40.44 s | [PASS] |
-| **VulTorch Multi-GPU Neural** | **63 bytes** | **3.08%** | **0.25 b/B** | **6.79 s** | **6.66 s** | **[PASS] 100% Bit-Exact** |
-
-- **81.7% smaller payload than CMIX** (63 bytes vs 345 bytes).
-- **~6x faster than CMIX** on commodity consumer GPUs.
-- **100% Cryptographic SHA-256 Match**: Byte-for-byte lossless recovery.
 
 ---
 
