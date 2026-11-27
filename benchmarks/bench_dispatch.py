@@ -57,7 +57,7 @@ def bench_matmul(device: str, n: int = 1024, iters: int = 10) -> tuple:
     a = torch.randn(n, n, device=device)
     b = torch.randn(n, n, device=device)
     ms = time_per_op(lambda: a @ b, iters)
-    tflops = (2 * n ** 3) / (ms / 1e3) / 1e12
+    tflops = (2 * n**3) / (ms / 1e3) / 1e12
     return ms, tflops
 
 
@@ -108,9 +108,7 @@ def bench_train_step(device: str, iters: int = 10, batch: int = 512) -> float:
     model = nn.Linear(1024, 2048).to(device)
     opt = optim.Adam(model.parameters(), lr=1e-3)
     x = torch.randn(batch, 1024, device=device)
-    y = torch.tensor(
-        np.random.randint(0, 2048, size=(batch,)).astype(np.float32), device=device
-    )
+    y = torch.tensor(np.random.randint(0, 2048, size=(batch,)).astype(np.float32), device=device)
     crit = nn.CrossEntropyLoss()
 
     def step():

@@ -4,6 +4,7 @@ High-Precision 32-bit / 64-bit Range Coder for Neural Entropy Compression
 
 import numpy as np
 
+
 class RangeCoder:
     TOP = 1 << 24
     BOTTOM = 1 << 16
@@ -37,9 +38,11 @@ class RangeCoder:
 
             range_ //= total_count
             low += sym_low * range_
-            range_ *= (sym_high - sym_low)
+            range_ *= sym_high - sym_low
 
-            while (low ^ (low + range_)) < cls.TOP or (range_ < cls.BOTTOM and ((range_ := -low & (cls.BOTTOM - 1)), True)):
+            while (low ^ (low + range_)) < cls.TOP or (
+                range_ < cls.BOTTOM and ((range_ := -low & (cls.BOTTOM - 1)), True)
+            ):
                 output.append((low >> 24) & 0xFF)
                 low = (low << 8) & 0xFFFFFFFF
                 range_ = (range_ << 8) & 0xFFFFFFFF
@@ -83,16 +86,18 @@ class RangeCoder:
             count_val = (code - low) // range_
 
             # Binary search for symbol
-            sym = int(np.searchsorted(cum, count_val, side='right') - 1)
+            sym = int(np.searchsorted(cum, count_val, side="right") - 1)
             sym = max(0, min(255, sym))
 
             sym_low = int(cum[sym])
             sym_high = int(cum[sym + 1])
 
             low += sym_low * range_
-            range_ *= (sym_high - sym_low)
+            range_ *= sym_high - sym_low
 
-            while (low ^ (low + range_)) < cls.TOP or (range_ < cls.BOTTOM and ((range_ := -low & (cls.BOTTOM - 1)), True)):
+            while (low ^ (low + range_)) < cls.TOP or (
+                range_ < cls.BOTTOM and ((range_ := -low & (cls.BOTTOM - 1)), True)
+            ):
                 b = stream[stream_idx] if stream_idx < len(stream) else 0
                 stream_idx += 1
                 code = ((code << 8) | b) & 0xFFFFFFFF

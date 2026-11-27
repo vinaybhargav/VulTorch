@@ -16,8 +16,10 @@ import vultorch.nn as nn
 import vultorch.optim as optim
 from vultorch.utils.range_coder import RangeCoder
 
+
 class NeuralCompressor1M(nn.Module):
     """Exact ~1 Million Parameter Autoregressive Byte Predictor"""
+
     def __init__(self, context_len=8, embed_dim=128, hidden_dim=512, device="vk:0"):
         super().__init__()
         self.context_len = context_len
@@ -31,14 +33,17 @@ class NeuralCompressor1M(nn.Module):
 
     def forward(self, x_ctx):
         # x_ctx: [B, context_len]
-        emb = self.embed(x_ctx) # [B, context_len, embed_dim]
+        emb = self.embed(x_ctx)  # [B, context_len, embed_dim]
         flat = emb.flatten(start_dim=1)
         h1 = self.act1(self.fc1(flat))
         h2 = self.act2(self.fc2(h1))
         logits = self.fc3(h2)
         return logits
 
-def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, device="vk:0", devices=None):
+
+def train_codec_model(
+    text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, device="vk:0", devices=None
+):
     """Trains the 1M parameter model on text patterns using VulTorch on GPU (supports multi-GPU DataParallel)."""
     K = 8
     padded = bytes([0] * K) + text_bytes
@@ -48,7 +53,7 @@ def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, de
     contexts = []
     targets = []
     for i in range(N):
-        contexts.append(list(padded[i:i + K]))
+        contexts.append(list(padded[i : i + K]))
         targets.append(text_bytes[i])
 
     ctx_arr = np.array(contexts, dtype=np.int64)
@@ -67,22 +72,32 @@ def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, de
     use_multi_gpu = len(devices) > 1
 
     if use_multi_gpu:
-        print(f"🔧 Neural Model Initialized: {total_params:,} parameters across {len(devices)} GPUs: {devices}")
+        print(
+            f"🔧 Neural Model Initialized: {total_params:,} parameters across {len(devices)} GPUs: {devices}"
+        )
         for d in devices:
             d_idx = int(d.split(":")[-1])
             print(f"   - {d}: {torch.vulkan.get_device_name(d_idx)}")
         parallel_model = nn.DataParallel(model, device_ids=devices)
         parallel_model.sync_every_forward = True
     else:
-        print(f"🔧 Neural Model Initialized: {total_params:,} parameters on {master_dev} ({torch.vulkan.get_device_name(int(master_dev.split(':')[-1]))})")
+        print(
+            f"🔧 Neural Model Initialized: {total_params:,} parameters on {master_dev} ({torch.vulkan.get_device_name(int(master_dev.split(':')[-1]))})"
+        )
         parallel_model = model
 
     optimizer = optim.Adam(model.parameters(), lr=lr)
     criterion = nn.CrossEntropyLoss()
 
     num_batches = (N + batch_size - 1) // batch_size
-    mode_str = f"Heterogeneous Multi-GPU ({', '.join(devices)})" if use_multi_gpu else f"Single GPU ({master_dev})"
-    print(f"🏋️  Training 1M parameter model on {N:,} bytes ({epochs} epochs, batch size {batch_size}, {mode_str})...")
+    mode_str = (
+        f"Heterogeneous Multi-GPU ({', '.join(devices)})"
+        if use_multi_gpu
+        else f"Single GPU ({master_dev})"
+    )
+    print(
+        f"🏋️  Training 1M parameter model on {N:,} bytes ({epochs} epochs, batch size {batch_size}, {mode_str})..."
+    )
 
     t0 = time.time()
     for ep in range(1, epochs + 1):
@@ -90,7 +105,7 @@ def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, de
         total_loss = 0.0
 
         for b in range(num_batches):
-            idx = perm[b * batch_size: min((b + 1) * batch_size, N)]
+            idx = perm[b * batch_size : min((b + 1) * batch_size, N)]
             bx = torch.tensor(ctx_arr[idx], device=master_dev)
             by = torch.tensor(tgt_arr[idx], device=master_dev)
 
@@ -110,13 +125,16 @@ def train_codec_model(text_bytes: bytes, epochs=15, batch_size=256, lr=0.003, de
             total_loss += loss.item() * len(idx)
 
         avg_loss = total_loss / N
-        bpc = avg_loss / np.log(2) # bits per character/byte
+        bpc = avg_loss / np.log(2)  # bits per character/byte
         if ep % 5 == 0 or ep == 1:
-            print(f"   Epoch {ep:2d}/{epochs} | Loss: {avg_loss:.4f} nats | Shannon Entropy: {bpc:.2f} bits/byte")
+            print(
+                f"   Epoch {ep:2d}/{epochs} | Loss: {avg_loss:.4f} nats | Shannon Entropy: {bpc:.2f} bits/byte"
+            )
 
     torch.vulkan.synchronize_all()
     print(f"✅ Training completed in {time.time() - t0:.2f}s on Vulkan GPU(s)!")
     return model
+
 
 def compress_file(model, data: bytes, batch_size=512, device="vk:0") -> bytes:
     K = 8
@@ -125,13 +143,13 @@ def compress_file(model, data: bytes, batch_size=512, device="vk:0") -> bytes:
 
     contexts = []
     for i in range(N):
-        contexts.append(list(padded[i:i + K]))
+        contexts.append(list(padded[i : i + K]))
     ctx_arr = np.array(contexts, dtype=np.int64)
 
     all_probs = []
     with torch.no_grad():
         for b in range(0, N, batch_size):
-            bx = torch.tensor(ctx_arr[b:min(b + batch_size, N)], device=device)
+            bx = torch.tensor(ctx_arr[b : min(b + batch_size, N)], device=device)
             logits = model(bx)
             probs = logits.softmax(dim=-1).numpy()
             all_probs.extend(probs)
@@ -139,6 +157,7 @@ def compress_file(model, data: bytes, batch_size=512, device="vk:0") -> bytes:
     payload = RangeCoder.encode(data, all_probs)
     header = struct.pack(">I", N)
     return header + payload
+
 
 def decompress_file(model, compressed_bytes: bytes, device="vk:0") -> bytes:
     N = struct.unpack(">I", compressed_bytes[:4])[0]
@@ -162,7 +181,7 @@ def decompress_file(model, compressed_bytes: bytes, device="vk:0") -> bytes:
 
     with torch.no_grad():
         for i in range(N):
-            ctx = list(decoded[i:i + K])
+            ctx = list(decoded[i : i + K])
             ctx_tensor = torch.tensor(np.array([ctx], dtype=np.int64), device=device)
             logits = model(ctx_tensor)
             probs = logits.softmax(dim=-1).numpy()[0]
@@ -178,16 +197,18 @@ def decompress_file(model, compressed_bytes: bytes, device="vk:0") -> bytes:
             range_ //= total_count
             count_val = (code - low) // range_
 
-            sym = int(np.searchsorted(cum, count_val, side='right') - 1)
+            sym = int(np.searchsorted(cum, count_val, side="right") - 1)
             sym = max(0, min(255, sym))
 
             sym_low = int(cum[sym])
             sym_high = int(cum[sym + 1])
 
             low += sym_low * range_
-            range_ *= (sym_high - sym_low)
+            range_ *= sym_high - sym_low
 
-            while (low ^ (low + range_)) < RangeCoder.TOP or (range_ < RangeCoder.BOTTOM and ((range_ := -low & (RangeCoder.BOTTOM - 1)), True)):
+            while (low ^ (low + range_)) < RangeCoder.TOP or (
+                range_ < RangeCoder.BOTTOM and ((range_ := -low & (RangeCoder.BOTTOM - 1)), True)
+            ):
                 b = stream[stream_idx] if stream_idx < len(stream) else 0
                 stream_idx += 1
                 code = ((code << 8) | b) & 0xFFFFFFFF
@@ -199,11 +220,16 @@ def decompress_file(model, compressed_bytes: bytes, device="vk:0") -> bytes:
 
     return bytes(out_bytes)
 
+
 def run_compression_showdown():
     # Load diverse natural technical and legal text from system
     data = bytearray()
     import glob
-    for p in sorted(glob.glob("/usr/share/licenses/**/LICENSE*", recursive=True) + glob.glob("/usr/share/licenses/**/COPYING*", recursive=True)):
+
+    for p in sorted(
+        glob.glob("/usr/share/licenses/**/LICENSE*", recursive=True)
+        + glob.glob("/usr/share/licenses/**/COPYING*", recursive=True)
+    ):
         try:
             with open(p, "rb") as f:
                 data.extend(f.read())
@@ -224,6 +250,7 @@ def run_compression_showdown():
 
     # 1. Run LZMA -9
     import subprocess
+
     t0 = time.time()
     res = subprocess.run(["lzma", "-9", "-c", "benchmark_doc.txt"], stdout=subprocess.PIPE)
     lzma_bytes = res.stdout
@@ -235,7 +262,7 @@ def run_compression_showdown():
     print(f"\n📦 LZMA -9 (Max Compression Preset):")
     print(f"   Size:             {lzma_size:,} bytes")
     print(f"   Compression Ratio: {lzma_ratio:.2f}% ({lzma_bpc:.2f} bits/byte)")
-    print(f"   Execution Time:   {lzma_time*1000:.1f} ms")
+    print(f"   Execution Time:   {lzma_time * 1000:.1f} ms")
 
     # 2. Train VulTorch 1M Neural Compressor on GPU
     print(f"\n⚡ VulTorch 1M Neural Compressor (Pure Vulkan GPU):")
@@ -257,7 +284,7 @@ def run_compression_showdown():
     print(f"   File:             benchmark_doc.txt.vt")
     print(f"   Size:             {vt_size:,} bytes")
     print(f"   Compression Ratio: {vt_ratio:.2f}% ({vt_bpc:.2f} bits/byte)")
-    print(f"   Encode Time:      {comp_time*1000:.1f} ms")
+    print(f"   Encode Time:      {comp_time * 1000:.1f} ms")
 
     # 4. Compare results
     print("\n" + "=" * 70)
@@ -273,6 +300,7 @@ def run_compression_showdown():
     else:
         print(f"   VulTorch vs LZMA diff: {diff} bytes")
     print("=" * 70)
+
 
 if __name__ == "__main__":
     run_compression_showdown()

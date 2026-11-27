@@ -1,6 +1,7 @@
 import pytest
 import vultorch as torch
 
+
 def test_vulkan_device_discovery():
     assert torch.vulkan.is_available()
     count = torch.vulkan.device_count()
@@ -12,7 +13,10 @@ def test_vulkan_device_discovery():
         assert "vendor" in props
         assert "total_memory" in props
         assert props["total_memory"] > 0
-        print(f"Discovered GPU {i}: {props['name']} ({props['vendor']}) - Memory: {props['total_memory'] / (1024**3):.2f} GB")
+        print(
+            f"Discovered GPU {i}: {props['name']} ({props['vendor']}) - Memory: {props['total_memory'] / (1024**3):.2f} GB"
+        )
+
 
 def test_device_object():
     d_cpu = torch.device("cpu")

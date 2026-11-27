@@ -35,8 +35,7 @@ def test_where_broadcast_and_gradcheck(dev):
     np.testing.assert_allclose(out.numpy(), expected, rtol=1e-5, atol=1e-5)
 
     assert torch.gradcheck(
-        lambda x, y: torch.where(cond, x, y).sum(),
-        a, b, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda x, y: torch.where(cond, x, y).sum(), a, b, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
 
@@ -53,8 +52,7 @@ def test_masked_fill_and_gradcheck(dev):
     np.testing.assert_allclose(out.numpy(), expected, rtol=1e-5, atol=1e-5)
 
     assert torch.gradcheck(
-        lambda t: t.masked_fill(m, 0.0).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: t.masked_fill(m, 0.0).sum(), x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
     x_inp = torch.tensor(x_np, device=dev)
@@ -75,8 +73,7 @@ def test_gather_scatter_index_select_and_gradcheck(dev):
     np.testing.assert_allclose(g.numpy(), expected_g, rtol=1e-5, atol=1e-5)
 
     assert torch.gradcheck(
-        lambda t: t.gather(1, idx).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: t.gather(1, idx).sum(), x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
     # scatter_add_
@@ -95,8 +92,7 @@ def test_gather_scatter_index_select_and_gradcheck(dev):
     sel = x.index_select(0, sel_idx)
     np.testing.assert_allclose(sel.numpy(), x_np[sel_idx_np], rtol=1e-5, atol=1e-5)
     assert torch.gradcheck(
-        lambda t: t.index_select(0, sel_idx).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: t.index_select(0, sel_idx).sum(), x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
 
@@ -109,7 +105,9 @@ def test_multi_axis_cat_stack_split_chunk_and_gradcheck(dev, dim):
     b = torch.tensor(b_np, device=dev, requires_grad=True)
 
     c = torch.cat([a, b], dim=dim)
-    np.testing.assert_allclose(c.numpy(), np.concatenate([a_np, b_np], axis=dim), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        c.numpy(), np.concatenate([a_np, b_np], axis=dim), rtol=1e-5, atol=1e-5
+    )
 
     parts = c.chunk(2, dim=dim)
     assert len(parts) == 2
@@ -119,7 +117,12 @@ def test_multi_axis_cat_stack_split_chunk_and_gradcheck(dev, dim):
     if dim == 1:
         assert torch.gradcheck(
             lambda x, y: (torch.cat([x, y], dim=1) ** 2).sum(),
-            a, b, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+            a,
+            b,
+            eps=2e-3,
+            rtol=2e-2,
+            atol=5e-3,
+            device=dev,
         )
 
 
@@ -138,7 +141,11 @@ def test_pad_and_gradcheck(dev, mode):
 
     assert torch.gradcheck(
         lambda t: (F.pad(t, pad_spec, mode=mode) ** 2).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        x,
+        eps=2e-3,
+        rtol=2e-2,
+        atol=5e-3,
+        device=dev,
     )
 
 
@@ -149,11 +156,21 @@ def test_tril_triu_flip_roll_repeat(dev):
 
     np.testing.assert_allclose(x.tril(-1).numpy(), np.tril(x_np, k=-1), rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(x.triu(1).numpy(), np.triu(x_np, k=1), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(x.flip([1, 2]).numpy(), np.flip(x_np, axis=(1, 2)), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(x.roll(2, dims=2).numpy(), np.roll(x_np, 2, axis=2), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(x.repeat(1, 2, 1).numpy(), np.tile(x_np, (1, 2, 1)), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        x.flip([1, 2]).numpy(), np.flip(x_np, axis=(1, 2)), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        x.roll(2, dims=2).numpy(), np.roll(x_np, 2, axis=2), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        x.repeat(1, 2, 1).numpy(), np.tile(x_np, (1, 2, 1)), rtol=1e-5, atol=1e-5
+    )
 
     assert torch.gradcheck(
         lambda t: (t.tril(0) + t.flip([2]) + t.roll(1, dims=1)).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        x,
+        eps=2e-3,
+        rtol=2e-2,
+        atol=5e-3,
+        device=dev,
     )

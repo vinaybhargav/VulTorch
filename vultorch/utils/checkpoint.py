@@ -51,9 +51,7 @@ class _CheckpointFunction(Function):
             rebuilt_args[idx] = val
 
         with enable_grad():
-            with vultorch.amp.autocast(
-                dtype=ctx.autocast_dtype, enabled=ctx.had_autocast
-            ):
+            with vultorch.amp.autocast(dtype=ctx.autocast_dtype, enabled=ctx.had_autocast):
                 outputs = ctx.run_function(*rebuilt_args)
 
         if not isinstance(outputs, tuple):
@@ -67,13 +65,16 @@ class _CheckpointFunction(Function):
                 diff_grads.append(g)
 
         if diff_outputs:
-            input_grads = _run_backward(
-                diff_outputs,
-                diff_grads,
-                target_inputs=detached_inputs,
-                allow_unused=True,
-                accumulate_untargeted_leaves=True,
-            ) or ()
+            input_grads = (
+                _run_backward(
+                    diff_outputs,
+                    diff_grads,
+                    target_inputs=detached_inputs,
+                    allow_unused=True,
+                    accumulate_untargeted_leaves=True,
+                )
+                or ()
+            )
         else:
             input_grads = tuple(None for _ in detached_inputs)
 

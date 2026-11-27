@@ -48,7 +48,12 @@ def test_custom_autograd_function_single_and_multi_output(device):
     y = vultorch.tensor([[0.8, 1.3], [-1.1, 0.4]], device=device, requires_grad=True)
 
     assert vultorch.gradcheck(lambda a, b: _MulAddFn.apply(a, b, 1.5).sum(), x, y, device=device)
-    assert vultorch.gradcheck(lambda a, b: (_SplitSquareFn.apply(a, b)[0] + _SplitSquareFn.apply(a, b)[1]).sum(), x, y, device=device)
+    assert vultorch.gradcheck(
+        lambda a, b: (_SplitSquareFn.apply(a, b)[0] + _SplitSquareFn.apply(a, b)[1]).sum(),
+        x,
+        y,
+        device=device,
+    )
 
     # Multi-output backward via sum
     a, b = _SplitSquareFn.apply(x, y)
@@ -140,15 +145,37 @@ def test_activation_checkpointing_matches_uncheckpointed(device):
 def test_slang_differentiable_ops_gradcheck(device):
     import vultorch.nn.functional as F
 
-    x = vultorch.tensor([[-1.5, -0.2, 0.4, 1.8], [0.1, -2.5, 2.2, -0.7]], device=device, requires_grad=True)
-    y = vultorch.tensor([[0.5, -0.8, 1.1, 0.9], [-0.3, -1.2, 1.0, 0.2]], device=device, requires_grad=True)
+    x = vultorch.tensor(
+        [[-1.5, -0.2, 0.4, 1.8], [0.1, -2.5, 2.2, -0.7]], device=device, requires_grad=True
+    )
+    y = vultorch.tensor(
+        [[0.5, -0.8, 1.1, 0.9], [-0.3, -1.2, 1.0, 0.2]], device=device, requires_grad=True
+    )
 
     assert vultorch.gradcheck(lambda t: F.mish(t).sum(), x, device=device, atol=1e-3, rtol=1e-3)
-    assert vultorch.gradcheck(lambda t: F.hardswish(t).sum(), x, device=device, atol=1e-3, rtol=1e-3)
-    assert vultorch.gradcheck(lambda t: F.leaky_relu(t, 0.1).sum(), x, device=device, atol=1e-3, rtol=1e-3)
+    assert vultorch.gradcheck(
+        lambda t: F.hardswish(t).sum(), x, device=device, atol=1e-3, rtol=1e-3
+    )
+    assert vultorch.gradcheck(
+        lambda t: F.leaky_relu(t, 0.1).sum(), x, device=device, atol=1e-3, rtol=1e-3
+    )
     assert vultorch.gradcheck(lambda t: F.elu(t, 1.0).sum(), x, device=device, atol=1e-3, rtol=1e-3)
-    assert vultorch.gradcheck(lambda a, b: F.smooth_l1_loss(a, b, reduction="sum", beta=1.0), x, y, device=device, atol=1e-3, rtol=1e-3)
-    assert vultorch.gradcheck(lambda a, b: F.cosine_similarity(a, b, dim=-1).sum(), x, y, device=device, atol=1e-3, rtol=1e-3)
+    assert vultorch.gradcheck(
+        lambda a, b: F.smooth_l1_loss(a, b, reduction="sum", beta=1.0),
+        x,
+        y,
+        device=device,
+        atol=1e-3,
+        rtol=1e-3,
+    )
+    assert vultorch.gradcheck(
+        lambda a, b: F.cosine_similarity(a, b, dim=-1).sum(),
+        x,
+        y,
+        device=device,
+        atol=1e-3,
+        rtol=1e-3,
+    )
 
     # Module parity
     assert nn.Mish()(x).shape == x.shape

@@ -3,12 +3,14 @@ import struct
 from typing import Dict, Any, Tuple
 import vultorch as torch
 
+
 class QuantizedLinearQ8:
     """
     Symmetric INT8 Quantized Linear Layer.
     Stores weights as int8 (-128 to 127) with a per-tensor scale factor (float32).
     Reduces memory footprint by 75% and guarantees deterministic integer dot-products.
     """
+
     def __init__(self, in_features: int, out_features: int, bias: bool = True):
         self.in_features = in_features
         self.out_features = out_features
@@ -20,9 +22,13 @@ class QuantizedLinearQ8:
         self.bias = np.zeros((out_features,), dtype=np.float32) if bias else None
 
     @classmethod
-    def from_float_linear(cls, linear_module: torch.nn.Linear) -> 'QuantizedLinearQ8':
-        qlinear = cls(linear_module.in_features, linear_module.out_features, bias=(linear_module.bias is not None))
-        w = linear_module.weight.numpy() # (out_features, in_features)
+    def from_float_linear(cls, linear_module: torch.nn.Linear) -> "QuantizedLinearQ8":
+        qlinear = cls(
+            linear_module.in_features,
+            linear_module.out_features,
+            bias=(linear_module.bias is not None),
+        )
+        w = linear_module.weight.numpy()  # (out_features, in_features)
         max_val = float(np.max(np.abs(w)))
         if max_val < 1e-8:
             max_val = 1e-8
@@ -55,14 +61,16 @@ class QuantizedLinearQ8:
         Header: in_features (uint32), out_features (uint32), has_bias (uint8), scale (float32)
         Body: raw int8 bytes for qweight + optional float32 bias
         """
-        header = struct.pack(">IIBf", self.in_features, self.out_features, 1 if self.has_bias else 0, self.scale)
+        header = struct.pack(
+            ">IIBf", self.in_features, self.out_features, 1 if self.has_bias else 0, self.scale
+        )
         body = self.qweight.tobytes()
         if self.has_bias and self.bias is not None:
             body += self.bias.astype(np.float32).tobytes()
         return header + body
 
     @classmethod
-    def deserialize(cls, data: bytes, offset: int = 0) -> Tuple['QuantizedLinearQ8', int]:
+    def deserialize(cls, data: bytes, offset: int = 0) -> Tuple["QuantizedLinearQ8", int]:
         in_f, out_f, has_b, scale = struct.unpack_from(">IIBf", data, offset)
         offset += struct.calcsize(">IIBf")
 
@@ -70,12 +78,16 @@ class QuantizedLinearQ8:
         layer.scale = scale
 
         w_size = in_f * out_f
-        layer.qweight = np.frombuffer(data[offset:offset + w_size], dtype=np.int8).reshape((out_f, in_f)).copy()
+        layer.qweight = (
+            np.frombuffer(data[offset : offset + w_size], dtype=np.int8)
+            .reshape((out_f, in_f))
+            .copy()
+        )
         offset += w_size
 
         if bool(has_b):
             b_size = out_f * 4
-            layer.bias = np.frombuffer(data[offset:offset + b_size], dtype=np.float32).copy()
+            layer.bias = np.frombuffer(data[offset : offset + b_size], dtype=np.float32).copy()
             offset += b_size
 
         return layer, offset
@@ -85,6 +97,7 @@ class ModelQuantizerQ8:
     """
     Quantizes a complete PyTorch/VulTorch model's Linear layers into Q8.
     """
+
     @staticmethod
     def quantize_state_dict(model: torch.nn.Module) -> bytes:
         serialized = bytearray()

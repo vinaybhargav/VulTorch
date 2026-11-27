@@ -27,7 +27,7 @@ def test_math_and_rounding_helpers_parity(device):
     np.testing.assert_allclose(vultorch.square(t).numpy(), arr * arr, atol=1e-5)
     np.testing.assert_allclose(vultorch.reciprocal(t).numpy(), 1.0 / arr, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(vultorch.neg(t).numpy(), -arr, atol=1e-5)
-    np.testing.assert_allclose(vultorch.pow(t, 2).numpy(), arr ** 2, rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(vultorch.pow(t, 2).numpy(), arr**2, rtol=1e-5, atol=1e-5)
 
     pos = np.array([0.2, 0.5, 0.8, 1.5, 2.5], dtype=np.float32)
     tp = vultorch.tensor(pos, device=device)
@@ -50,6 +50,7 @@ def test_math_and_rounding_helpers_parity(device):
 
     # erf / erfc against known values
     import math
+
     expected_erf = np.array([math.erf(float(v)) for v in unit], dtype=np.float32)
     np.testing.assert_allclose(vultorch.erf(tu).numpy(), expected_erf, rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(vultorch.erfc(tu).numpy(), 1.0 - expected_erf, rtol=1e-5, atol=1e-5)
@@ -85,18 +86,27 @@ def test_differentiable_math_and_losses_gradcheck(device):
     pos = vultorch.tensor([0.6, 1.2, 1.8, 0.9], device=device, requires_grad=True)
 
     assert vultorch.gradcheck(lambda t: t.square().sum(), x, device=device, atol=1e-3, rtol=1e-3)
-    assert vultorch.gradcheck(lambda t: t.reciprocal().sum(), pos, device=device, atol=1e-3, rtol=1e-3)
+    assert vultorch.gradcheck(
+        lambda t: t.reciprocal().sum(), pos, device=device, atol=1e-3, rtol=1e-3
+    )
     assert vultorch.gradcheck(lambda t: t.erf().sum(), x, device=device, atol=1e-3, rtol=1e-3)
     assert vultorch.gradcheck(lambda t: t.tan().sum(), x, device=device, atol=1e-3, rtol=1e-3)
     assert vultorch.gradcheck(lambda t: t.asin().sum(), x, device=device, atol=1e-3, rtol=1e-3)
     assert vultorch.gradcheck(lambda t: t.log1p().sum(), pos, device=device, atol=1e-3, rtol=1e-3)
-    assert vultorch.gradcheck(lambda a, b: a.lerp(b, 0.3).sum(), x, y, device=device, atol=1e-3, rtol=1e-3)
-    assert vultorch.gradcheck(lambda a, b: F.l1_loss(a, b, reduction="sum"), x, y, device=device, atol=1e-3, rtol=1e-3)
+    assert vultorch.gradcheck(
+        lambda a, b: a.lerp(b, 0.3).sum(), x, y, device=device, atol=1e-3, rtol=1e-3
+    )
+    assert vultorch.gradcheck(
+        lambda a, b: F.l1_loss(a, b, reduction="sum"), x, y, device=device, atol=1e-3, rtol=1e-3
+    )
 
     targets = vultorch.tensor([0.0, 1.0, 1.0, 0.0], device=device)
     assert vultorch.gradcheck(
         lambda a: F.binary_cross_entropy_with_logits(a, targets, reduction="sum"),
-        x, device=device, atol=1e-3, rtol=1e-3
+        x,
+        device=device,
+        atol=1e-3,
+        rtol=1e-3,
     )
 
 
@@ -122,7 +132,9 @@ def test_constructors_tensor_api_and_functional_parity(device):
     assert vultorch.randn_like(base).shape == (4, 8)
 
     # DataLoader on-GPU shuffle
-    ds = TensorDataset(vultorch.randn(20, 4, device=device), vultorch.randint(0, 3, (20,), device=device))
+    ds = TensorDataset(
+        vultorch.randn(20, 4, device=device), vultorch.randint(0, 3, (20,), device=device)
+    )
     loader = DataLoader(ds, batch_size=8, shuffle=True)
     batches = list(loader)
     assert sum(bx.shape[0] for bx, _ in batches) == 20

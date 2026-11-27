@@ -12,19 +12,22 @@ import vultorch
 from ..tensor import Tensor, Device, resolve_device, _check_same_device
 from ..autograd import is_grad_enabled, no_grad, Node
 
+
 class Parameter(Tensor):
     """A kind of Tensor that is to be considered a module parameter."""
+
     def __init__(self, data: Union[Tensor, np.ndarray], requires_grad: bool = True):
         if isinstance(data, Tensor):
             super().__init__(data._native, device=data.device, requires_grad=requires_grad)
         else:
             super().__init__(data, device=resolve_device(None), requires_grad=requires_grad)
 
+
 class Module:
     def __init__(self):
         self._parameters: Dict[str, Optional[Parameter]] = OrderedDict()
         self._buffers: Dict[str, Optional[Tensor]] = OrderedDict()
-        self._modules: Dict[str, Optional['Module']] = OrderedDict()
+        self._modules: Dict[str, Optional["Module"]] = OrderedDict()
         self.training = True
 
     def forward(self, *inputs, **kwargs):
@@ -40,7 +43,7 @@ class Module:
         self._buffers[name] = tensor
         super().__setattr__(name, tensor)
 
-    def register_module(self, name: str, module: Optional['Module']):
+    def register_module(self, name: str, module: Optional["Module"]):
         self._modules[name] = module
 
     def __setattr__(self, name: str, value):
@@ -59,7 +62,9 @@ class Module:
                 if module is not None:
                     yield from module.parameters(recurse=True)
 
-    def named_parameters(self, prefix: str = "", recurse: bool = True) -> Iterator[Tuple[str, Parameter]]:
+    def named_parameters(
+        self, prefix: str = "", recurse: bool = True
+    ) -> Iterator[Tuple[str, Parameter]]:
         for name, param in self._parameters.items():
             if param is not None:
                 yield f"{prefix}.{name}" if prefix else name, param
@@ -83,11 +88,13 @@ class Module:
                     sub_prefix = f"{prefix}.{mod_name}" if prefix else mod_name
                     yield from module.named_buffers(prefix=sub_prefix, recurse=True)
 
-    def modules(self) -> Iterator['Module']:
+    def modules(self) -> Iterator["Module"]:
         for _, module in self.named_modules():
             yield module
 
-    def named_modules(self, memo=None, prefix: str = "", remove_duplicate: bool = True) -> Iterator[Tuple[str, 'Module']]:
+    def named_modules(
+        self, memo=None, prefix: str = "", remove_duplicate: bool = True
+    ) -> Iterator[Tuple[str, "Module"]]:
         if memo is None:
             memo = set()
         if self not in memo:
@@ -99,10 +106,12 @@ class Module:
                     sub_prefix = f"{prefix}.{name}" if prefix else name
                     yield from module.named_modules(memo, sub_prefix, remove_duplicate)
 
-    def to(self, device: Union[str, Device]) -> 'Module':
+    def to(self, device: Union[str, Device]) -> "Module":
         for name, param in self._parameters.items():
             if param is not None:
-                self._parameters[name] = Parameter(param.to(device), requires_grad=param.requires_grad)
+                self._parameters[name] = Parameter(
+                    param.to(device), requires_grad=param.requires_grad
+                )
                 super().__setattr__(name, self._parameters[name])
         for name, buf in getattr(self, "_buffers", {}).items():
             if buf is not None:
@@ -113,14 +122,14 @@ class Module:
                 module.to(device)
         return self
 
-    def train(self, mode: bool = True) -> 'Module':
+    def train(self, mode: bool = True) -> "Module":
         self.training = mode
         for module in self._modules.values():
             if module is not None:
                 module.train(mode)
         return self
 
-    def eval(self) -> 'Module':
+    def eval(self) -> "Module":
         return self.train(False)
 
     def zero_grad(self):
@@ -144,9 +153,10 @@ class Module:
         device_ids: Optional[Union[str, List[str]]] = None,
         balance: Union[bool, str] = "tflops",
         device_weights: Optional[List[float]] = None,
-    ) -> 'MultiGPU':
+    ) -> "MultiGPU":
         """Wraps this module in `nn.MultiGPU` across `device_ids` (defaulting to `['all']`)."""
         return MultiGPU(self, device_ids=device_ids, balance=balance, device_weights=device_weights)
+
 
 class Sequential(Module):
     def __init__(self, *args):
@@ -170,6 +180,7 @@ class Sequential(Module):
             x = module(x)
         return x
 
+
 class ModuleList(Module):
     def __init__(self, modules: Optional[List[Module]] = None):
         super().__init__()
@@ -186,8 +197,16 @@ class ModuleList(Module):
     def __iter__(self) -> Iterator[Module]:
         return iter(self._modules.values())
 
+
 class Linear(Module):
-    def __init__(self, in_features: int, out_features: int, bias: bool = True, device=None, epilogue: Optional[str] = None):
+    def __init__(
+        self,
+        in_features: int,
+        out_features: int,
+        bias: bool = True,
+        device=None,
+        epilogue: Optional[str] = None,
+    ):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
@@ -211,6 +230,7 @@ class Linear(Module):
             return functional.linear(x, self.weight, self.bias, epilogue=self.epilogue)
 
         from ..amp import is_autocast_enabled, get_autocast_dtype
+
         x_in = x
         w_in = self.weight
         b_in = self.bias
@@ -292,18 +312,27 @@ class Linear(Module):
             out.grad_fn = Node("LinearBackward", linear_backward, inputs)
         return out
 
+
 class Conv2d(Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: Union[int, Tuple[int, int]],
-                 stride: Union[int, Tuple[int, int]] = 1,
-                 padding: Union[int, Tuple[int, int]] = 0,
-                 groups: int = 1,
-                 bias: bool = True, device=None):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int]],
+        stride: Union[int, Tuple[int, int]] = 1,
+        padding: Union[int, Tuple[int, int]] = 0,
+        groups: int = 1,
+        bias: bool = True,
+        device=None,
+    ):
         super().__init__()
         if in_channels % groups != 0 or out_channels % groups != 0:
             raise ValueError("in_channels and out_channels must be divisible by groups")
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.kH, self.kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        self.kH, self.kW = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        )
         self.stride_h, self.stride_w = (stride, stride) if isinstance(stride, int) else stride
         self.pad_h, self.pad_w = (padding, padding) if isinstance(padding, int) else padding
         self.groups = int(groups)
@@ -324,6 +353,7 @@ class Conv2d(Module):
     def forward(self, x: Tensor) -> Tensor:
         _check_same_device(x, self.weight, "Conv2d")
         from ..amp import is_autocast_enabled, get_autocast_dtype
+
         x_in = x
         w_in = self.weight
         b_in = self.bias
@@ -337,16 +367,27 @@ class Conv2d(Module):
                 b_in = b_in.to(amp_dt)
 
         b_native = b_in._native if b_in is not None else None
-        native_out = x_in._native.conv2d(w_in._native, b_native,
-                                         self.stride_h, self.stride_w,
-                                         self.pad_h, self.pad_w,
-                                         self.groups, True)
-        req_grad = x.requires_grad or self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad)
+        native_out = x_in._native.conv2d(
+            w_in._native,
+            b_native,
+            self.stride_h,
+            self.stride_w,
+            self.pad_h,
+            self.pad_w,
+            self.groups,
+            True,
+        )
+        req_grad = (
+            x.requires_grad
+            or self.weight.requires_grad
+            or (self.bias is not None and self.bias.requires_grad)
+        )
         out = Tensor(native_out, device=x.device, requires_grad=req_grad)
 
         if is_grad_enabled() and req_grad:
             out.is_leaf = False
             sh, sw, ph, pw, grps = self.stride_h, self.stride_w, self.pad_h, self.pad_w, self.groups
+
             def conv_backward(grad_out: Tensor):
                 g_in = None
                 g_w = None
@@ -354,12 +395,14 @@ class Conv2d(Module):
 
                 if x.requires_grad:
                     gin_native = grad_out._native.conv2d_backward_input(
-                        self.weight._native, x.shape, sh, sw, ph, pw, grps, True)
+                        self.weight._native, x.shape, sh, sw, ph, pw, grps, True
+                    )
                     g_in = Tensor(gin_native, device=x.device)
 
                 if self.weight.requires_grad:
                     gw_native = grad_out._native.conv2d_backward_weight(
-                        x._native, self.weight.shape, sh, sw, ph, pw, grps, True)
+                        x._native, self.weight.shape, sh, sw, ph, pw, grps, True
+                    )
                     g_w = Tensor(gw_native, device=x.device)
 
                 if self.bias is not None and self.bias.requires_grad:
@@ -374,33 +417,60 @@ class Conv2d(Module):
             out.grad_fn = Node("Conv2dBackward", conv_backward, inputs)
         return out
 
+
 class Conv1d(Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: int,
-                 stride: int = 1, padding: int = 0, groups: int = 1,
-                 bias: bool = True, device=None):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        stride: int = 1,
+        padding: int = 0,
+        groups: int = 1,
+        bias: bool = True,
+        device=None,
+    ):
         super().__init__()
-        self.conv2d = Conv2d(in_channels, out_channels, (kernel_size, 1),
-                             stride=(stride, 1), padding=(padding, 0),
-                             groups=groups, bias=bias, device=device)
+        self.conv2d = Conv2d(
+            in_channels,
+            out_channels,
+            (kernel_size, 1),
+            stride=(stride, 1),
+            padding=(padding, 0),
+            groups=groups,
+            bias=bias,
+            device=device,
+        )
 
     def forward(self, x: Tensor) -> Tensor:
         return self.conv2d(x.unsqueeze(-1)).squeeze(-1)
 
+
 class ConvTranspose2d(Module):
-    def __init__(self, in_channels: int, out_channels: int, kernel_size: Union[int, Tuple[int, int]],
-                 stride: Union[int, Tuple[int, int]] = 1,
-                 padding: Union[int, Tuple[int, int]] = 0,
-                 bias: bool = True, device=None):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: Union[int, Tuple[int, int]],
+        stride: Union[int, Tuple[int, int]] = 1,
+        padding: Union[int, Tuple[int, int]] = 0,
+        bias: bool = True,
+        device=None,
+    ):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
-        self.kH, self.kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        self.kH, self.kW = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        )
         self.stride_h, self.stride_w = (stride, stride) if isinstance(stride, int) else stride
         self.pad_h, self.pad_w = (padding, padding) if isinstance(padding, int) else padding
         dev = resolve_device(device)
 
         k = 1.0 / math.sqrt(out_channels * self.kH * self.kW)
-        w = vultorch.empty((in_channels, out_channels, self.kH, self.kW), device=dev).uniform_(-k, k)
+        w = vultorch.empty((in_channels, out_channels, self.kH, self.kW), device=dev).uniform_(
+            -k, k
+        )
         self.weight = Parameter(w, requires_grad=True)
 
         if bias:
@@ -416,10 +486,20 @@ class ConvTranspose2d(Module):
         out_shape = (N, self.out_channels, H_out, W_out)
 
         native_out = x._native.conv2d_backward_input(
-            self.weight._native, list(out_shape),
-            self.stride_h, self.stride_w, self.pad_h, self.pad_w, 1, True
+            self.weight._native,
+            list(out_shape),
+            self.stride_h,
+            self.stride_w,
+            self.pad_h,
+            self.pad_w,
+            1,
+            True,
         )
-        req_grad = (x.requires_grad or self.weight.requires_grad or (self.bias is not None and self.bias.requires_grad)) and is_grad_enabled()
+        req_grad = (
+            x.requires_grad
+            or self.weight.requires_grad
+            or (self.bias is not None and self.bias.requires_grad)
+        ) and is_grad_enabled()
         out = Tensor(native_out, device=x.device, requires_grad=req_grad)
 
         if req_grad:
@@ -435,9 +515,7 @@ class ConvTranspose2d(Module):
                 g_b = None
 
                 if x.requires_grad:
-                    gin_nat = grad_out._native.conv2d(
-                        w_ref._native, None, sh, sw, ph, pw, 1, True
-                    )
+                    gin_nat = grad_out._native.conv2d(w_ref._native, None, sh, sw, ph, pw, 1, True)
                     g_in = Tensor(gin_nat, device=dev)
 
                 if w_ref.requires_grad:
@@ -464,12 +542,18 @@ class ConvTranspose2d(Module):
             out = out + self.bias.reshape(1, self.out_channels, 1, 1)
         return out
 
+
 class MaxPool2d(Module):
-    def __init__(self, kernel_size: Union[int, Tuple[int, int]],
-                 stride: Optional[Union[int, Tuple[int, int]]] = None,
-                 padding: Union[int, Tuple[int, int]] = 0):
+    def __init__(
+        self,
+        kernel_size: Union[int, Tuple[int, int]],
+        stride: Optional[Union[int, Tuple[int, int]]] = None,
+        padding: Union[int, Tuple[int, int]] = 0,
+    ):
         super().__init__()
-        self.kH, self.kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        self.kH, self.kW = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        )
         stride = stride if stride is not None else kernel_size
         self.stride_h, self.stride_w = (stride, stride) if isinstance(stride, int) else stride
         self.pad_h, self.pad_w = (padding, padding) if isinstance(padding, int) else padding
@@ -497,13 +581,19 @@ class MaxPool2d(Module):
             out.grad_fn = Node("MaxPool2dBackward", pool_backward, [x])
         return out
 
+
 class AvgPool2d(Module):
-    def __init__(self, kernel_size: Union[int, Tuple[int, int]],
-                 stride: Optional[Union[int, Tuple[int, int]]] = None,
-                 padding: Union[int, Tuple[int, int]] = 0,
-                 count_include_pad: bool = True):
+    def __init__(
+        self,
+        kernel_size: Union[int, Tuple[int, int]],
+        stride: Optional[Union[int, Tuple[int, int]]] = None,
+        padding: Union[int, Tuple[int, int]] = 0,
+        count_include_pad: bool = True,
+    ):
         super().__init__()
-        self.kH, self.kW = (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        self.kH, self.kW = (
+            (kernel_size, kernel_size) if isinstance(kernel_size, int) else kernel_size
+        )
         stride = stride if stride is not None else kernel_size
         self.stride_h, self.stride_w = (stride, stride) if isinstance(stride, int) else stride
         self.pad_h, self.pad_w = (padding, padding) if isinstance(padding, int) else padding
@@ -511,8 +601,16 @@ class AvgPool2d(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         out_native = x._native.avgpool2d(
-            self.kH, self.kW, self.stride_h, self.stride_w,
-            self.pad_h, self.pad_w, self.count_include_pad, False, 0, 0
+            self.kH,
+            self.kW,
+            self.stride_h,
+            self.stride_w,
+            self.pad_h,
+            self.pad_w,
+            self.count_include_pad,
+            False,
+            0,
+            0,
         )
         req_grad = x.requires_grad and is_grad_enabled()
         out = Tensor(out_native, device=x.device, requires_grad=req_grad)
@@ -534,15 +632,16 @@ class AvgPool2d(Module):
             out.grad_fn = Node("AvgPool2dBackward", avgpool_backward, [x])
         return out
 
+
 class AdaptiveAvgPool2d(Module):
     def __init__(self, output_size: Union[int, Tuple[int, int]]):
         super().__init__()
-        self.out_h, self.out_w = (output_size, output_size) if isinstance(output_size, int) else output_size
+        self.out_h, self.out_w = (
+            (output_size, output_size) if isinstance(output_size, int) else output_size
+        )
 
     def forward(self, x: Tensor) -> Tensor:
-        out_native = x._native.avgpool2d(
-            1, 1, 1, 1, 0, 0, False, True, self.out_h, self.out_w
-        )
+        out_native = x._native.avgpool2d(1, 1, 1, 1, 0, 0, False, True, self.out_h, self.out_w)
         req_grad = x.requires_grad and is_grad_enabled()
         out = Tensor(out_native, device=x.device, requires_grad=req_grad)
         if req_grad:
@@ -559,6 +658,7 @@ class AdaptiveAvgPool2d(Module):
             out.grad_fn = Node("AdaptiveAvgPool2dBackward", adaptive_avgpool_backward, [x])
         return out
 
+
 class Flatten(Module):
     def __init__(self, start_dim: int = 1, end_dim: int = -1):
         super().__init__()
@@ -568,17 +668,30 @@ class Flatten(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.flatten(self.start_dim, self.end_dim)
 
+
 class LayerNorm(Module):
-    def __init__(self, normalized_shape: Union[int, List[int]], eps: float = 1e-5, elementwise_affine: bool = True, device=None):
+    def __init__(
+        self,
+        normalized_shape: Union[int, List[int]],
+        eps: float = 1e-5,
+        elementwise_affine: bool = True,
+        device=None,
+    ):
         super().__init__()
-        self.normalized_shape = (normalized_shape,) if isinstance(normalized_shape, int) else tuple(normalized_shape)
+        self.normalized_shape = (
+            (normalized_shape,) if isinstance(normalized_shape, int) else tuple(normalized_shape)
+        )
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         dev = resolve_device(device)
 
         if elementwise_affine:
-            self.weight = Parameter(vultorch.ones(self.normalized_shape, device=dev), requires_grad=True)
-            self.bias = Parameter(vultorch.zeros(self.normalized_shape, device=dev), requires_grad=True)
+            self.weight = Parameter(
+                vultorch.ones(self.normalized_shape, device=dev), requires_grad=True
+            )
+            self.bias = Parameter(
+                vultorch.zeros(self.normalized_shape, device=dev), requires_grad=True
+            )
         else:
             self.weight = None
             self.bias = None
@@ -586,9 +699,7 @@ class LayerNorm(Module):
     def forward(self, x: Tensor) -> Tensor:
         ndim_norm = len(self.normalized_shape)
         if x.ndim < ndim_norm:
-            raise ValueError(
-                f"LayerNorm expected at least {ndim_norm} dims, got {x.ndim}"
-            )
+            raise ValueError(f"LayerNorm expected at least {ndim_norm} dims, got {x.ndim}")
 
         g_native = self.weight._native if self.weight is not None else None
         b_native = self.bias._native if self.bias is not None else None
@@ -631,25 +742,34 @@ class LayerNorm(Module):
         out.grad_fn = Node("LayerNormBackward", layernorm_backward, inputs)
         return out
 
+
 class RMSNorm(Module):
-    def __init__(self, normalized_shape: Union[int, List[int]], eps: float = 1e-6, elementwise_affine: bool = True, device=None):
+    def __init__(
+        self,
+        normalized_shape: Union[int, List[int]],
+        eps: float = 1e-6,
+        elementwise_affine: bool = True,
+        device=None,
+    ):
         super().__init__()
-        self.normalized_shape = (normalized_shape,) if isinstance(normalized_shape, int) else tuple(normalized_shape)
+        self.normalized_shape = (
+            (normalized_shape,) if isinstance(normalized_shape, int) else tuple(normalized_shape)
+        )
         self.eps = eps
         self.elementwise_affine = elementwise_affine
         dev = resolve_device(device)
 
         if elementwise_affine:
-            self.weight = Parameter(vultorch.ones(self.normalized_shape, device=dev), requires_grad=True)
+            self.weight = Parameter(
+                vultorch.ones(self.normalized_shape, device=dev), requires_grad=True
+            )
         else:
             self.weight = None
 
     def forward(self, x: Tensor) -> Tensor:
         ndim_norm = len(self.normalized_shape)
         if x.ndim < ndim_norm:
-            raise ValueError(
-                f"RMSNorm expected at least {ndim_norm} dims, got {x.ndim}"
-            )
+            raise ValueError(f"RMSNorm expected at least {ndim_norm} dims, got {x.ndim}")
 
         g_native = self.weight._native if self.weight is not None else None
         native_out = x._native.rmsnorm(g_native, self.eps, ndim_norm)
@@ -684,9 +804,17 @@ class RMSNorm(Module):
         out.grad_fn = Node("RMSNormBackward", rmsnorm_backward, inputs)
         return out
 
+
 class _BatchNormBase(Module):
-    def __init__(self, num_features: int, eps: float = 1e-5, momentum: float = 0.1,
-                 affine: bool = True, track_running_stats: bool = True, device=None):
+    def __init__(
+        self,
+        num_features: int,
+        eps: float = 1e-5,
+        momentum: float = 0.1,
+        affine: bool = True,
+        track_running_stats: bool = True,
+        device=None,
+    ):
         super().__init__()
         self.num_features = num_features
         self.eps = eps
@@ -738,8 +866,14 @@ class _BatchNormBase(Module):
             need_dg = weight is not None and weight.requires_grad
             need_db = bias is not None and bias.requires_grad
             dx_nat, dg_nat, db_nat = x._native.batchnorm_backward(
-                g.contiguous()._native, save_mean_nat, save_invstd_nat,
-                g_nat, eps, need_dx, need_dg, need_db
+                g.contiguous()._native,
+                save_mean_nat,
+                save_invstd_nat,
+                g_nat,
+                eps,
+                need_dx,
+                need_dg,
+                need_db,
             )
             grads = [Tensor(dx_nat, device=dev) if dx_nat is not None else None]
             if weight is not None:
@@ -766,8 +900,14 @@ class BatchNorm2d(_BatchNormBase):
 
 
 class GroupNorm(Module):
-    def __init__(self, num_groups: int, num_channels: int, eps: float = 1e-5,
-                 affine: bool = True, device=None):
+    def __init__(
+        self,
+        num_groups: int,
+        num_channels: int,
+        eps: float = 1e-5,
+        affine: bool = True,
+        device=None,
+    ):
         super().__init__()
         if num_channels % num_groups != 0:
             raise ValueError("num_channels must be divisible by num_groups")
@@ -787,9 +927,7 @@ class GroupNorm(Module):
     def forward(self, x: Tensor) -> Tensor:
         g_nat = self.weight._native if self.weight is not None else None
         b_nat = self.bias._native if self.bias is not None else None
-        y_nat, mean_invstd_nat = x._native.groupnorm(
-            self.num_groups, g_nat, b_nat, self.eps
-        )
+        y_nat, mean_invstd_nat = x._native.groupnorm(self.num_groups, g_nat, b_nat, self.eps)
         req_grad = (
             x.requires_grad
             or (self.weight is not None and self.weight.requires_grad)
@@ -810,8 +948,7 @@ class GroupNorm(Module):
             need_dg = weight is not None and weight.requires_grad
             need_db = bias is not None and bias.requires_grad
             dx_nat, dg_nat, db_nat = x._native.groupnorm_backward(
-                g.contiguous()._native, mean_invstd_nat, ng, g_nat,
-                need_dx, need_dg, need_db
+                g.contiguous()._native, mean_invstd_nat, ng, g_nat, need_dx, need_dg, need_db
             )
             grads = [Tensor(dx_nat, device=dev) if dx_nat is not None else None]
             if weight is not None:
@@ -860,9 +997,15 @@ class Dropout(Module):
             out.grad_fn = Node("DropoutBackward", dropout_backward, [x])
         return out
 
+
 class Embedding(Module):
-    def __init__(self, num_embeddings: int, embedding_dim: int,
-                 padding_idx: Optional[int] = None, device=None):
+    def __init__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        padding_idx: Optional[int] = None,
+        device=None,
+    ):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
@@ -881,7 +1024,7 @@ class Embedding(Module):
                     parts.append(self.weight[:p_idx])
                 parts.append(zero_row)
                 if p_idx + 1 < num_embeddings:
-                    parts.append(self.weight[p_idx + 1:])
+                    parts.append(self.weight[p_idx + 1 :])
                 self.weight.copy_(vultorch.cat(parts, dim=0, device=dev))
 
     def forward(self, indices: Tensor) -> Tensor:
@@ -904,26 +1047,32 @@ class Embedding(Module):
             out.grad_fn = Node("EmbeddingBackward", emb_backward, [self.weight])
         return out
 
+
 # Activations
 class ReLU(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.relu()
 
+
 class GELU(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.gelu()
+
 
 class SiLU(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.silu()
 
+
 class Mish(Module):
     def forward(self, x: Tensor) -> Tensor:
         return F.mish(x)
 
+
 class Hardswish(Module):
     def forward(self, x: Tensor) -> Tensor:
         return F.hardswish(x)
+
 
 class LeakyReLU(Module):
     def __init__(self, negative_slope: float = 0.01):
@@ -932,6 +1081,7 @@ class LeakyReLU(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return F.leaky_relu(x, negative_slope=self.negative_slope)
+
 
 class ELU(Module):
     def __init__(self, alpha: float = 1.0):
@@ -951,10 +1101,21 @@ class _SnakeBase(Module):
       - mode 3 (SnakeRational):       x + (1 / b) * sin^2(a * x) / (1 + (a * x)^2)
       - mode 4 (SnakeSinc):           x + (1 / b) * (sin(a * x) / (a * x))^2
     """
-    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
-                 alpha_logscale: bool = False, channel_dim: int = 1,
-                 eps: float = 1e-9, mode: int = 0, has_beta: bool = False,
-                 has_gamma: bool = False, init_gamma: float = 0.0, device=None):
+
+    def __init__(
+        self,
+        in_features: int,
+        a: float = 1.0,
+        trainable: bool = True,
+        alpha_logscale: bool = False,
+        channel_dim: int = 1,
+        eps: float = 1e-9,
+        mode: int = 0,
+        has_beta: bool = False,
+        has_gamma: bool = False,
+        init_gamma: float = 0.0,
+        device=None,
+    ):
         super().__init__()
         self.in_features = in_features
         self.alpha_logscale = alpha_logscale
@@ -995,8 +1156,7 @@ class _SnakeBase(Module):
         b_nat = self.beta._native if self.beta is not None else None
         g_nat = self.gamma._native if self.gamma is not None else None
         y_nat = x._native.snake(
-            self.alpha._native, b_nat, cd, self.alpha_logscale, 1.0, self.eps,
-            self.mode, g_nat, 0.0
+            self.alpha._native, b_nat, cd, self.alpha_logscale, 1.0, self.eps, self.mode, g_nat, 0.0
         )
         req_grad = (
             x.requires_grad
@@ -1031,9 +1191,20 @@ class _SnakeBase(Module):
             need_db = isinstance(beta_ref, Parameter) and beta_ref.requires_grad
             need_dg = isinstance(gamma_ref, Parameter) and gamma_ref.requires_grad
             dx_nat, da_nat, db_nat, dg_nat = x._native.snake_backward(
-                g.contiguous()._native, alpha_ref._native, b_nat,
-                cd, log_sc, 1.0, eps_val, need_dx, need_da, need_db,
-                mode_val, g_nat, 0.0, need_dg
+                g.contiguous()._native,
+                alpha_ref._native,
+                b_nat,
+                cd,
+                log_sc,
+                1.0,
+                eps_val,
+                need_dx,
+                need_da,
+                need_db,
+                mode_val,
+                g_nat,
+                0.0,
+                need_dg,
             )
             grads = [Tensor(dx_nat, device=dev) if dx_nat is not None else None]
             if isinstance(alpha_ref, Parameter):
@@ -1053,13 +1224,28 @@ class Snake(_SnakeBase):
     Snake periodic non-linear activation (Ziyin et al. 2020):
         Snake_a(x) = x + (1 / a) * sin^2(a * x)
     """
-    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
-                 alpha_logscale: bool = False, channel_dim: int = 1,
-                 eps: float = 1e-9, device=None):
+
+    def __init__(
+        self,
+        in_features: int,
+        a: float = 1.0,
+        trainable: bool = True,
+        alpha_logscale: bool = False,
+        channel_dim: int = 1,
+        eps: float = 1e-9,
+        device=None,
+    ):
         super().__init__(
-            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
-            channel_dim=channel_dim, eps=eps, mode=0, has_beta=False, has_gamma=False,
-            device=device
+            in_features,
+            a=a,
+            trainable=trainable,
+            alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim,
+            eps=eps,
+            mode=0,
+            has_beta=False,
+            has_gamma=False,
+            device=device,
         )
 
 
@@ -1069,13 +1255,28 @@ class SnakeBeta(_SnakeBase):
     frequency `alpha` and inverse-magnitude `beta`:
         SnakeBeta_{a, b}(x) = x + (1 / b) * sin^2(a * x)
     """
-    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
-                 alpha_logscale: bool = False, channel_dim: int = 1,
-                 eps: float = 1e-9, device=None):
+
+    def __init__(
+        self,
+        in_features: int,
+        a: float = 1.0,
+        trainable: bool = True,
+        alpha_logscale: bool = False,
+        channel_dim: int = 1,
+        eps: float = 1e-9,
+        device=None,
+    ):
         super().__init__(
-            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
-            channel_dim=channel_dim, eps=eps, mode=0, has_beta=True, has_gamma=False,
-            device=device
+            in_features,
+            a=a,
+            trainable=trainable,
+            alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim,
+            eps=eps,
+            mode=0,
+            has_beta=True,
+            has_gamma=False,
+            device=device,
         )
 
 
@@ -1085,13 +1286,30 @@ class SnakeGamma(_SnakeBase):
     inverse-magnitude `beta`, and phase shift `gamma`:
         SnakeGamma_{a, b, gamma}(x) = x + (1 / b) * sin^2(a * x + gamma)
     """
-    def __init__(self, in_features: int, a: float = 1.0, gamma: float = 0.0,
-                 trainable: bool = True, alpha_logscale: bool = False,
-                 channel_dim: int = 1, eps: float = 1e-9, device=None):
+
+    def __init__(
+        self,
+        in_features: int,
+        a: float = 1.0,
+        gamma: float = 0.0,
+        trainable: bool = True,
+        alpha_logscale: bool = False,
+        channel_dim: int = 1,
+        eps: float = 1e-9,
+        device=None,
+    ):
         super().__init__(
-            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
-            channel_dim=channel_dim, eps=eps, mode=1, has_beta=True, has_gamma=True,
-            init_gamma=gamma, device=device
+            in_features,
+            a=a,
+            trainable=trainable,
+            alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim,
+            eps=eps,
+            mode=1,
+            has_beta=True,
+            has_gamma=True,
+            init_gamma=gamma,
+            device=device,
         )
 
 
@@ -1100,13 +1318,29 @@ class SnakeCos(_SnakeBase):
     SnakeCos cosine-squared periodic activation:
         SnakeCos_{a, b}(x) = x + (1 / b) * cos^2(a * x)
     """
-    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
-                 alpha_logscale: bool = False, has_beta: bool = True,
-                 channel_dim: int = 1, eps: float = 1e-9, device=None):
+
+    def __init__(
+        self,
+        in_features: int,
+        a: float = 1.0,
+        trainable: bool = True,
+        alpha_logscale: bool = False,
+        has_beta: bool = True,
+        channel_dim: int = 1,
+        eps: float = 1e-9,
+        device=None,
+    ):
         super().__init__(
-            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
-            channel_dim=channel_dim, eps=eps, mode=2, has_beta=has_beta, has_gamma=False,
-            device=device
+            in_features,
+            a=a,
+            trainable=trainable,
+            alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim,
+            eps=eps,
+            mode=2,
+            has_beta=has_beta,
+            has_gamma=False,
+            device=device,
         )
 
 
@@ -1115,13 +1349,29 @@ class SnakeRational(_SnakeBase):
     SnakeRational damped periodic activation:
         SnakeRational_{a, b}(x) = x + (1 / b) * sin^2(a * x) / (1 + (a * x)^2)
     """
-    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
-                 alpha_logscale: bool = False, has_beta: bool = True,
-                 channel_dim: int = 1, eps: float = 1e-9, device=None):
+
+    def __init__(
+        self,
+        in_features: int,
+        a: float = 1.0,
+        trainable: bool = True,
+        alpha_logscale: bool = False,
+        has_beta: bool = True,
+        channel_dim: int = 1,
+        eps: float = 1e-9,
+        device=None,
+    ):
         super().__init__(
-            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
-            channel_dim=channel_dim, eps=eps, mode=3, has_beta=has_beta, has_gamma=False,
-            device=device
+            in_features,
+            a=a,
+            trainable=trainable,
+            alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim,
+            eps=eps,
+            mode=3,
+            has_beta=has_beta,
+            has_gamma=False,
+            device=device,
         )
 
 
@@ -1130,13 +1380,29 @@ class SnakeSinc(_SnakeBase):
     SnakeSinc wavepacket periodic activation:
         SnakeSinc_{a, b}(x) = x + (1 / b) * (sin(a * x) / (a * x))^2
     """
-    def __init__(self, in_features: int, a: float = 1.0, trainable: bool = True,
-                 alpha_logscale: bool = False, has_beta: bool = True,
-                 channel_dim: int = 1, eps: float = 1e-9, device=None):
+
+    def __init__(
+        self,
+        in_features: int,
+        a: float = 1.0,
+        trainable: bool = True,
+        alpha_logscale: bool = False,
+        has_beta: bool = True,
+        channel_dim: int = 1,
+        eps: float = 1e-9,
+        device=None,
+    ):
         super().__init__(
-            in_features, a=a, trainable=trainable, alpha_logscale=alpha_logscale,
-            channel_dim=channel_dim, eps=eps, mode=4, has_beta=has_beta, has_gamma=False,
-            device=device
+            in_features,
+            a=a,
+            trainable=trainable,
+            alpha_logscale=alpha_logscale,
+            channel_dim=channel_dim,
+            eps=eps,
+            mode=4,
+            has_beta=has_beta,
+            has_gamma=False,
+            device=device,
         )
 
 
@@ -1150,6 +1416,7 @@ class Mamba(Module):
       - Fused Slang selective scan (`ssm_scan_forward` / `ssm_scan_backward`)
       - Gated output `(y * SiLU(z))` + `out_proj`: d_inner -> d_model
     """
+
     def __init__(
         self,
         d_model: int,
@@ -1202,28 +1469,26 @@ class Mamba(Module):
         """
         B_sz, L_sz, _ = hidden_states.shape
         xz = self.in_proj(hidden_states)  # [B, L, 2 * d_inner]
-        x, z = xz.chunk(2, dim=-1)        # each [B, L, d_inner]
+        x, z = xz.chunk(2, dim=-1)  # each [B, L, d_inner]
 
         # Depthwise causal Conv1d on [B, d_inner, L]
         x_conv = self.conv1d(x.transpose(1, 2))
         if self.d_conv > 1:
             x_conv = x_conv.narrow(2, 0, L_sz)
-        x_act = self.act(x_conv)          # [B, d_inner, L]
+        x_act = self.act(x_conv)  # [B, d_inner, L]
 
         # Selective state space parameters from x_act^T: [B, L, d_inner]
-        x_Flat = x_act.transpose(1, 2)    # [B, L, d_inner]
-        x_dbl = self.x_proj(x_Flat)       # [B, L, dt_rank + 2 * d_state]
-        dt_raw, B_sel, C_sel = x_dbl.split(
-            [self.dt_rank, self.d_state, self.d_state], dim=-1
-        )
+        x_Flat = x_act.transpose(1, 2)  # [B, L, d_inner]
+        x_dbl = self.x_proj(x_Flat)  # [B, L, dt_rank + 2 * d_state]
+        dt_raw, B_sel, C_sel = x_dbl.split([self.dt_rank, self.d_state, self.d_state], dim=-1)
         # Project delta: [B, L, dt_rank] -> [B, L, d_inner] -> [B, d_inner, L]
         delta = functional.softplus(self.dt_proj(dt_raw).transpose(1, 2))
-        A = -(self.A_log.exp())           # [d_inner, d_state]
-        B_mat = B_sel.transpose(1, 2)     # [B, d_state, L]
-        C_mat = C_sel.transpose(1, 2)     # [B, d_state, L]
+        A = -(self.A_log.exp())  # [d_inner, d_state]
+        B_mat = B_sel.transpose(1, 2)  # [B, d_state, L]
+        C_mat = C_sel.transpose(1, 2)  # [B, d_state, L]
 
         y = functional.selective_scan(x_act, delta, A, B_mat, C_mat, self.D)  # [B, d_inner, L]
-        y_gated = y.transpose(1, 2) * z.silu()                                # [B, L, d_inner]
+        y_gated = y.transpose(1, 2) * z.silu()  # [B, L, d_inner]
         return self.out_proj(y_gated)
 
 
@@ -1236,6 +1501,7 @@ class RotaryEmbedding(Module):
     tables and applying fused complex rotation to 4D query/key tensors `[B, H, S, D]`
     (when `seq_dim=2`) or `[B, S, H, D]` (when `seq_dim=1`).
     """
+
     def __init__(
         self,
         dim: int,
@@ -1277,12 +1543,14 @@ class RotaryEmbedding(Module):
 
 class SwiGLU(Module):
     """Fused SwiGLU activation (`SiLU(a) * b`). Splits input along last dim when a single tensor is given."""
+
     def forward(self, a: Tensor, b: Optional[Tensor] = None) -> Tensor:
         return functional.swiglu(a, b)
 
 
 class GeGLU(Module):
     """Fused GeGLU activation (`GELU(a) * b`). Splits input along last dim when a single tensor is given."""
+
     def forward(self, a: Tensor, b: Optional[Tensor] = None) -> Tensor:
         return functional.geglu(a, b)
 
@@ -1292,6 +1560,7 @@ class MultiheadAttention(Module):
     Multi-Head & Grouped-Query Attention (GQA) backed by fused Slang FlashAttention-2
     (`F.scaled_dot_product_attention`) with optional built-in Rotary Position Embeddings (`use_rope=True`).
     """
+
     def __init__(
         self,
         embed_dim: int,
@@ -1306,7 +1575,9 @@ class MultiheadAttention(Module):
     ):
         super().__init__()
         if embed_dim % num_heads != 0:
-            raise ValueError(f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})")
+            raise ValueError(
+                f"embed_dim ({embed_dim}) must be divisible by num_heads ({num_heads})"
+            )
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.num_kv_heads = num_heads if num_kv_heads is None else int(num_kv_heads)
@@ -1322,7 +1593,13 @@ class MultiheadAttention(Module):
         self.k_proj = Linear(embed_dim, self.kv_dim, bias=bias, device=dev)
         self.v_proj = Linear(embed_dim, self.kv_dim, bias=bias, device=dev)
         self.out_proj = Linear(embed_dim, embed_dim, bias=bias, device=dev)
-        self.rope = RotaryEmbedding(self.head_dim, max_position_embeddings=max_seq_len, seq_dim=2, device=dev) if use_rope else None
+        self.rope = (
+            RotaryEmbedding(
+                self.head_dim, max_position_embeddings=max_seq_len, seq_dim=2, device=dev
+            )
+            if use_rope
+            else None
+        )
 
     def forward(
         self,
@@ -1355,7 +1632,12 @@ class MultiheadAttention(Module):
             k = self.rope(k)
 
         attn_out = functional.scaled_dot_product_attention(
-            q, k, v, attn_mask=attn_mask, dropout_p=self.dropout if self.training else 0.0, is_causal=is_causal
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=self.dropout if self.training else 0.0,
+            is_causal=is_causal,
         )
         merged = attn_out.transpose(1, 2).contiguous().reshape(B_sz, S_q, self.embed_dim)
         out = self.out_proj(merged)
@@ -1373,6 +1655,7 @@ class QuantizedLinear(Module):
     alongside per-group scales `[out_features, in_features // group_size]` and dequantizes
     in registers during the Slang matrix multiplication dispatch.
     """
+
     def __init__(
         self,
         in_features: int,
@@ -1387,7 +1670,9 @@ class QuantizedLinear(Module):
             raise ValueError(f"QuantizedLinear supports bits=4 or bits=8, got {bits}")
         pack_factor = 8 if bits == 4 else 4
         if in_features % pack_factor != 0:
-            raise ValueError(f"in_features ({in_features}) must be divisible by {pack_factor} for int{bits}")
+            raise ValueError(
+                f"in_features ({in_features}) must be divisible by {pack_factor} for int{bits}"
+            )
         self.in_features = in_features
         self.out_features = out_features
         self.bits = int(bits)
@@ -1396,10 +1681,18 @@ class QuantizedLinear(Module):
         dev = resolve_device(device)
 
         words_per_row = in_features // pack_factor
-        self.register_buffer("qweight", vultorch.zeros((out_features, words_per_row), device=dev, dtype=vultorch.int32))
-        self.register_buffer("scales", vultorch.ones((out_features, self.num_groups), device=dev, dtype=vultorch.float32))
+        self.register_buffer(
+            "qweight",
+            vultorch.zeros((out_features, words_per_row), device=dev, dtype=vultorch.int32),
+        )
+        self.register_buffer(
+            "scales",
+            vultorch.ones((out_features, self.num_groups), device=dev, dtype=vultorch.float32),
+        )
         if bias:
-            self.register_buffer("bias", vultorch.zeros((out_features,), device=dev, dtype=vultorch.float32))
+            self.register_buffer(
+                "bias", vultorch.zeros((out_features,), device=dev, dtype=vultorch.float32)
+            )
         else:
             self.bias = None
 
@@ -1413,12 +1706,14 @@ class QuantizedLinear(Module):
         linear: Linear,
         bits: int = 4,
         group_size: int = 64,
-    ) -> 'QuantizedLinear':
+    ) -> "QuantizedLinear":
         dev = linear.weight.device
         in_f = linear.in_features
         out_f = linear.out_features
         eff_gs = min(int(group_size), in_f)
-        q_mod = cls(in_f, out_f, bits=bits, group_size=eff_gs, bias=(linear.bias is not None), device=dev)
+        q_mod = cls(
+            in_f, out_f, bits=bits, group_size=eff_gs, bias=(linear.bias is not None), device=dev
+        )
 
         qw_nat, sc_nat = linear.weight._native.quantize_weights(eff_gs, int(bits))
         q_mod.qweight.copy_(Tensor._from_native(qw_nat, dev, False))
@@ -1435,13 +1730,16 @@ class QuantizedLinear(Module):
         )
         return Tensor._from_native(out_nat, x.device, False)
 
+
 class Sigmoid(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.sigmoid()
 
+
 class Tanh(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.tanh()
+
 
 class Softmax(Module):
     def __init__(self, dim: int = -1):
@@ -1451,6 +1749,7 @@ class Softmax(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x.softmax(self.dim)
 
+
 class LogSoftmax(Module):
     def __init__(self, dim: int = -1):
         super().__init__()
@@ -1458,6 +1757,7 @@ class LogSoftmax(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         return x.log_softmax(self.dim)
+
 
 # Loss Functions
 class MSELoss(Module):
@@ -1474,6 +1774,7 @@ class MSELoss(Module):
             return sq.sum()
         return sq
 
+
 class SmoothL1Loss(Module):
     def __init__(self, reduction: str = "mean", beta: float = 1.0):
         super().__init__()
@@ -1482,6 +1783,7 @@ class SmoothL1Loss(Module):
 
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
         return F.smooth_l1_loss(input, target, reduction=self.reduction, beta=self.beta)
+
 
 class CosineSimilarity(Module):
     def __init__(self, dim: int = 1, eps: float = 1e-8):
@@ -1492,9 +1794,11 @@ class CosineSimilarity(Module):
     def forward(self, x1: Tensor, x2: Tensor) -> Tensor:
         return F.cosine_similarity(x1, x2, dim=self.dim, eps=self.eps)
 
+
 class Identity(Module):
     def forward(self, x: Tensor) -> Tensor:
         return x
+
 
 class L1Loss(Module):
     def __init__(self, reduction: str = "mean"):
@@ -1504,6 +1808,7 @@ class L1Loss(Module):
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
         return F.l1_loss(input, target, reduction=self.reduction)
 
+
 class BCEWithLogitsLoss(Module):
     def __init__(self, reduction: str = "mean"):
         super().__init__()
@@ -1512,8 +1817,15 @@ class BCEWithLogitsLoss(Module):
     def forward(self, input: Tensor, target: Tensor) -> Tensor:
         return F.binary_cross_entropy_with_logits(input, target, reduction=self.reduction)
 
+
 class Upsample(Module):
-    def __init__(self, size=None, scale_factor=None, mode: str = "nearest", align_corners: Optional[bool] = None):
+    def __init__(
+        self,
+        size=None,
+        scale_factor=None,
+        mode: str = "nearest",
+        align_corners: Optional[bool] = None,
+    ):
         super().__init__()
         self.size = size
         self.scale_factor = scale_factor
@@ -1521,7 +1833,14 @@ class Upsample(Module):
         self.align_corners = align_corners
 
     def forward(self, x: Tensor) -> Tensor:
-        return F.interpolate(x, size=self.size, scale_factor=self.scale_factor, mode=self.mode, align_corners=self.align_corners)
+        return F.interpolate(
+            x,
+            size=self.size,
+            scale_factor=self.scale_factor,
+            mode=self.mode,
+            align_corners=self.align_corners,
+        )
+
 
 class ParameterList(Module):
     def __init__(self, parameters=None):
@@ -1543,6 +1862,7 @@ class ParameterList(Module):
     def append(self, p: Parameter):
         self.register_parameter(str(len(self._parameters)), p)
         return self
+
 
 class ModuleDict(Module):
     def __init__(self, modules=None):
@@ -1572,10 +1892,12 @@ class ModuleDict(Module):
     def items(self):
         return self._modules.items()
 
+
 class CrossEntropyLoss(Module):
     """
     Numerically stable Cross Entropy Loss with LogSoftmax + NLL.
     """
+
     def __init__(self, reduction: str = "mean"):
         super().__init__()
         self.reduction = reduction
@@ -1629,23 +1951,29 @@ class CrossEntropyLoss(Module):
                     grad = Tensor(grad_native, device=device)
                     return grad if g.numel == 1 else grad * g.reshape((rows, 1))
                 else:
-                    grad = Tensor(pred_native.cross_entropy_grad(indices_native, None, 1.0), device=device)
+                    grad = Tensor(
+                        pred_native.cross_entropy_grad(indices_native, None, 1.0), device=device
+                    )
                     return grad * g.reshape((rows, 1))
 
             out.grad_fn = Node("CrossEntropyBackward", ce_backward, [pred])
 
         return out
 
+
 from . import functional
 from . import functional as F
 from . import utils
 from . import init
 
+
 # ----------------------------------------------------------------------------
 # Recurrent Layers (RNN, LSTM, GRU)
 # ----------------------------------------------------------------------------
 class RNNCell(Module):
-    def __init__(self, input_size: int, hidden_size: int, nonlinearity: str = "tanh", bias: bool = True):
+    def __init__(
+        self, input_size: int, hidden_size: int, nonlinearity: str = "tanh", bias: bool = True
+    ):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
@@ -1667,7 +1995,9 @@ class RNNCell(Module):
 
     def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tensor:
         if hx is None:
-            hx = vultorch.zeros(input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype)
+            hx = vultorch.zeros(
+                input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype
+            )
         gate = input @ self.weight_ih.t() + hx @ self.weight_hh.t()
         if self.bias_ih is not None:
             gate = gate + self.bias_ih + self.bias_hh
@@ -1694,10 +2024,16 @@ class LSTMCell(Module):
         init.uniform_(self.weight_ih, -std, std)
         init.uniform_(self.weight_hh, -std, std)
 
-    def forward(self, input: Tensor, hx: Optional[Tuple[Tensor, Tensor]] = None) -> Tuple[Tensor, Tensor]:
+    def forward(
+        self, input: Tensor, hx: Optional[Tuple[Tensor, Tensor]] = None
+    ) -> Tuple[Tensor, Tensor]:
         if hx is None:
-            h = vultorch.zeros(input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype)
-            c = vultorch.zeros(input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype)
+            h = vultorch.zeros(
+                input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype
+            )
+            c = vultorch.zeros(
+                input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype
+            )
         else:
             h, c = hx
         gates = input @ self.weight_ih.t() + h @ self.weight_hh.t()
@@ -1705,9 +2041,9 @@ class LSTMCell(Module):
             gates = gates + self.bias_ih + self.bias_hh
         H = self.hidden_size
         i_gate = gates[:, 0:H].sigmoid()
-        f_gate = gates[:, H:2*H].sigmoid()
-        g_gate = gates[:, 2*H:3*H].tanh()
-        o_gate = gates[:, 3*H:4*H].sigmoid()
+        f_gate = gates[:, H : 2 * H].sigmoid()
+        g_gate = gates[:, 2 * H : 3 * H].tanh()
+        o_gate = gates[:, 3 * H : 4 * H].sigmoid()
         c_next = f_gate * c + i_gate * g_gate
         h_next = o_gate * c_next.tanh()
         return h_next, c_next
@@ -1735,7 +2071,9 @@ class GRUCell(Module):
 
     def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tensor:
         if hx is None:
-            hx = vultorch.zeros(input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype)
+            hx = vultorch.zeros(
+                input.shape[0], self.hidden_size, device=input.device, dtype=input.dtype
+            )
         H = self.hidden_size
         gi = input @ self.weight_ih.t()
         gh = hx @ self.weight_hh.t()
@@ -1743,32 +2081,55 @@ class GRUCell(Module):
             gi = gi + self.bias_ih
             gh = gh + self.bias_hh
         r = (gi[:, 0:H] + gh[:, 0:H]).sigmoid()
-        z = (gi[:, H:2*H] + gh[:, H:2*H]).sigmoid()
-        n = (gi[:, 2*H:3*H] + r * gh[:, 2*H:3*H]).tanh()
+        z = (gi[:, H : 2 * H] + gh[:, H : 2 * H]).sigmoid()
+        n = (gi[:, 2 * H : 3 * H] + r * gh[:, 2 * H : 3 * H]).tanh()
         h_next = (1.0 - z) * n + z * hx
         return h_next
 
 
 class LSTM(Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, bias: bool = True, batch_first: bool = False):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        bias: bool = True,
+        batch_first: bool = False,
+    ):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.batch_first = batch_first
-        self.layers = ModuleList([
-            LSTMCell(input_size if i == 0 else hidden_size, hidden_size, bias=bias)
-            for i in range(num_layers)
-        ])
+        self.layers = ModuleList(
+            [
+                LSTMCell(input_size if i == 0 else hidden_size, hidden_size, bias=bias)
+                for i in range(num_layers)
+            ]
+        )
 
-    def forward(self, input: Tensor, hx: Optional[Tuple[Tensor, Tensor]] = None) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
+    def forward(
+        self, input: Tensor, hx: Optional[Tuple[Tensor, Tensor]] = None
+    ) -> Tuple[Tensor, Tuple[Tensor, Tensor]]:
         if self.batch_first:
             # (B, T, D) -> (T, B, D)
             input = input.transpose(0, 1)
         seq_len, batch_size, _ = input.shape
         if hx is None:
-            h_0 = vultorch.zeros(self.num_layers, batch_size, self.hidden_size, device=input.device, dtype=input.dtype)
-            c_0 = vultorch.zeros(self.num_layers, batch_size, self.hidden_size, device=input.device, dtype=input.dtype)
+            h_0 = vultorch.zeros(
+                self.num_layers,
+                batch_size,
+                self.hidden_size,
+                device=input.device,
+                dtype=input.dtype,
+            )
+            c_0 = vultorch.zeros(
+                self.num_layers,
+                batch_size,
+                self.hidden_size,
+                device=input.device,
+                dtype=input.dtype,
+            )
         else:
             h_0, c_0 = hx
 
@@ -1796,23 +2157,38 @@ class LSTM(Module):
 
 
 class GRU(Module):
-    def __init__(self, input_size: int, hidden_size: int, num_layers: int = 1, bias: bool = True, batch_first: bool = False):
+    def __init__(
+        self,
+        input_size: int,
+        hidden_size: int,
+        num_layers: int = 1,
+        bias: bool = True,
+        batch_first: bool = False,
+    ):
         super().__init__()
         self.input_size = input_size
         self.hidden_size = hidden_size
         self.num_layers = num_layers
         self.batch_first = batch_first
-        self.layers = ModuleList([
-            GRUCell(input_size if i == 0 else hidden_size, hidden_size, bias=bias)
-            for i in range(num_layers)
-        ])
+        self.layers = ModuleList(
+            [
+                GRUCell(input_size if i == 0 else hidden_size, hidden_size, bias=bias)
+                for i in range(num_layers)
+            ]
+        )
 
     def forward(self, input: Tensor, hx: Optional[Tensor] = None) -> Tuple[Tensor, Tensor]:
         if self.batch_first:
             input = input.transpose(0, 1)
         seq_len, batch_size, _ = input.shape
         if hx is None:
-            h_0 = vultorch.zeros(self.num_layers, batch_size, self.hidden_size, device=input.device, dtype=input.dtype)
+            h_0 = vultorch.zeros(
+                self.num_layers,
+                batch_size,
+                self.hidden_size,
+                device=input.device,
+                dtype=input.dtype,
+            )
         else:
             h_0 = hx
 
@@ -1838,7 +2214,14 @@ class GRU(Module):
 # Transformer Containers
 # ----------------------------------------------------------------------------
 class TransformerEncoderLayer(Module):
-    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1, activation: str = "relu"):
+    def __init__(
+        self,
+        d_model: int,
+        nhead: int,
+        dim_feedforward: int = 2048,
+        dropout: float = 0.1,
+        activation: str = "relu",
+    ):
         super().__init__()
         self.self_attn = MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=True)
         self.linear1 = Linear(d_model, dim_feedforward)
@@ -1861,6 +2244,7 @@ class TransformerEncoder(Module):
     def __init__(self, encoder_layer: TransformerEncoderLayer, num_layers: int):
         super().__init__()
         import copy
+
         self.layers = ModuleList([copy.deepcopy(encoder_layer) for _ in range(num_layers)])
 
     def forward(self, src: Tensor, mask: Optional[Tensor] = None) -> Tensor:
@@ -1868,6 +2252,7 @@ class TransformerEncoder(Module):
         for layer in self.layers:
             out = layer(out, mask=mask)
         return out
+
 
 # ----------------------------------------------------------------------------
 class MultiGPU(Module):
@@ -1881,6 +2266,7 @@ class MultiGPU(Module):
       parameters and clears stale replica gradients—requiring zero extra calls in the
       training loop.
     """
+
     def __init__(
         self,
         module: Module,
@@ -1892,7 +2278,11 @@ class MultiGPU(Module):
         if (
             device_ids is None
             or device_ids == "all"
-            or (isinstance(device_ids, (list, tuple)) and len(device_ids) == 1 and str(device_ids[0]).lower() == "all")
+            or (
+                isinstance(device_ids, (list, tuple))
+                and len(device_ids) == 1
+                and str(device_ids[0]).lower() == "all"
+            )
         ):
             count = vultorch.vulkan.device_count()
             resolved_ids = [f"vk:{i}" for i in range(count)] if count > 0 else ["cpu"]
@@ -1944,12 +2334,18 @@ class MultiGPU(Module):
             )
 
         # Closed-loop adaptive balance: combine static GEMM TFLOPS calibration with measured per-step latency
-        if self.balance == "auto" and len(self._measured_throughputs) == n_devs and self._step_count > 2:
+        if (
+            self.balance == "auto"
+            and len(self._measured_throughputs) == n_devs
+            and self._step_count > 2
+        ):
             dynamic_weights = [self._measured_throughputs[d] for d in self.device_ids]
             total_w = sum(dynamic_weights)
             if total_w > 0:
                 norm_w = [w / total_w for w in dynamic_weights]
-                return vultorch.vulkan.compute_split_sizes(batch_size, self.device_ids, weights=norm_w)
+                return vultorch.vulkan.compute_split_sizes(
+                    batch_size, self.device_ids, weights=norm_w
+                )
 
         if self.balance in (True, "tflops", "auto"):
             return vultorch.vulkan.compute_split_sizes(batch_size, self.device_ids)
@@ -1984,6 +2380,7 @@ class MultiGPU(Module):
 
         if device not in self.replicas:
             import copy
+
             replica = copy.deepcopy(self.module)
             replica.to(device)
             self.replicas[device] = replica
@@ -2021,7 +2418,9 @@ class MultiGPU(Module):
         if isinstance(obj, list):
             return [DataParallel._slice_tree(v, start, end, dev_id) for v in obj]
         if isinstance(obj, dict):
-            return type(obj)((k, DataParallel._slice_tree(v, start, end, dev_id)) for k, v in obj.items())
+            return type(obj)(
+                (k, DataParallel._slice_tree(v, start, end, dev_id)) for k, v in obj.items()
+            )
         return obj
 
     @staticmethod
@@ -2127,9 +2526,9 @@ class MultiGPU(Module):
         for _, (dev_id, chunk_sz, elapsed) in enumerate(rt[1] for rt in results_and_times):
             throughput = float(chunk_sz) / elapsed
             if dev_id in self._measured_throughputs:
-                self._measured_throughputs[dev_id] = (
-                    (1.0 - alpha) * self._measured_throughputs[dev_id] + alpha * throughput
-                )
+                self._measured_throughputs[dev_id] = (1.0 - alpha) * self._measured_throughputs[
+                    dev_id
+                ] + alpha * throughput
             else:
                 self._measured_throughputs[dev_id] = throughput
 
@@ -2137,11 +2536,14 @@ class MultiGPU(Module):
         first_out = self._find_first_tensor(gathered)
         if first_out is not None and first_out.requires_grad and first_out.grad_fn is not None:
             import weakref
+
             weak_self = weakref.ref(self)
+
             def _hook():
                 inst = weak_self()
                 if inst is not None:
                     inst._auto_reduce_after_backward()
+
             first_out.grad_fn.post_hook = _hook
 
         return gathered
@@ -2185,4 +2587,3 @@ class MultiGPU(Module):
 
 
 DataParallel = MultiGPU
-

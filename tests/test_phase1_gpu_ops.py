@@ -76,7 +76,9 @@ def test_maxpool2d_gpu_matches_cpu_and_gradcheck(device, kernel_size, stride, pa
 
     # Numerical gradcheck
     x_gc = x_np[:1, :1, :4, :4].copy()
-    w_gc = rng.standard_normal(pool_dev(vultorch.tensor(x_gc, device=device)).shape).astype(np.float32)
+    w_gc = rng.standard_normal(pool_dev(vultorch.tensor(x_gc, device=device)).shape).astype(
+        np.float32
+    )
     w_gc_t = vultorch.tensor(w_gc, device=device)
     assert gradcheck(
         lambda inp: (pool_dev(inp) * w_gc_t).sum(),
@@ -110,7 +112,9 @@ def test_avgpool2d_and_adaptive_avgpool2d_gradcheck(device, count_include_pad):
     np.testing.assert_allclose(x_dev.grad.numpy(), x_cpu.grad.numpy(), rtol=1e-5, atol=1e-5)
 
     x_gc = x_np[:, :1, :4, :4].copy()
-    w_gc = rng.standard_normal(pool_dev(vultorch.tensor(x_gc, device=device)).shape).astype(np.float32)
+    w_gc = rng.standard_normal(pool_dev(vultorch.tensor(x_gc, device=device)).shape).astype(
+        np.float32
+    )
     w_gc_t = vultorch.tensor(w_gc, device=device)
     assert gradcheck(
         lambda inp: (pool_dev(inp) * w_gc_t).sum(),
@@ -138,7 +142,9 @@ def test_avgpool2d_and_adaptive_avgpool2d_gradcheck(device, count_include_pad):
         np.testing.assert_allclose(xd.grad.numpy(), xc.grad.numpy(), rtol=1e-5, atol=1e-5)
 
         x_gc2 = x_np[:, :1, :4, :4].copy()
-        w_gc2 = rng.standard_normal(adap_dev(vultorch.tensor(x_gc2, device=device)).shape).astype(np.float32)
+        w_gc2 = rng.standard_normal(adap_dev(vultorch.tensor(x_gc2, device=device)).shape).astype(
+            np.float32
+        )
         w_gc2_t = vultorch.tensor(w_gc2, device=device)
         assert gradcheck(
             lambda inp: (adap_dev(inp) * w_gc2_t).sum(),
@@ -228,8 +234,12 @@ def test_layernorm_and_rmsnorm_fused_backward(device):
 
     np.testing.assert_allclose(y_t.numpy(), y_ref.astype(np.float32), rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(x_t.grad.numpy(), dx_ref.astype(np.float32), rtol=1e-4, atol=1e-4)
-    np.testing.assert_allclose(ln.weight.grad.numpy(), dg_ref.astype(np.float32), rtol=1e-4, atol=1e-4)
-    np.testing.assert_allclose(ln.bias.grad.numpy(), db_ref.astype(np.float32), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(
+        ln.weight.grad.numpy(), dg_ref.astype(np.float32), rtol=1e-4, atol=1e-4
+    )
+    np.testing.assert_allclose(
+        ln.bias.grad.numpy(), db_ref.astype(np.float32), rtol=1e-4, atol=1e-4
+    )
 
     # --- RMSNorm ---
     rms = nn.RMSNorm(16, eps=eps, device=device)
@@ -240,7 +250,7 @@ def test_layernorm_and_rmsnorm_fused_backward(device):
     yr_t = rms(xr_t)
     yr_t.backward(vultorch.tensor(dy_np, device=device))
 
-    ms = (x64 ** 2).mean(axis=-1, keepdims=True)
+    ms = (x64**2).mean(axis=-1, keepdims=True)
     inv_rms = 1.0 / np.sqrt(ms + eps)
     xr_hat = x64 * inv_rms
     yr_ref = xr_hat * g64
@@ -250,18 +260,20 @@ def test_layernorm_and_rmsnorm_fused_backward(device):
 
     np.testing.assert_allclose(yr_t.numpy(), yr_ref.astype(np.float32), rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(xr_t.grad.numpy(), dxr_ref.astype(np.float32), rtol=1e-4, atol=1e-4)
-    np.testing.assert_allclose(rms.weight.grad.numpy(), dgr_ref.astype(np.float32), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(
+        rms.weight.grad.numpy(), dgr_ref.astype(np.float32), rtol=1e-4, atol=1e-4
+    )
 
 
 @pytest.mark.parametrize("device", DEVICES)
 @pytest.mark.parametrize(
     "momentum,dampening,weight_decay,nesterov",
     [
-        (0.0, 0.0, 0.0, False),      # Plain SGD
-        (0.0, 0.0, 1e-2, False),     # SGD + weight_decay
-        (0.9, 0.0, 1e-3, False),     # SGD + momentum + weight_decay
-        (0.9, 0.2, 1e-3, False),     # SGD + momentum + dampening
-        (0.9, 0.0, 1e-3, True),      # Nesterov SGD
+        (0.0, 0.0, 0.0, False),  # Plain SGD
+        (0.0, 0.0, 1e-2, False),  # SGD + weight_decay
+        (0.9, 0.0, 1e-3, False),  # SGD + momentum + weight_decay
+        (0.9, 0.2, 1e-3, False),  # SGD + momentum + dampening
+        (0.9, 0.0, 1e-3, True),  # Nesterov SGD
     ],
 )
 def test_fused_sgd_matches_unfused(device, momentum, dampening, weight_decay, nesterov):
@@ -422,4 +434,3 @@ def test_dataparallel_multi_head_tuple_and_dict_outputs():
     for name, p in net.named_parameters():
         assert p.grad is not None, f"Missing gradient for {name}"
         assert np.all(np.isfinite(p.grad.numpy()))
-

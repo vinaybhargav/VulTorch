@@ -39,11 +39,15 @@ def test_conv2d_im2col_matches_cpu_reference(dev):
     y_gpu = conv_gpu(x_gpu)
     np.testing.assert_allclose(y_gpu.numpy(), y_cpu.numpy(), rtol=1e-3, atol=1e-3)
 
-    (y_cpu ** 2).sum().backward()
-    (y_gpu ** 2).sum().backward()
+    (y_cpu**2).sum().backward()
+    (y_gpu**2).sum().backward()
     np.testing.assert_allclose(x_gpu.grad.numpy(), x_cpu.grad.numpy(), rtol=1e-3, atol=1e-3)
-    np.testing.assert_allclose(conv_gpu.weight.grad.numpy(), conv_cpu.weight.grad.numpy(), rtol=1e-3, atol=1e-3)
-    np.testing.assert_allclose(conv_gpu.bias.grad.numpy(), conv_cpu.bias.grad.numpy(), rtol=1e-3, atol=1e-3)
+    np.testing.assert_allclose(
+        conv_gpu.weight.grad.numpy(), conv_cpu.weight.grad.numpy(), rtol=1e-3, atol=1e-3
+    )
+    np.testing.assert_allclose(
+        conv_gpu.bias.grad.numpy(), conv_cpu.bias.grad.numpy(), rtol=1e-3, atol=1e-3
+    )
 
 
 @pytest.mark.parametrize("dev", DEVICES)
@@ -75,8 +79,7 @@ def test_conv_transpose2d_and_gradcheck(dev):
     assert y.shape == (1, 2, 5, 5)
 
     assert torch.gradcheck(
-        lambda t: (deconv(t) ** 2).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: (deconv(t) ** 2).sum(), x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
 
@@ -97,8 +100,7 @@ def test_batchnorm2d_and_groupnorm_gradcheck(dev):
 
     w_proj = torch.tensor(_rand_np((3, 4, 4, 4), seed=55), device=dev)
     assert torch.gradcheck(
-        lambda t: (bn(t) * w_proj).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: (bn(t) * w_proj).sum(), x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
     # Eval mode uses running_mean / running_var
@@ -109,8 +111,7 @@ def test_batchnorm2d_and_groupnorm_gradcheck(dev):
     # GroupNorm + gradcheck
     gn = nn.GroupNorm(2, 4, device=dev)
     assert torch.gradcheck(
-        lambda t: (gn(t) * w_proj).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: (gn(t) * w_proj).sum(), x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
 
@@ -233,8 +234,7 @@ def test_snake_scalar_and_module_gradcheck(dev):
 
     w = torch.tensor(_rand_np((2, 4, 16), seed=102), device=dev)
     assert torch.gradcheck(
-        lambda t: (t.snake(a=2.0) * w).sum(),
-        x, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: (t.snake(a=2.0) * w).sum(), x, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
     # 2. Per-channel trainable nn.Snake (linear and log-scale)
@@ -285,8 +285,10 @@ def test_snake_beta_and_signal_processing_conv1d_net(dev):
 
     # Finite difference check on both alpha and beta
     eps_fd = 1e-3
-    for param, analytic in [(sb.alpha, sb.alpha.grad.numpy().copy()),
-                            (sb.beta, sb.beta.grad.numpy().copy())]:
+    for param, analytic in [
+        (sb.alpha, sb.alpha.grad.numpy().copy()),
+        (sb.beta, sb.beta.grad.numpy().copy()),
+    ]:
         p_orig = param.numpy().copy()
         num_dp = np.zeros_like(p_orig)
         for c in range(4):
@@ -408,11 +410,19 @@ def test_mamba_selective_scan_and_block(dev):
     # Gradcheck on u, dt, B, C
     assert torch.gradcheck(
         lambda u_in: (torch.selective_scan(u_in, dt, A, B_t, C_t, D_t) * w).sum(),
-        u, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
+        u,
+        eps=1e-3,
+        rtol=2e-2,
+        atol=5e-3,
+        device=dev,
     )
     assert torch.gradcheck(
         lambda dt_in: (torch.selective_scan(u, dt_in, A, B_t, C_t, D_t) * w).sum(),
-        dt, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
+        dt,
+        eps=1e-3,
+        rtol=2e-2,
+        atol=5e-3,
+        device=dev,
     )
 
     # Full Mamba block (both standard SiLU and SnakeBeta front-end)
@@ -436,6 +446,3 @@ def test_mamba_selective_scan_and_block(dev):
                 loss_first = val
             loss_final = val
         assert loss_final < loss_first
-
-
-

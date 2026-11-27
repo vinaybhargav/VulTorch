@@ -13,9 +13,10 @@ from examples.neural_text_compressor import (
     NeuralCompressor1M,
     train_codec_model,
     compress_file,
-    decompress_file
+    decompress_file,
 )
 import vultorch as torch
+
 
 def main():
     parser = argparse.ArgumentParser(description="VulTorch ~1M Parameter Neural Text Compressor")
@@ -36,7 +37,9 @@ def main():
     p_decomp.add_argument("--device", default="vk:0", help="Vulkan device (default: vk:0)")
 
     # Benchmark
-    p_bench = subparsers.add_parser("benchmark", help="Benchmark VulTorch vs LZMA -9 on a text file")
+    p_bench = subparsers.add_parser(
+        "benchmark", help="Benchmark VulTorch vs LZMA -9 on a text file"
+    )
     p_bench.add_argument("input", help="Path to text file")
     p_bench.add_argument("--device", default="vk:0", help="Vulkan device (default: vk:0)")
 
@@ -94,15 +97,22 @@ def main():
         print(f"📊 COMPRESSION BENCHMARK: {args.input}")
         print("=" * 70)
         print(f"Original Size:        {orig_sz:,} bytes (100.0%)")
-        print(f"LZMA -9 Size:         {lzma_sz:,} bytes ({lzma_sz/orig_sz*100:.2f}%, {(lzma_sz*8)/orig_sz:.2f} bpc)")
-        print(f"VulTorch 1M Size:     {vt_sz:,} bytes ({vt_sz/orig_sz*100:.2f}%, {(vt_sz*8)/orig_sz:.2f} bpc)")
+        print(
+            f"LZMA -9 Size:         {lzma_sz:,} bytes ({lzma_sz / orig_sz * 100:.2f}%, {(lzma_sz * 8) / orig_sz:.2f} bpc)"
+        )
+        print(
+            f"VulTorch 1M Size:     {vt_sz:,} bytes ({vt_sz / orig_sz * 100:.2f}%, {(vt_sz * 8) / orig_sz:.2f} bpc)"
+        )
         print("-" * 70)
         diff = lzma_sz - vt_sz
         if diff > 0:
-            print(f"🎉 VulTorch BEAT LZMA -9 by {(diff/lzma_sz)*100:.1f}% ({diff:,} fewer bytes)!")
+            print(
+                f"🎉 VulTorch BEAT LZMA -9 by {(diff / lzma_sz) * 100:.1f}% ({diff:,} fewer bytes)!"
+            )
         else:
             print(f"LZMA vs VulTorch: {diff} bytes")
         print("=" * 70)
+
 
 if __name__ == "__main__":
     main()

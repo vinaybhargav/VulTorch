@@ -11,16 +11,17 @@ from vultorch.models.compressor_10m import NeuralCompressor10M
 from vultorch.quantization.q8 import QuantizedLinearQ8, ModelQuantizerQ8
 from vultorch.utils.range_coder import RangeCoder
 
+
 def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
     orig_len = len(data)
-    K = 32 # Context length
+    K = 32  # Context length
     padded = bytes([0] * K) + data
 
     # Prepare training sequences
     X_list = []
     Y_list = []
     for i in range(orig_len):
-        X_list.append(list(padded[i:i + K]))
+        X_list.append(list(padded[i : i + K]))
         Y_list.append(padded[i + K])
 
     X_arr = np.array(X_list, dtype=np.int64)
@@ -43,7 +44,7 @@ def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
         total_loss = 0.0
         indices = np.random.permutation(orig_len)
         for b in range(num_batches):
-            b_idx = indices[b * batch_size:(b + 1) * batch_size]
+            b_idx = indices[b * batch_size : (b + 1) * batch_size]
             bx = torch.tensor(X_arr[b_idx], device=device)
             by = torch.tensor(Y_arr[b_idx], device=device)
 
@@ -56,7 +57,10 @@ def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
 
         avg_loss = total_loss / orig_len
         bpc = avg_loss / np.log(2)
-        print(f"   Epoch {epoch:2d}/{epochs} | Cross-Entropy: {avg_loss:.4f} nats | Entropy: {bpc:.2f} bits/byte", flush=True)
+        print(
+            f"   Epoch {epoch:2d}/{epochs} | Cross-Entropy: {avg_loss:.4f} nats | Entropy: {bpc:.2f} bits/byte",
+            flush=True,
+        )
 
     train_time = time.time() - t0_train
     print(f"✅ Training completed in {train_time:.2f}s on GPU!", flush=True)
@@ -64,7 +68,10 @@ def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
     # Quantize to Q8
     print("💎 Quantizing model linear layers to INT8 (Q8)...", flush=True)
     q8_blob = ModelQuantizerQ8.quantize_state_dict(model)
-    print(f"   Quantized Q8 Model Size: {len(q8_blob):,} bytes (~{len(q8_blob)/(1024*1024):.1f} MB)", flush=True)
+    print(
+        f"   Quantized Q8 Model Size: {len(q8_blob):,} bytes (~{len(q8_blob) / (1024 * 1024):.1f} MB)",
+        flush=True,
+    )
 
     # Build fast vectorized Q8 inference engine
     emb_w = model.embed.weight.numpy()
@@ -80,7 +87,7 @@ def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
     ql_out = QuantizedLinearQ8.from_float_linear(model.fc_out)
 
     def gelu(x):
-        return 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * (x ** 3))))
+        return 0.5 * x * (1.0 + np.tanh(np.sqrt(2.0 / np.pi) * (x + 0.044715 * (x**3))))
 
     def layer_norm(x, w, b, eps=1e-5):
         mean = np.mean(x, axis=-1, keepdims=True)
@@ -101,13 +108,16 @@ def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
     t0_comp = time.time()
     all_probs = []
     for i in range(orig_len):
-        p = forward_q8(list(padded[i:i + K]))[0]
+        p = forward_q8(list(padded[i : i + K]))[0]
         all_probs.append(p)
 
     payload = RangeCoder.encode(data, all_probs)
     compressed_bytes = struct.pack(">I", orig_len) + payload
     comp_time = time.time() - t0_comp
-    print(f"   Compression completed in {comp_time*1000:.1f}ms! Payload: {len(compressed_bytes):,} bytes", flush=True)
+    print(
+        f"   Compression completed in {comp_time * 1000:.1f}ms! Payload: {len(compressed_bytes):,} bytes",
+        flush=True,
+    )
 
     # Decompression pass with Q8 model
     print(f"\n🔄 Decompressing with Q8 model...", flush=True)
@@ -130,9 +140,9 @@ def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
 
     for i in range(N):
         if i % 500 == 0 or i == N - 1:
-            print(f"   Decompressing token {i+1}/{N} ({((i+1)/N)*100:.1f}%)...", flush=True)
+            print(f"   Decompressing token {i + 1}/{N} ({((i + 1) / N) * 100:.1f}%)...", flush=True)
 
-        probs = forward_q8(list(decoded[i:i + K]))[0]
+        probs = forward_q8(list(decoded[i : i + K]))[0]
 
         total_count = 1 << 14
         counts = np.maximum(1, (probs * (total_count - 256)).astype(np.int32))
@@ -144,15 +154,17 @@ def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
 
         range_ //= total_count
         count_val = (code - low) // range_
-        sym = int(np.searchsorted(cum, count_val, side='right') - 1)
+        sym = int(np.searchsorted(cum, count_val, side="right") - 1)
         sym = max(0, min(255, sym))
 
         sym_low = int(cum[sym])
         sym_high = int(cum[sym + 1])
         low += sym_low * range_
-        range_ *= (sym_high - sym_low)
+        range_ *= sym_high - sym_low
 
-        while (low ^ (low + range_)) < RangeCoder.TOP or (range_ < RangeCoder.BOTTOM and ((range_ := -low & (RangeCoder.BOTTOM - 1)), True)):
+        while (low ^ (low + range_)) < RangeCoder.TOP or (
+            range_ < RangeCoder.BOTTOM and ((range_ := -low & (RangeCoder.BOTTOM - 1)), True)
+        ):
             b = stream[stream_idx] if stream_idx < len(stream) else 0
             stream_idx += 1
             code = ((code << 8) | b) & 0xFFFFFFFF
@@ -164,7 +176,10 @@ def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
 
     decomp_time = time.time() - t0_decomp
     restored_bytes = bytes(out_bytes)
-    print(f"✅ Decompressed {len(restored_bytes):,} bytes in {decomp_time:.2f}s ({len(restored_bytes)/decomp_time:.1f} bytes/sec)!", flush=True)
+    print(
+        f"✅ Decompressed {len(restored_bytes):,} bytes in {decomp_time:.2f}s ({len(restored_bytes) / decomp_time:.1f} bytes/sec)!",
+        flush=True,
+    )
 
     return {
         "compressed_size": len(compressed_bytes),
@@ -172,8 +187,9 @@ def train_and_compress_vultorch_10m(data: bytes, device: str = "vk:0"):
         "comp_time": comp_time,
         "total_comp_time": train_time + comp_time,
         "decomp_time": decomp_time,
-        "restored": restored_bytes
+        "restored": restored_bytes,
     }
+
 
 def run_grand_showdown():
     print("=" * 80)
@@ -203,7 +219,8 @@ def run_grand_showdown():
     # --- Benchmark 1: LZMA -9 ---
     print("\n[1/3] Benchmarking LZMA -9 (7-Zip Maximum)...")
     lzma_out = input_file + ".lzma"
-    if os.path.exists(lzma_out): os.remove(lzma_out)
+    if os.path.exists(lzma_out):
+        os.remove(lzma_out)
     t0 = time.time()
     subprocess.run(["lzma", "-9", "-k", "-f", input_file], check=True)
     t_lzma_comp = time.time() - t0
@@ -233,37 +250,48 @@ def run_grand_showdown():
     with open(cmix_restored, "rb") as f:
         cmix_decomp_bytes = f.read()
     cmix_sha = hashlib.sha256(cmix_decomp_bytes).hexdigest()
-    print(f"   Compressed Size: {cmix_size:,} bytes | Time: {t_cmix_comp:.2f}s | SHA Match: {cmix_sha == orig_sha}", flush=True)
+    print(
+        f"   Compressed Size: {cmix_size:,} bytes | Time: {t_cmix_comp:.2f}s | SHA Match: {cmix_sha == orig_sha}",
+        flush=True,
+    )
 
     # --- Benchmark 3: VulTorch 10M Q8 Neural Compressor ---
     print("\n[3/3] Benchmarking VulTorch 10M Q8 on Vulkan GPU (AMD 7900 XTX)...")
     vt_res = train_and_compress_vultorch_10m(test_data, device="vk:0")
     vt_sha = hashlib.sha256(vt_res["restored"]).hexdigest()
-    vt_match = (vt_sha == orig_sha)
+    vt_match = vt_sha == orig_sha
 
     # --- Results Table ---
     print("\n" + "=" * 80)
     print("📊 COMPRESSION SHOWDOWN RESULTS TABLE")
     print("=" * 80)
-    print(f"{'Compressor':<22} | {'Size (B)':<10} | {'Ratio (%)':<10} | {'Bits/Byte':<10} | {'Comp Time':<10} | {'Throughput':<12}")
+    print(
+        f"{'Compressor':<22} | {'Size (B)':<10} | {'Ratio (%)':<10} | {'Bits/Byte':<10} | {'Comp Time':<10} | {'Throughput':<12}"
+    )
     print("-" * 80)
 
     lzma_ratio = (lzma_size / orig_size) * 100
     lzma_bpc = (lzma_size * 8) / orig_size
     lzma_speed = (orig_size / 1024) / max(0.0001, t_lzma_comp)
-    print(f"{'LZMA -9':<22} | {lzma_size:<10,d} | {lzma_ratio:<9.2f}% | {lzma_bpc:<10.2f} | {t_lzma_comp:<9.3f}s | {lzma_speed:<9.1f} KB/s")
+    print(
+        f"{'LZMA -9':<22} | {lzma_size:<10,d} | {lzma_ratio:<9.2f}% | {lzma_bpc:<10.2f} | {t_lzma_comp:<9.3f}s | {lzma_speed:<9.1f} KB/s"
+    )
 
     cmix_ratio = (cmix_size / orig_size) * 100
     cmix_bpc = (cmix_size * 8) / orig_size
     cmix_speed = (orig_size / 1024) / max(0.0001, t_cmix_comp)
-    print(f"{'CMIX v21 (World Record)':<22} | {cmix_size:<10,d} | {cmix_ratio:<9.2f}% | {cmix_bpc:<10.2f} | {t_cmix_comp:<9.2f}s | {cmix_speed:<9.2f} KB/s")
+    print(
+        f"{'CMIX v21 (World Record)':<22} | {cmix_size:<10,d} | {cmix_ratio:<9.2f}% | {cmix_bpc:<10.2f} | {t_cmix_comp:<9.2f}s | {cmix_speed:<9.2f} KB/s"
+    )
 
     vt_size = vt_res["compressed_size"]
     vt_ratio = (vt_size / orig_size) * 100
     vt_bpc = (vt_size * 8) / orig_size
     vt_total_t = vt_res["total_comp_time"]
     vt_speed = (orig_size / 1024) / max(0.0001, vt_total_t)
-    print(f"{'VulTorch 10M Q8':<22} | {vt_size:<10,d} | {vt_ratio:<9.2f}% | {vt_bpc:<10.2f} | {vt_total_t:<9.2f}s | {vt_speed:<9.2f} KB/s")
+    print(
+        f"{'VulTorch 10M Q8':<22} | {vt_size:<10,d} | {vt_ratio:<9.2f}% | {vt_bpc:<10.2f} | {vt_total_t:<9.2f}s | {vt_speed:<9.2f} KB/s"
+    )
 
     print("=" * 80)
     print(f"🔍 BIT-EXACT LOSSLESS VERIFICATION:")
@@ -277,9 +305,14 @@ def run_grand_showdown():
     speed_win = t_cmix_comp / vt_total_t
     print("-" * 80)
     print(f"🚀 SUMMARY VS CMIX:")
-    print(f"   📦 Compressed Size: VulTorch is {size_win:.1f}% SMALLER than CMIX ({vt_size} bytes vs {cmix_size} bytes)!")
-    print(f"   ⚡ Compression Speed: VulTorch is {speed_win:.2f}x FASTER than CMIX ({vt_total_t:.1f}s vs {t_cmix_comp:.1f}s)!")
+    print(
+        f"   📦 Compressed Size: VulTorch is {size_win:.1f}% SMALLER than CMIX ({vt_size} bytes vs {cmix_size} bytes)!"
+    )
+    print(
+        f"   ⚡ Compression Speed: VulTorch is {speed_win:.2f}x FASTER than CMIX ({vt_total_t:.1f}s vs {t_cmix_comp:.1f}s)!"
+    )
     print("=" * 80)
+
 
 if __name__ == "__main__":
     run_grand_showdown()

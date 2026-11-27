@@ -8,6 +8,7 @@ import vultorch
 from ...tensor import Tensor
 from ...autograd import no_grad
 
+
 def clip_grad_norm_(
     parameters: Union[Iterable[Tensor], Tensor],
     max_norm: float,
@@ -46,7 +47,9 @@ def clip_grad_norm_(
             total_norm = float(total_norm_t.item())
 
         if error_if_nonfinite and (math.isnan(total_norm) or math.isinf(total_norm)):
-            raise RuntimeError(f"The total norm of order {norm_type} for gradients from `parameters` is non-finite, so it cannot be clipped.")
+            raise RuntimeError(
+                f"The total norm of order {norm_type} for gradients from `parameters` is non-finite, so it cannot be clipped."
+            )
 
         clip_coef = max_norm / (total_norm + 1e-6)
         if clip_coef < 1.0:

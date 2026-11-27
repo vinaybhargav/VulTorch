@@ -3,7 +3,10 @@ import numpy as np
 import vultorch as torch
 import vultorch.nn as nn
 
-@pytest.mark.skipif(torch.vulkan.device_count() < 2, reason="Multi-GPU test requires at least 2 Vulkan devices")
+
+@pytest.mark.skipif(
+    torch.vulkan.device_count() < 2, reason="Multi-GPU test requires at least 2 Vulkan devices"
+)
 def test_cross_gpu_transfer():
     x_amd = torch.randn(64, 64, device="vk:0")
     # Transfer from AMD 7900 XTX to NVIDIA RTX 3080
@@ -16,7 +19,10 @@ def test_cross_gpu_transfer():
     assert x_back.device == torch.device("vk:0")
     np.testing.assert_allclose(x_amd.numpy(), x_back.numpy(), rtol=1e-5, atol=1e-5)
 
-@pytest.mark.skipif(torch.vulkan.device_count() < 2, reason="Multi-GPU test requires at least 2 Vulkan devices")
+
+@pytest.mark.skipif(
+    torch.vulkan.device_count() < 2, reason="Multi-GPU test requires at least 2 Vulkan devices"
+)
 def test_concurrent_multi_gpu_compute():
     # Compute on AMD GPU
     a0 = torch.randn(128, 128, device="vk:0")
@@ -31,13 +37,12 @@ def test_concurrent_multi_gpu_compute():
     np.testing.assert_allclose(c0.numpy(), a0.numpy() @ b0.numpy(), rtol=1e-4, atol=1e-4)
     np.testing.assert_allclose(c1.numpy(), a1.numpy() @ b1.numpy(), rtol=1e-4, atol=1e-4)
 
-@pytest.mark.skipif(torch.vulkan.device_count() < 2, reason="Multi-GPU test requires at least 2 Vulkan devices")
+
+@pytest.mark.skipif(
+    torch.vulkan.device_count() < 2, reason="Multi-GPU test requires at least 2 Vulkan devices"
+)
 def test_data_parallel_heterogeneous():
-    model = nn.Sequential(
-        nn.Linear(32, 16),
-        nn.ReLU(),
-        nn.Linear(16, 4)
-    ).to("vk:0")
+    model = nn.Sequential(nn.Linear(32, 16), nn.ReLU(), nn.Linear(16, 4)).to("vk:0")
 
     dp_model = nn.DataParallel(model, device_ids=["vk:0", "vk:1"])
     x = torch.randn(16, 32, device="vk:0")
@@ -52,7 +57,10 @@ def test_data_parallel_heterogeneous():
     ref = model(x)
     np.testing.assert_allclose(out.numpy(), ref.numpy(), rtol=1e-4, atol=1e-4)
 
-@pytest.mark.skipif(torch.vulkan.device_count() < 2, reason="Multi-GPU test requires at least 2 Vulkan devices")
+
+@pytest.mark.skipif(
+    torch.vulkan.device_count() < 2, reason="Multi-GPU test requires at least 2 Vulkan devices"
+)
 def test_tflops_load_balancer_weights():
     t0 = torch.vulkan.get_device_tflops(0)
     t1 = torch.vulkan.get_device_tflops(1)

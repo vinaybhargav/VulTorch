@@ -28,7 +28,7 @@ def test_gradcheck_elementwise(dev):
         "add": lambda t: (t + 1.5).sum(),
         "mul_scalar": lambda t: (t * 3.0).sum(),
         "mul": lambda t: (t * t).sum(),
-        "pow": lambda t: (t ** 3.0).sum(),
+        "pow": lambda t: (t**3.0).sum(),
         "neg": lambda t: (-t).sum(),
         "exp": lambda t: t.exp().sum(),
         "tanh": lambda t: t.tanh().sum(),
@@ -102,7 +102,7 @@ def test_gradcheck_indexing_and_max(dev):
     x = _rand((2, 3), 5)
     for name, fn in {
         "getitem": lambda t: (t[0:1] ** 2).sum(),
-        "max_all": lambda t: (t.max() ** 2),
+        "max_all": lambda t: t.max() ** 2,
         "max_dim": lambda t: (t.max(dim=1) ** 2).sum(),
     }.items():
         assert gradcheck(fn, x, device=dev), name

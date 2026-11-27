@@ -6,6 +6,7 @@
 Shapes are N (cube) or MxKxN. The GPU is warmed for 1 s first so power
 management, not the kernel, does not decide the result.
 """
+
 import argparse
 import os
 import sys
@@ -53,4 +54,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

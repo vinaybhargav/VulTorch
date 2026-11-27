@@ -15,6 +15,7 @@ import vultorch as torch
 import vultorch.nn as nn
 import vultorch.optim as optim
 
+
 def main():
     dev_count = torch.vulkan.device_count()
     print("=" * 70)
@@ -42,7 +43,7 @@ def main():
         nn.ReLU(),
         nn.Linear(hidden_dim, hidden_dim, device="vk:0"),
         nn.ReLU(),
-        nn.Linear(hidden_dim, out_features, device="vk:0")
+        nn.Linear(hidden_dim, out_features, device="vk:0"),
     ).to("vk:0")
 
     parallel_model = nn.DataParallel(base_model, device_ids=devices)
@@ -80,6 +81,7 @@ def main():
     print(f"✅ Heterogeneous Multi-GPU training completed in {elapsed:.2f}s")
     print(f"🚀 Throughput: {samples_per_sec:.1f} samples/sec across AMD 7900 XTX + NVIDIA 3080!")
     print("=" * 70)
+
 
 if __name__ == "__main__":
     main()

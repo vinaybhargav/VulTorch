@@ -13,8 +13,9 @@ from examples.neural_text_compressor import (
     NeuralCompressor1M,
     train_codec_model,
     compress_file,
-    decompress_file
+    decompress_file,
 )
+
 
 def verify_lossless_roundtrip(data: bytes, device: str = "vk:0", devices=None):
     print("=" * 70)
@@ -32,7 +33,9 @@ def verify_lossless_roundtrip(data: bytes, device: str = "vk:0", devices=None):
     # 1. Train model on GPU(s) (Heterogeneous Multi-GPU DataParallel)
     dev_str = f"Multi-GPU ({', '.join(devices)})" if len(devices) > 1 else f"Single GPU ({device})"
     print(f"\n1️⃣  Training 1M Parameter Model on {dev_str}...")
-    model = train_codec_model(data, epochs=10, batch_size=256, lr=0.005, device=device, devices=devices)
+    model = train_codec_model(
+        data, epochs=10, batch_size=256, lr=0.005, device=device, devices=devices
+    )
 
     # 2. Compress
     print(f"\n2️⃣  Compressing on GPU ({device})...")
@@ -44,7 +47,7 @@ def verify_lossless_roundtrip(data: bytes, device: str = "vk:0", devices=None):
     ratio = (comp_len / orig_len) * 100
     bpc = (comp_len * 8) / orig_len
     print(f"   Compressed Size:      {comp_len:,} bytes ({ratio:.2f}%, {bpc:.2f} bits/byte)")
-    print(f"   Compression Time:     {comp_time*1000:.1f} ms")
+    print(f"   Compression Time:     {comp_time * 1000:.1f} ms")
 
     # 3. Decompress (using exact same device for bit-exact entropy probability matching)
     print(f"\n3️⃣  Decompressing back to original bytes on GPU ({device})...")
@@ -69,7 +72,9 @@ def verify_lossless_roundtrip(data: bytes, device: str = "vk:0", devices=None):
     print(f"  [PASS] Byte Length Exact Match: {orig_len:,} == {restored_len:,}")
 
     # Check 2: Cryptographic Hash
-    assert orig_sha256 == restored_sha256, f"❌ Hash mismatch!\nOrig: {orig_sha256}\nRest: {restored_sha256}"
+    assert orig_sha256 == restored_sha256, (
+        f"❌ Hash mismatch!\nOrig: {orig_sha256}\nRest: {restored_sha256}"
+    )
     print(f"  [PASS] SHA-256 Exact Match:    {orig_sha256}")
 
     # Check 3: Every individual byte index
@@ -91,12 +96,16 @@ def verify_lossless_roundtrip(data: bytes, device: str = "vk:0", devices=None):
     print("🎉 100% BIT-EXACT LOSSLESS VERIFICATION CONFIRMED!")
     print("=" * 70)
 
+
 if __name__ == "__main__":
     # Test on real text
-    sample_text = """VulTorch: A High-Performance Pure Vulkan Deep Learning Library.
+    sample_text = (
+        """VulTorch: A High-Performance Pure Vulkan Deep Learning Library.
 Eliminating NVIDIA CUDA lock-in by running full tensor compute, reverse-mode autodiff,
 and deep neural networks across AMD Radeon, Intel, and NVIDIA GPUs using standard Vulkan.
 Compressing and decompressing text losslessly with deep neural language models!
 The quick brown fox jumps over the lazy dog. 0123456789!
-""" * 3
+"""
+        * 3
+    )
     verify_lossless_roundtrip(sample_text.encode("utf-8"))

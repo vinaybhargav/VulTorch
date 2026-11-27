@@ -18,7 +18,9 @@ class Dataset:
 class TensorDataset(Dataset):
     """Dataset wrapping one or more Tensors or NumPy arrays along dimension 0."""
 
-    def __init__(self, *tensors: Union[Tensor, np.ndarray], device: Optional[Union[str, Device]] = None):
+    def __init__(
+        self, *tensors: Union[Tensor, np.ndarray], device: Optional[Union[str, Device]] = None
+    ):
         if not tensors:
             raise ValueError("TensorDataset requires at least one tensor or array")
         converted = []
@@ -108,7 +110,10 @@ class DataLoader:
                     if self.drop_last and (end - start) < self.batch_size:
                         break
                     idx_t = perm[start:end]
-                    batched = [t.index_select(0, idx_t if idx_t.device == t.device else idx_t.to(t.device)) for t in self.dataset.tensors]
+                    batched = [
+                        t.index_select(0, idx_t if idx_t.device == t.device else idx_t.to(t.device))
+                        for t in self.dataset.tensors
+                    ]
                     yield self._move(tuple(batched))
                 return
             for start in range(0, n, self.batch_size):

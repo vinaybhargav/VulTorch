@@ -20,6 +20,7 @@ def _rand(shape, seed=0):
 
 # ---------------------------------------------------------------- broadcasting
 
+
 def test_cpu_broadcast_matches_numpy():
     cases = [
         ((2, 3), (3,)),
@@ -43,9 +44,7 @@ def test_incompatible_broadcast_raises():
         _ = a + b
 
 
-@pytest.mark.parametrize(
-    "name", ["exp", "log", "sqrt", "tanh", "sigmoid", "relu", "gelu", "silu"]
-)
+@pytest.mark.parametrize("name", ["exp", "log", "sqrt", "tanh", "sigmoid", "relu", "gelu", "silu"])
 def test_unary_ops_cpu_matches_gpu(name):
     """The CPU fallback must implement the same op table as the shader.
 
@@ -60,7 +59,7 @@ def test_unary_ops_cpu_matches_gpu(name):
 
     # Independent references for the two ops that used to be no-ops.
     if name == "gelu":
-        ref = 0.5 * x_np * (1.0 + np.tanh(0.7978845608 * (x_np + 0.044715 * x_np ** 3)))
+        ref = 0.5 * x_np * (1.0 + np.tanh(0.7978845608 * (x_np + 0.044715 * x_np**3)))
         np.testing.assert_allclose(cpu, ref, rtol=1e-4, atol=1e-5)
     elif name == "silu":
         ref = x_np / (1.0 + np.exp(-x_np))
@@ -70,6 +69,7 @@ def test_unary_ops_cpu_matches_gpu(name):
 
 
 # --------------------------------------------------------------------- softmax
+
 
 @pytest.mark.parametrize("dim", [0, 1, -1])
 def test_softmax_axis(dim):
@@ -104,6 +104,7 @@ def test_softmax_invalid_dim_raises():
 
 # -------------------------------------------------------------------- indexing
 
+
 def test_getitem_propagates_gradient():
     x = torch.tensor(np.ones((2, 3), np.float32), device="cpu", requires_grad=True)
     x[0:1].sum().backward()
@@ -124,6 +125,7 @@ def test_getitem_scalar_index_gradient():
 
 # ------------------------------------------------------------------------ max
 
+
 def test_max_routes_gradient_to_first_argmax():
     x = torch.tensor(np.array([1.0, 5.0, 5.0], np.float32), device="cpu", requires_grad=True)
     x.max().backward()
@@ -139,6 +141,7 @@ def test_max_over_dim_gradient():
 
 
 # --------------------------------------------------------------------- matmul
+
 
 def test_matmul_broadcasts_unbatched_weight():
     a, b = _rand((2, 3, 4), 7), _rand((4, 5), 8)
@@ -198,6 +201,7 @@ def test_matmul_batch_mismatch_raises():
 
 # ------------------------------------------------------------------- conv2d
 
+
 def test_conv2d_cpu_gradients_match_gpu():
     x_np, w_np = _rand((2, 2, 5, 5), 11), _rand((3, 2, 3, 3), 12)
 
@@ -219,6 +223,7 @@ def test_conv2d_cpu_gradients_match_gpu():
 
 
 # ----------------------------------------------------------------- layernorm
+
 
 def _layernorm_reference(x_np, gamma, beta, eps=1e-5):
     mu = x_np.mean(-1, keepdims=True)
@@ -256,6 +261,7 @@ def test_layernorm_weight_grad_matches_reference():
 
 
 # -------------------------------------------------------------------- device
+
 
 def test_device_is_hashable():
     d = torch.device("vk:0")

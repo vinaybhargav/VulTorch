@@ -9,6 +9,7 @@ from ..tensor import Tensor
 from ..autograd import no_grad
 from . import lr_scheduler
 
+
 class Optimizer:
     def __init__(self, params: Iterable[Tensor], defaults: Dict[str, Any]):
         self.defaults = defaults
@@ -37,8 +38,7 @@ class Optimizer:
         for p, s in self.state.items():
             if p in param_mappings:
                 state_out[param_mappings[p]] = {
-                    k: v.clone() if isinstance(v, Tensor) else v
-                    for k, v in s.items()
+                    k: v.clone() if isinstance(v, Tensor) else v for k, v in s.items()
                 }
 
         groups_out = []
@@ -61,10 +61,7 @@ class Optimizer:
             k_tuple = tuple(key) if isinstance(key, (list, tuple)) else key
             if k_tuple in param_lookup:
                 p = param_lookup[k_tuple]
-                self.state[p] = {
-                    k: v.clone() if isinstance(v, Tensor) else v
-                    for k, v in s.items()
-                }
+                self.state[p] = {k: v.clone() if isinstance(v, Tensor) else v for k, v in s.items()}
 
     def step(self):
         # Parameter updates are not differentiable and must not extend the graph.
@@ -74,14 +71,24 @@ class Optimizer:
     def _step_impl(self):
         raise NotImplementedError
 
+
 class SGD(Optimizer):
-    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
-                 momentum: float = 0.0, dampening: float = 0.0,
-                 weight_decay: float = 0.0, nesterov: bool = False,
-                 fused: bool = True):
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        momentum: float = 0.0,
+        dampening: float = 0.0,
+        weight_decay: float = 0.0,
+        nesterov: bool = False,
+        fused: bool = True,
+    ):
         defaults = dict(
-            lr=lr, momentum=momentum, dampening=dampening,
-            weight_decay=weight_decay, nesterov=nesterov
+            lr=lr,
+            momentum=momentum,
+            dampening=dampening,
+            weight_decay=weight_decay,
+            nesterov=nesterov,
         )
         super().__init__(params, defaults)
         self.fused = fused
@@ -104,14 +111,21 @@ class SGD(Optimizer):
                     mom_native = None
                     if momentum != 0.0:
                         if "momentum_buffer" not in param_state:
-                            param_state["momentum_buffer"] = vultorch.empty(p.shape, device=p.device)
+                            param_state["momentum_buffer"] = vultorch.empty(
+                                p.shape, device=p.device
+                            )
                             first_step = True
                         mom_native = param_state["momentum_buffer"]._native
 
                     p._native.sgd_step_(
-                        p.grad._native, mom_native,
-                        float(lr), float(momentum), float(dampening),
-                        float(weight_decay), bool(nesterov), first_step
+                        p.grad._native,
+                        mom_native,
+                        float(lr),
+                        float(momentum),
+                        float(dampening),
+                        float(weight_decay),
+                        bool(nesterov),
+                        first_step,
                     )
                     continue
 
@@ -140,8 +154,12 @@ class SGD(Optimizer):
 def _fused_adam_update(p, state, group, decoupled):
     """One-kernel Adam/AdamW update. Returns False if the fused path can't be used."""
     grad = p.grad
-    if grad is None or grad._native is None or not p._native.is_contiguous() \
-            or not grad._native.is_contiguous():
+    if (
+        grad is None
+        or grad._native is None
+        or not p._native.is_contiguous()
+        or not grad._native.is_contiguous()
+    ):
         return False
     if len(state) == 0:
         state["step"] = 0
@@ -150,16 +168,30 @@ def _fused_adam_update(p, state, group, decoupled):
     state["step"] += 1
     beta1, beta2 = group["betas"]
     p._native.adam_step_(
-        grad._native, state["exp_avg"]._native, state["exp_avg_sq"]._native,
-        group["lr"], beta1, beta2, group["eps"], group["weight_decay"],
-        decoupled, state["step"])
+        grad._native,
+        state["exp_avg"]._native,
+        state["exp_avg_sq"]._native,
+        group["lr"],
+        beta1,
+        beta2,
+        group["eps"],
+        group["weight_decay"],
+        decoupled,
+        state["step"],
+    )
     return True
 
 
 class Adam(Optimizer):
-    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
-                 betas: tuple = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 0.0,
-                 fused: bool = True):
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        betas: tuple = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 0.0,
+        fused: bool = True,
+    ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.fused = fused
@@ -200,8 +232,8 @@ class Adam(Optimizer):
                 state["exp_avg"] = exp_avg
                 state["exp_avg_sq"] = exp_avg_sq
 
-                bias_correction1 = 1.0 - beta1 ** step
-                bias_correction2 = 1.0 - beta2 ** step
+                bias_correction1 = 1.0 - beta1**step
+                bias_correction2 = 1.0 - beta2**step
 
                 step_size = lr / bias_correction1
                 denom = (exp_avg_sq / bias_correction2).sqrt() + eps
@@ -209,10 +241,17 @@ class Adam(Optimizer):
                 update = exp_avg / denom * step_size
                 p.copy_(p - update)
 
+
 class AdamW(Optimizer):
-    def __init__(self, params: Iterable[Tensor], lr: float = 1e-3,
-                 betas: tuple = (0.9, 0.999), eps: float = 1e-8, weight_decay: float = 1e-2,
-                 fused: bool = True):
+    def __init__(
+        self,
+        params: Iterable[Tensor],
+        lr: float = 1e-3,
+        betas: tuple = (0.9, 0.999),
+        eps: float = 1e-8,
+        weight_decay: float = 1e-2,
+        fused: bool = True,
+    ):
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
         super().__init__(params, defaults)
         self.fused = fused
@@ -252,8 +291,8 @@ class AdamW(Optimizer):
                 state["exp_avg"] = exp_avg
                 state["exp_avg_sq"] = exp_avg_sq
 
-                bias_correction1 = 1.0 - beta1 ** step
-                bias_correction2 = 1.0 - beta2 ** step
+                bias_correction1 = 1.0 - beta1**step
+                bias_correction2 = 1.0 - beta2**step
 
                 step_size = lr / bias_correction1
                 denom = (exp_avg_sq / bias_correction2).sqrt() + eps

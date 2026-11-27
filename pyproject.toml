@@ -43,3 +43,15 @@ testpaths = ["tests"]
 # Any warning is a test failure. Keep the suite honest about deprecations and
 # numeric warnings instead of letting them rot in the output.
 filterwarnings = ["error"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.format]
+indent-style = "space"
+quote-style = "double"
+line-ending = "lf"
+# Format multiline function definitions and calls with closing brackets on dedicated lines (Allman equivalent)
+skip-magic-trailing-comma = false
+

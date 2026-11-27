@@ -48,13 +48,23 @@ def test_var_std_norm_and_gradcheck(dev):
     x_np = _rand_np((3, 5), seed=11)
     x = torch.tensor(x_np, device=dev, requires_grad=True)
 
-    np.testing.assert_allclose(x.var(dim=1, unbiased=True).numpy(), np.var(x_np, axis=1, ddof=1), rtol=1e-4, atol=1e-4)
-    np.testing.assert_allclose(x.std(dim=1, unbiased=False).numpy(), np.std(x_np, axis=1, ddof=0), rtol=1e-4, atol=1e-4)
-    np.testing.assert_allclose(x.norm(p=2.0, dim=1).numpy(), np.linalg.norm(x_np, ord=2, axis=1), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(
+        x.var(dim=1, unbiased=True).numpy(), np.var(x_np, axis=1, ddof=1), rtol=1e-4, atol=1e-4
+    )
+    np.testing.assert_allclose(
+        x.std(dim=1, unbiased=False).numpy(), np.std(x_np, axis=1, ddof=0), rtol=1e-4, atol=1e-4
+    )
+    np.testing.assert_allclose(
+        x.norm(p=2.0, dim=1).numpy(), np.linalg.norm(x_np, ord=2, axis=1), rtol=1e-4, atol=1e-4
+    )
 
     assert torch.gradcheck(
         lambda t: (t.var(dim=1, unbiased=True) + t.std(dim=1, unbiased=False)).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        x,
+        eps=2e-3,
+        rtol=2e-2,
+        atol=5e-3,
+        device=dev,
     )
 
 
@@ -63,16 +73,18 @@ def test_cumsum_cumprod_and_gradcheck(dev):
     x_np = _rand_np((3, 6), seed=22, low=0.4, high=1.5)
     x = torch.tensor(x_np, device=dev, requires_grad=True)
 
-    np.testing.assert_allclose(x.cumsum(dim=1).numpy(), np.cumsum(x_np, axis=1), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(x.cumprod(dim=1).numpy(), np.cumprod(x_np, axis=1), rtol=1e-4, atol=1e-4)
+    np.testing.assert_allclose(
+        x.cumsum(dim=1).numpy(), np.cumsum(x_np, axis=1), rtol=1e-5, atol=1e-5
+    )
+    np.testing.assert_allclose(
+        x.cumprod(dim=1).numpy(), np.cumprod(x_np, axis=1), rtol=1e-4, atol=1e-4
+    )
 
     assert torch.gradcheck(
-        lambda t: (t.cumsum(dim=1) ** 2).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: (t.cumsum(dim=1) ** 2).sum(), x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
     )
     assert torch.gradcheck(
-        lambda t: t.cumprod(dim=1).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: t.cumprod(dim=1).sum(), x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
 
@@ -93,5 +105,9 @@ def test_sort_and_topk_and_gradcheck(dev):
 
     assert torch.gradcheck(
         lambda t: (t.topk(3, dim=1, largest=True).values ** 2).sum(),
-        x, eps=2e-3, rtol=2e-2, atol=5e-3, device=dev
+        x,
+        eps=2e-3,
+        rtol=2e-2,
+        atol=5e-3,
+        device=dev,
     )

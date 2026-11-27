@@ -33,6 +33,7 @@ def _rand_np(shape, seed=0, low=-1.5, high=1.5, dtype=np.float32):
 # 1. Zero-Copy Strided Views
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("dev", DEVICES)
 def test_zero_copy_views_latency_dispatches_and_storage(dev):
     torch.vulkan.synchronize_all()
@@ -70,11 +71,21 @@ def test_zero_copy_views_latency_dispatches_and_storage(dev):
         v7 = x.reshape(64, 512)
     elapsed_us_per_view = ((time.perf_counter() - t0) * 1e6) / (iters * 7)
 
-    views = {"transpose": v1, "permute": v2, "expand": v3, "narrow": v4, "slice": v5, "as_strided": v6, "reshape": v7}
+    views = {
+        "transpose": v1,
+        "permute": v2,
+        "expand": v3,
+        "narrow": v4,
+        "slice": v5,
+        "as_strided": v6,
+        "reshape": v7,
+    }
 
     if did >= 0:
         d_after = torch.vulkan.recorded_dispatches(did)
-        assert d_after == d_before, f"View ops triggered {d_after - d_before} unexpected GPU dispatches"
+        assert d_after == d_before, (
+            f"View ops triggered {d_after - d_before} unexpected GPU dispatches"
+        )
 
     assert elapsed_us_per_view < 10.0, f"View creation too slow: {elapsed_us_per_view:.2f} us/view"
 
@@ -108,7 +119,9 @@ def test_zero_copy_views_latency_dispatches_and_storage(dev):
     # Exact values through to_numpy()
     np.testing.assert_allclose(v1.numpy(), x_np.transpose(0, 2, 1), rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(v2.numpy(), x_np.transpose(2, 0, 1), rtol=1e-5, atol=1e-5)
-    np.testing.assert_allclose(v3.numpy(), np.broadcast_to(y.numpy(), (64, 64)), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        v3.numpy(), np.broadcast_to(y.numpy(), (64, 64)), rtol=1e-5, atol=1e-5
+    )
     np.testing.assert_allclose(v4.numpy(), x_np[:, 4:20, :], rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(v5.numpy(), x_np[8:24], rtol=1e-5, atol=1e-5)
     np.testing.assert_allclose(v6.numpy(), x_np[3], rtol=1e-5, atol=1e-5)
@@ -133,7 +146,7 @@ def test_chained_non_contiguous_forward_backward_and_gradcheck(dev):
     # NumPy exact reference
     expected_s = x_np.T + np.broadcast_to(y_np, (64, 64))
     expected_out = expected_s @ z_np.T
-    expected_loss = float(np.sum(expected_out ** 2))
+    expected_loss = float(np.sum(expected_out**2))
     grad_out = 2.0 * expected_out
     expected_ds = grad_out @ z_np
     expected_dz = (expected_s.T @ grad_out).T
@@ -152,7 +165,9 @@ def test_chained_non_contiguous_forward_backward_and_gradcheck(dev):
     sz = torch.tensor(_rand_np((6, 5), seed=23), device=dev, requires_grad=True)
     assert torch.gradcheck(
         lambda a, b, c: (((a.t() + b.expand(4, 5)) @ c.t())[:, 1:5:2]).sum(),
-        sx, sy, sz,
+        sx,
+        sy,
+        sz,
         eps=2e-3,
         rtol=2e-2,
         atol=5e-3,
@@ -168,7 +183,9 @@ def test_strided_offset_slicing_and_narrow_backward(dev):
     # Double slice + narrow + permute (creates non-zero storage_offset + non-contiguous strides)
     sub = x[1:5, 2:6:2, :].narrow(2, 1, 2).permute(2, 0, 1)
     assert sub.storage_id() == x.storage_id()
-    np.testing.assert_allclose(sub.numpy(), x_np[1:5, 2:6:2, 1:3].transpose(2, 0, 1), rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        sub.numpy(), x_np[1:5, 2:6:2, 1:3].transpose(2, 0, 1), rtol=1e-5, atol=1e-5
+    )
 
     w = torch.tensor(_rand_np((2, 4, 2), seed=56), device=dev)
     loss = (sub * w).sum()
@@ -236,9 +253,13 @@ def test_multi_dtype_casts_arithmetic_reductions_and_indices(dev):
 
     np.testing.assert_array_equal(base.int().numpy(), np.array([[-3, 2], [0, 4]], dtype=np.int32))
     np.testing.assert_array_equal(base.long().numpy(), np.array([[-3, 2], [0, 4]], dtype=np.int64))
-    np.testing.assert_array_equal(base.bool().numpy(), np.array([[True, True], [False, True]], dtype=np.bool_))
-    np.testing.assert_array_equal(torch.tensor([0, 5, 255], device=dev, dtype=torch.uint8).numpy(),
-                                  np.array([0, 5, 255], dtype=np.uint8))
+    np.testing.assert_array_equal(
+        base.bool().numpy(), np.array([[True, True], [False, True]], dtype=np.bool_)
+    )
+    np.testing.assert_array_equal(
+        torch.tensor([0, 5, 255], device=dev, dtype=torch.uint8).numpy(),
+        np.array([0, 5, 255], dtype=np.uint8),
+    )
 
     # Comparisons return vultorch.bool
     cmp_gt = base > 1.0
@@ -265,7 +286,9 @@ def test_multi_dtype_casts_arithmetic_reductions_and_indices(dev):
     idx_i64 = torch.tensor([[0, 3, 7], [2, 1, 5]], device=dev, dtype=torch.int64)
     emb_out = emb(idx_i64)
     assert emb_out.shape == (2, 3, 4)
-    np.testing.assert_allclose(emb_out.numpy(), emb.weight.numpy()[idx_i64.numpy()], rtol=1e-5, atol=1e-5)
+    np.testing.assert_allclose(
+        emb_out.numpy(), emb.weight.numpy()[idx_i64.numpy()], rtol=1e-5, atol=1e-5
+    )
 
     logits = torch.tensor(_rand_np((4, 5), seed=99), device=dev, requires_grad=True)
     targets_i64 = torch.tensor(np.array([0, 2, 4, 1], dtype=np.int64), device=dev)
@@ -277,7 +300,9 @@ def test_multi_dtype_casts_arithmetic_reductions_and_indices(dev):
     h = torch.tensor(_rand_np((4, 4), seed=71), device=dev, requires_grad=True)
     loss_h = (h.half() * 2.0).sum().float()
     loss_h.backward()
-    np.testing.assert_allclose(h.grad.numpy(), np.full((4, 4), 2.0, dtype=np.float32), rtol=1e-2, atol=1e-2)
+    np.testing.assert_allclose(
+        h.grad.numpy(), np.full((4, 4), 2.0, dtype=np.float32), rtol=1e-2, atol=1e-2
+    )
 
 
 @pytest.mark.parametrize("dev", DEVICES)
@@ -305,6 +330,7 @@ def test_native_fp16_gemm_and_memory_savings(dev):
 # 3. Arena Sub-Allocator & Persistent Mapped Staging Ring
 # ---------------------------------------------------------------------------
 
+
 @pytest.mark.parametrize("dev", GPU_DEVICES)
 def test_arena_suballocator_low_vk_allocs_and_zero_leak_training(dev):
     did = _dev_id(dev)
@@ -328,7 +354,9 @@ def test_arena_suballocator_low_vk_allocs_and_zero_leak_training(dev):
     torch.vulkan.synchronize(did)
     after_allocs = torch.vulkan.driver_allocation_count(did)
     delta_allocs = after_allocs - slab_baseline
-    assert delta_allocs <= 8, f"Arena triggered {delta_allocs} new VkDeviceMemory blocks (expected <= 8)"
+    assert delta_allocs <= 8, (
+        f"Arena triggered {delta_allocs} new VkDeviceMemory blocks (expected <= 8)"
+    )
     assert torch.vulkan.active_arena_bytes(did) <= active_baseline + 4096
     del _warm
 

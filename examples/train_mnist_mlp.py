@@ -10,6 +10,7 @@ import vultorch.nn as nn
 import vultorch.optim as optim
 from vultorch.utils.data import TensorDataset, DataLoader
 
+
 def generate_synthetic_mnist(num_samples=1000):
     """Generates synthetic 28x28 digit classification data."""
     np.random.seed(42)
@@ -18,9 +19,10 @@ def generate_synthetic_mnist(num_samples=1000):
     # Create simple class signals
     y = np.random.randint(0, 10, size=num_samples)
     for c in range(10):
-        mask = (y == c)
-        X[mask, c * 70:(c + 1) * 70] += 2.5
+        mask = y == c
+        X[mask, c * 70 : (c + 1) * 70] += 2.5
     return X, y
+
 
 class DigitClassifier(nn.Module):
     def __init__(self, device="vk:0"):
@@ -30,11 +32,12 @@ class DigitClassifier(nn.Module):
             nn.ReLU(),
             nn.Linear(128, 64, device=device),
             nn.ReLU(),
-            nn.Linear(64, 10, device=device)
+            nn.Linear(64, 10, device=device),
         )
 
     def forward(self, x):
         return self.net(x)
+
 
 def main():
     device = "vk:0"
@@ -48,7 +51,9 @@ def main():
     X_train, y_train = generate_synthetic_mnist(800)
     X_val, y_val = generate_synthetic_mnist(200)
 
-    train_ds = TensorDataset(torch.tensor(X_train, device=device), torch.tensor(y_train, device=device))
+    train_ds = TensorDataset(
+        torch.tensor(X_train, device=device), torch.tensor(y_train, device=device)
+    )
     train_loader = DataLoader(train_ds, batch_size=64, shuffle=True)
 
     model = DigitClassifier(device=device)
@@ -86,6 +91,7 @@ def main():
     print("-" * 65)
     print(f"✨ Training complete in {elapsed:.2f}s on {device_name} via Vulkan!")
     print("=" * 65)
+
 
 if __name__ == "__main__":
     main()

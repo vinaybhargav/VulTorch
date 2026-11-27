@@ -44,7 +44,9 @@ def _naive_attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, is_causa
     scores = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(d))
     if is_causal:
         s_q, s_k = q.shape[2], k.shape[2]
-        mask = torch.ones((s_q, s_k), device=q.device, dtype=torch.bool).triu(diagonal=1 + (s_k - s_q))
+        mask = torch.ones((s_q, s_k), device=q.device, dtype=torch.bool).triu(
+            diagonal=1 + (s_k - s_q)
+        )
         scores = scores.masked_fill(mask, -1e9)
     probs = scores.softmax(dim=-1)
     return probs @ v
@@ -111,7 +113,9 @@ def test_flash_attention_s2048_memory_and_speed_gate(dev):
     # whereas naive attention materializes [2, 8, 2048, 2048] scores + mask + probs = 768 MiB!
     activation_mib = (mem_after - mem_before) / (1024.0 * 1024.0)
     assert out_fa.shape == (B, H, S, D)
-    assert activation_mib < 35.0, f"Expected < 35 MiB activation memory, got {activation_mib:.2f} MiB"
+    assert activation_mib < 35.0, (
+        f"Expected < 35 MiB activation memory, got {activation_mib:.2f} MiB"
+    )
 
     # Verify causal early-termination speedup: causal FlashAttention skips the upper-triangular tiles (~2x faster than non-causal)
     q_b = q[:, :4, :1024, :]
@@ -148,13 +152,13 @@ def test_rope_swiglu_geglu_and_gemm_epilogues(dev):
     assert y_rope.shape == (B, H, S, D)
     # RoPE is an orthogonal rotation: norm must be preserved!
     np.testing.assert_allclose(
-        (y_rope ** 2).sum(dim=-1).numpy(),
-        (x ** 2).sum(dim=-1).numpy(),
-        rtol=1e-4, atol=1e-4,
+        (y_rope**2).sum(dim=-1).numpy(),
+        (x**2).sum(dim=-1).numpy(),
+        rtol=1e-4,
+        atol=1e-4,
     )
     assert torch.gradcheck(
-        lambda t: (rope(t) * w).sum(),
-        x, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
+        lambda t: (rope(t) * w).sum(), x, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
     )
 
     # 2. SwiGLU & GeGLU forward + gradcheck
@@ -168,12 +172,16 @@ def test_rope_swiglu_geglu_and_gemm_epilogues(dev):
     y_swi = F.swiglu(a, b)
     ref_swi = a.silu() * b
     np.testing.assert_allclose(y_swi.numpy(), ref_swi.numpy(), rtol=1e-4, atol=1e-4)
-    assert torch.gradcheck(lambda t: (F.swiglu(t, b) * gw).sum(), a, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev)
+    assert torch.gradcheck(
+        lambda t: (F.swiglu(t, b) * gw).sum(), a, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
+    )
 
     y_ge = F.geglu(a, b)
     ref_ge = a.gelu() * b
     np.testing.assert_allclose(y_ge.numpy(), ref_ge.numpy(), rtol=1e-4, atol=1e-4)
-    assert torch.gradcheck(lambda t: (F.geglu(t, b) * gw).sum(), a, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev)
+    assert torch.gradcheck(
+        lambda t: (F.geglu(t, b) * gw).sum(), a, eps=1e-3, rtol=2e-2, atol=5e-3, device=dev
+    )
 
     # 3. GEMM Epilogues (ReLU, GELU, SiLU) in single dispatch
     lx = torch.tensor(_rand_np((16, 32), seed=26), device=dev)
@@ -211,10 +219,12 @@ class MicroLLaMA(nn.Module):
     def __init__(self, vocab_size=64, d_model=32, n_layers=4, device="vk"):
         super().__init__()
         self.emb = nn.Embedding(vocab_size, d_model, device=device)
-        self.layers = nn.ModuleList([
-            MicroTransformerBlock(d_model=d_model, n_heads=4, n_kv_heads=2, device=device)
-            for _ in range(n_layers)
-        ])
+        self.layers = nn.ModuleList(
+            [
+                MicroTransformerBlock(d_model=d_model, n_heads=4, n_kv_heads=2, device=device)
+                for _ in range(n_layers)
+            ]
+        )
         self.norm = nn.RMSNorm(d_model, device=device)
         self.head = nn.Linear(d_model, vocab_size, bias=False, device=device)
 
@@ -288,7 +298,9 @@ def test_quantized_linear_int4_int8_and_4096_gate(dev):
     q4_4k = nn.QuantizedLinear.from_float(lin_4k, bits=4, group_size=64).to(dev)
     q4_bytes = q4_4k.weight_nbytes
 
-    assert fp16_bytes / q4_bytes >= 3.5, f"Expected >= 3.5x reduction over fp16, got {fp16_bytes / q4_bytes:.2f}x"
+    assert fp16_bytes / q4_bytes >= 3.5, (
+        f"Expected >= 3.5x reduction over fp16, got {fp16_bytes / q4_bytes:.2f}x"
+    )
     assert fp32_bytes / q4_bytes >= 7.0
 
     x_4k = torch.randn(2, 4096, device=dev)

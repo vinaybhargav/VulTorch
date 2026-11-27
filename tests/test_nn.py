@@ -4,12 +4,14 @@ import vultorch as torch
 import vultorch.nn as nn
 import vultorch.optim as optim
 
+
 def test_linear_layer():
     layer = nn.Linear(10, 5).to("vk:0")
     x = torch.randn(4, 10, device="vk:0")
     y = layer(x)
     assert y.shape == (4, 5)
     assert y.device == torch.device("vk:0")
+
 
 def test_conv2d_layer():
     conv = nn.Conv2d(in_channels=3, out_channels=16, kernel_size=3, padding=1).to("vk:0")
@@ -21,12 +23,9 @@ def test_conv2d_layer():
     assert conv.weight.grad is not None
     assert x.grad is not None
 
+
 def test_cross_entropy_and_adam():
-    model = nn.Sequential(
-        nn.Linear(20, 10),
-        nn.ReLU(),
-        nn.Linear(10, 3)
-    ).to("vk:0")
+    model = nn.Sequential(nn.Linear(20, 10), nn.ReLU(), nn.Linear(10, 3)).to("vk:0")
 
     optimizer = optim.Adam(model.parameters(), lr=0.01)
     criterion = nn.CrossEntropyLoss()

@@ -27,7 +27,11 @@ _DTYPE_TO_SAFETENSORS = {
 _SAFETENSORS_TO_DTYPE = {v: k for k, v in _DTYPE_TO_SAFETENSORS.items()}
 
 
-def save_safetensors(tensors: Dict[str, Tensor], filepath: Union[str, os.PathLike], metadata: Optional[Dict[str, str]] = None):
+def save_safetensors(
+    tensors: Dict[str, Tensor],
+    filepath: Union[str, os.PathLike],
+    metadata: Optional[Dict[str, str]] = None,
+):
     """
     Saves a dict of tensors to safetensors binary format.
     Zero external dependencies.
@@ -47,7 +51,7 @@ def save_safetensors(tensors: Dict[str, Tensor], filepath: Union[str, os.PathLik
         raw_data = np_arr.tobytes()
         t_dtype = tensor.dtype
         st_dtype = _DTYPE_TO_SAFETENSORS.get(t_dtype, "F32")
-        
+
         start_offset = total_bytes
         end_offset = total_bytes + len(raw_data)
         total_bytes = end_offset
@@ -70,7 +74,9 @@ def save_safetensors(tensors: Dict[str, Tensor], filepath: Union[str, os.PathLik
             f.write(raw_b)
 
 
-def load_safetensors(filepath: Union[str, os.PathLike], device: Optional[Union[str, vultorch.device]] = None) -> Dict[str, Tensor]:
+def load_safetensors(
+    filepath: Union[str, os.PathLike], device: Optional[Union[str, vultorch.device]] = None
+) -> Dict[str, Tensor]:
     """
     Loads tensors from a safetensors binary file.
     """
@@ -110,7 +116,7 @@ def load_safetensors(filepath: Union[str, os.PathLike], device: Optional[Union[s
             }
             np_dt = np_dtype_map.get(st_dtype, np.float32)
             np_arr = np.frombuffer(raw, dtype=np_dt).reshape(shape)
-            
+
             vt_dtype = _SAFETENSORS_TO_DTYPE.get(st_dtype, "float32")
             t = vultorch.tensor(np_arr, dtype=vt_dtype, device=target_device)
             result[k] = t

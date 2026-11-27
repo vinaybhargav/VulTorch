@@ -34,6 +34,7 @@ class _set_grad_enabled:
 
 class no_grad:
     """Context manager that disables gradient calculation in this thread."""
+
     def __enter__(self):
         self.prev = is_grad_enabled()
         _state.enabled = False
@@ -46,6 +47,7 @@ class no_grad:
 
 class enable_grad:
     """Context manager that enables gradient calculation in this thread."""
+
     def __enter__(self):
         self.prev = is_grad_enabled()
         _state.enabled = True
@@ -58,6 +60,7 @@ class enable_grad:
 
 class Context:
     """Context for saving forward tensors and metadata for the backward pass."""
+
     def __init__(self):
         self._saved_tensors: Tuple = ()
         self._saved_versions: Tuple[Optional[int], ...] = ()
@@ -66,8 +69,7 @@ class Context:
     def save_for_backward(self, *tensors):
         self._saved_tensors = tensors
         self._saved_versions = tuple(
-            t._native.version() if hasattr(t, "_native") else None
-            for t in tensors
+            t._native.version() if hasattr(t, "_native") else None for t in tensors
         )
 
     def mark_non_differentiable(self, *tensors):
@@ -87,12 +89,13 @@ class Context:
 
 class Node:
     """A node in the computation graph that computes backward gradients."""
+
     def __init__(
         self,
         name: str,
         backward_fn: Callable,
-        inputs: List['Tensor'],
-        outputs: Optional[List['Tensor']] = None,
+        inputs: List["Tensor"],
+        outputs: Optional[List["Tensor"]] = None,
     ):
         self.name = name
         self.backward_fn = backward_fn
@@ -151,6 +154,7 @@ class Function:
                     diff_outs.append(o)
 
         if any_req_grad and diff_outs:
+
             def _fn_backward(*grad_outputs):
                 # Ensure saved_tensors version check runs even if user didn't access
                 # ctx.saved_tensors in a constant-output backward, when tensors were saved.
@@ -178,9 +182,9 @@ class Function:
 
 
 def _run_backward(
-    root_tensors: Sequence['Tensor'],
-    grad_outputs: Optional[Sequence[Optional['Tensor']]],
-    target_inputs: Optional[Sequence['Tensor']] = None,
+    root_tensors: Sequence["Tensor"],
+    grad_outputs: Optional[Sequence[Optional["Tensor"]]],
+    target_inputs: Optional[Sequence["Tensor"]] = None,
     retain_graph: bool = False,
     create_graph: bool = False,
     allow_unused: bool = False,
@@ -209,10 +213,10 @@ def _run_backward(
             used_leaf_natives.add(id(g._native))
 
         # Iterative post-order topological sort over computation graph
-        topo_nodes: List[Tuple['Tensor', Node]] = []
-        visited_tensors: Set['Tensor'] = set()
+        topo_nodes: List[Tuple["Tensor", Node]] = []
+        visited_tensors: Set["Tensor"] = set()
         visited_nodes: Set[int] = set()
-        stack: List[Tuple['Tensor', bool]] = [(r, False) for r in reversed(root_tensors)]
+        stack: List[Tuple["Tensor", bool]] = [(r, False) for r in reversed(root_tensors)]
 
         while stack:
             node_t, expanded = stack.pop()
@@ -239,7 +243,9 @@ def _run_backward(
                 if not any(o in grads for o in node.outputs):
                     continue
                 g_outs = [
-                    grads[o] if o in grads else (vultorch.zeros_like(o) if o.requires_grad else None)
+                    grads[o]
+                    if o in grads
+                    else (vultorch.zeros_like(o) if o.requires_grad else None)
                     for o in node.outputs
                 ]
                 input_grads = node.backward_fn(*g_outs)
@@ -268,8 +274,7 @@ def _run_backward(
                     grads[inp] = g_in
 
                 if inp.is_leaf and (
-                    accumulate_leaves
-                    or (accumulate_untargeted_leaves and inp not in target_set)
+                    accumulate_leaves or (accumulate_untargeted_leaves and inp not in target_set)
                 ):
                     if inp.grad is None:
                         nid = id(g_in._native)
@@ -306,7 +311,12 @@ def _run_backward(
         return result
 
 
-def backward(root_tensor: 'Tensor', grad: Optional['Tensor'] = None, retain_graph: bool = False, create_graph: bool = False):
+def backward(
+    root_tensor: "Tensor",
+    grad: Optional["Tensor"] = None,
+    retain_graph: bool = False,
+    create_graph: bool = False,
+):
     """
     Computes the gradient of the root tensor with respect to graph leaves.
     """
@@ -322,13 +332,13 @@ def backward(root_tensor: 'Tensor', grad: Optional['Tensor'] = None, retain_grap
 
 
 def grad(
-    outputs: Union['Tensor', Sequence['Tensor']],
-    inputs: Union['Tensor', Sequence['Tensor']],
-    grad_outputs: Optional[Union['Tensor', Sequence[Optional['Tensor']]]] = None,
+    outputs: Union["Tensor", Sequence["Tensor"]],
+    inputs: Union["Tensor", Sequence["Tensor"]],
+    grad_outputs: Optional[Union["Tensor", Sequence[Optional["Tensor"]]]] = None,
     retain_graph: Optional[bool] = None,
     create_graph: bool = False,
     allow_unused: bool = False,
-) -> Tuple[Optional['Tensor'], ...]:
+) -> Tuple[Optional["Tensor"], ...]:
     """
     Computes and returns the sum of gradients of outputs with respect to the inputs.
     """
@@ -357,7 +367,7 @@ def grad(
     )
 
 
-def _reduce_broadcast_gradient(grad: 'Tensor', target_shape: Tuple[int, ...]) -> 'Tensor':
+def _reduce_broadcast_gradient(grad: "Tensor", target_shape: Tuple[int, ...]) -> "Tensor":
     """Sums gradient over dimensions that were broadcasted during forward pass."""
     grad_shape = grad.shape
     ndim_diff = len(grad_shape) - len(target_shape)

@@ -15,11 +15,14 @@ import vultorch.nn as nn
 import vultorch.optim as optim
 from vultorch.models.compressor_10m import NeuralCompressor10M
 
-def pretrain_universal_codec(corpus_path: str = "benchmarks/data/enwik8",
-                             output_weights: str = "models/universal_10m_q8.bin",
-                             num_steps: int = 150,
-                             batch_size: int = 256,
-                             learning_rate: float = 0.003):
+
+def pretrain_universal_codec(
+    corpus_path: str = "benchmarks/data/enwik8",
+    output_weights: str = "models/universal_10m_q8.bin",
+    num_steps: int = 150,
+    batch_size: int = 256,
+    learning_rate: float = 0.003,
+):
     print("=" * 80)
     print("🌍 VulTorch Universal Neural Codec: Multi-GPU Foundation Pre-Training")
     print("=" * 80)
@@ -44,10 +47,14 @@ def pretrain_universal_codec(corpus_path: str = "benchmarks/data/enwik8",
 
     # 2. Load Wikipedia Corpus (enwik8)
     if not os.path.exists(corpus_path):
-        raise FileNotFoundError(f"Corpus not found at {corpus_path}. Run examples/download_benchmark_data.py first.")
+        raise FileNotFoundError(
+            f"Corpus not found at {corpus_path}. Run examples/download_benchmark_data.py first."
+        )
 
     file_size = os.path.getsize(corpus_path)
-    print(f"\n📚 Training Corpus: {corpus_path} ({file_size:,} bytes, {file_size/(1024*1024):.1f} MB)")
+    print(
+        f"\n📚 Training Corpus: {corpus_path} ({file_size:,} bytes, {file_size / (1024 * 1024):.1f} MB)"
+    )
 
     # Read training stream (stream slices for active memory efficiency)
     with open(corpus_path, "rb") as f:
@@ -58,7 +65,7 @@ def pretrain_universal_codec(corpus_path: str = "benchmarks/data/enwik8",
     print(f"📄 Active Training Window: {len(train_data):,} bytes")
 
     # 3. Model Setup
-    K = 32 # 32-byte receptive field
+    K = 32  # 32-byte receptive field
     padded = bytes([0] * K) + train_data
     N = len(train_data)
 
@@ -86,7 +93,7 @@ def pretrain_universal_codec(corpus_path: str = "benchmarks/data/enwik8",
         batch_x = []
         batch_y = []
         for idx in start_indices:
-            batch_x.append(list(padded[idx:idx + K]))
+            batch_x.append(list(padded[idx : idx + K]))
             batch_y.append(padded[idx + K])
 
         bx = torch.tensor(np.array(batch_x, dtype=np.int64), device="vk:0")
@@ -108,17 +115,23 @@ def pretrain_universal_codec(corpus_path: str = "benchmarks/data/enwik8",
             bpc = loss_val / np.log(2)
             elapsed = time.time() - start_time
             throughput = (step * batch_size) / elapsed
-            print(f"   Step {step:3d}/{num_steps:3d} | Loss: {loss_val:.4f} nats | Cross-Entropy: {bpc:.2f} bits/byte | {throughput:.1f} samples/sec", flush=True)
+            print(
+                f"   Step {step:3d}/{num_steps:3d} | Loss: {loss_val:.4f} nats | Cross-Entropy: {bpc:.2f} bits/byte | {throughput:.1f} samples/sec",
+                flush=True,
+            )
 
     torch.vulkan.synchronize_all()
     total_time = time.time() - start_time
-    print(f"\n✅ Foundation Pre-Training Completed in {total_time:.2f}s ({num_steps * batch_size / total_time:.1f} tokens/sec)!")
+    print(
+        f"\n✅ Foundation Pre-Training Completed in {total_time:.2f}s ({num_steps * batch_size / total_time:.1f} tokens/sec)!"
+    )
 
     # 4. Quantize and Export to Standalone Binary
     os.makedirs(os.path.dirname(output_weights), exist_ok=True)
     print(f"\n💎 Quantizing and Exporting Foundation Weights to {output_weights}...")
     base_model.export_q8_binary(output_weights)
     print("🎉 Universal Foundation Codec Model is ready for standalone C++ deployment!")
+
 
 if __name__ == "__main__":
     pretrain_universal_codec()

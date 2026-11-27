@@ -38,10 +38,16 @@ def test_capabilities_are_consistent_with_device_count():
 
 
 GEMM_VARIANTS = [
-    "matmul", "matmul_tiled64", "matmul_tiled",
+    "matmul",
+    "matmul_tiled64",
+    "matmul_tiled",
     # Slang generic SGEMM (shaders/gemm.slang)
-    "gemm_t32_k16_r2", "gemm_t64_k16_r4", "gemm_t64_k8_r4",
-    "gemm_t64_k16_r8", "gemm_t128_k8_r8", "gemm_t128_k16_r8",
+    "gemm_t32_k16_r2",
+    "gemm_t64_k16_r4",
+    "gemm_t64_k8_r4",
+    "gemm_t64_k16_r8",
+    "gemm_t128_k8_r8",
+    "gemm_t128_k16_r8",
 ]
 
 
@@ -50,10 +56,10 @@ GEMM_VARIANTS = [
 @pytest.mark.parametrize(
     "shape",
     [
-        (64, 64, 64),        # exactly one 64 tile
-        (129, 200, 97),      # ragged in every dimension
-        (256, 512, 384),     # several tiles, K not a multiple of 16
-        (300, 7, 131),       # K smaller than one K step
+        (64, 64, 64),  # exactly one 64 tile
+        (129, 200, 97),  # ragged in every dimension
+        (256, 512, 384),  # several tiles, K not a multiple of 16
+        (300, 7, 131),  # K smaller than one K step
     ],
 )
 def test_gemm_variant_matches_numpy(device, shader, shape, monkeypatch):

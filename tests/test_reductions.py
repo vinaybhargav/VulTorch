@@ -33,9 +33,7 @@ def test_sum_along_dim_matches_numpy(dev, dim, keepdim):
 def test_sum_3d_along_dim_matches_numpy(dev, dim):
     x_np = _rand((2, 3, 4), 2)
     x = torch.tensor(x_np, device=dev)
-    np.testing.assert_allclose(
-        x.sum(dim=dim).numpy(), x_np.sum(axis=dim), rtol=1e-5, atol=1e-5
-    )
+    np.testing.assert_allclose(x.sum(dim=dim).numpy(), x_np.sum(axis=dim), rtol=1e-5, atol=1e-5)
 
 
 @pytest.mark.parametrize("dev", DEVICES)
@@ -43,9 +41,7 @@ def test_sum_3d_along_dim_matches_numpy(dev, dim):
 def test_mean_along_dim_matches_numpy(dev, dim):
     x_np = _rand((3, 7), 3)
     x = torch.tensor(x_np, device=dev)
-    np.testing.assert_allclose(
-        x.mean(dim=dim).numpy(), x_np.mean(axis=dim), rtol=1e-5, atol=1e-6
-    )
+    np.testing.assert_allclose(x.mean(dim=dim).numpy(), x_np.mean(axis=dim), rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("dev", DEVICES)
@@ -53,9 +49,7 @@ def test_mean_along_dim_matches_numpy(dev, dim):
 def test_max_along_dim_matches_numpy(dev, dim):
     x_np = _rand((5, 6), 4)
     x = torch.tensor(x_np, device=dev)
-    np.testing.assert_allclose(
-        x.max(dim=dim).numpy(), x_np.max(axis=dim), rtol=1e-6
-    )
+    np.testing.assert_allclose(x.max(dim=dim).numpy(), x_np.max(axis=dim), rtol=1e-6)
 
 
 @pytest.mark.parametrize("dev", DEVICES)
@@ -93,6 +87,4 @@ def test_bias_gradient_shape(dev):
     layer(x).sum().backward()
 
     assert layer.bias.grad is not None
-    np.testing.assert_allclose(
-        layer.bias.grad.numpy(), np.full(4, 16.0, np.float32), rtol=1e-5
-    )
+    np.testing.assert_allclose(layer.bias.grad.numpy(), np.full(4, 16.0, np.float32), rtol=1e-5)
