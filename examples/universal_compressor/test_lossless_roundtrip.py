@@ -9,12 +9,21 @@ import struct
 import numpy as np
 import vultorch as torch
 import vultorch.nn as nn
-from examples.neural_text_compressor import (
-    NeuralCompressor1M,
-    train_codec_model,
-    compress_file,
-    decompress_file,
-)
+
+try:
+    from .neural_text_compressor import (
+        NeuralCompressor1M,
+        compress_file,
+        decompress_file,
+        train_codec_model,
+    )
+except ImportError:
+    from neural_text_compressor import (
+        NeuralCompressor1M,
+        compress_file,
+        decompress_file,
+        train_codec_model,
+    )
 
 
 def verify_lossless_roundtrip(data: bytes, device: str = "vk:0", devices=None):

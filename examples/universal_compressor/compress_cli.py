@@ -9,12 +9,21 @@ import os
 import argparse
 import time
 import subprocess
-from examples.neural_text_compressor import (
-    NeuralCompressor1M,
-    train_codec_model,
-    compress_file,
-    decompress_file,
-)
+
+try:
+    from .neural_text_compressor import (
+        NeuralCompressor1M,
+        compress_file,
+        decompress_file,
+        train_codec_model,
+    )
+except ImportError:
+    from neural_text_compressor import (
+        NeuralCompressor1M,
+        compress_file,
+        decompress_file,
+        train_codec_model,
+    )
 import vultorch as torch
 
 
