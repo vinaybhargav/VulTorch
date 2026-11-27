@@ -48,7 +48,7 @@ if (( shader_failed )); then
 fi
 
 echo "==> Python syntax (warnings are errors)"
-"$PY" -W error -m compileall -q vultorch tests examples benchmarks test_lossless_roundtrip.py
+"$PY" -W error -m compileall -q vultorch tests examples benchmarks
 
 echo "==> Tests (warnings are errors)"
 "$PY" -W error -m pytest -q

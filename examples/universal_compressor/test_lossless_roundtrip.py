@@ -98,14 +98,30 @@ def verify_lossless_roundtrip(data: bytes, device: str = "vk:0", devices=None):
 
 
 if __name__ == "__main__":
-    # Test on real text
-    sample_text = (
-        """VulTorch: A High-Performance Pure Vulkan Deep Learning Library.
+    import os
+    import sys
+
+    # Check if a custom file was passed or default to sample_book.txt in the same directory
+    cur_dir = os.path.dirname(os.path.abspath(__file__))
+    sample_book_path = os.path.join(cur_dir, "sample_book.txt")
+
+    if len(sys.argv) > 1 and os.path.isfile(sys.argv[1]):
+        with open(sys.argv[1], "rb") as f:
+            data = f.read()
+    elif os.path.isfile(sample_book_path):
+        with open(sample_book_path, "rb") as f:
+            # Test on first 1024 bytes of sample_book for fast verification
+            data = f.read()[:1024]
+    else:
+        sample_text = (
+            """VulTorch: A High-Performance Pure Vulkan Deep Learning Library.
 Eliminating NVIDIA CUDA lock-in by running full tensor compute, reverse-mode autodiff,
 and deep neural networks across AMD Radeon, Intel, and NVIDIA GPUs using standard Vulkan.
 Compressing and decompressing text losslessly with deep neural language models!
 The quick brown fox jumps over the lazy dog. 0123456789!
 """
-        * 3
-    )
-    verify_lossless_roundtrip(sample_text.encode("utf-8"))
+            * 3
+        )
+        data = sample_text.encode("utf-8")
+
+    verify_lossless_roundtrip(data)
