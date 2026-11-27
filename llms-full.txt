@@ -1,0 +1,102 @@
+# VulTorch Full API Reference
+
+Single-file verified API reference for LLMs, code generation models, and AI coding assistants.
+
+## 1. Package Structure
+- `vultorch`: Core tensor creation, math, contractions, compilation, and Vulkan runtime diagnostics.
+- `vultorch.nn`: Neural network modules, containers, activations, initializations, and normalization layers.
+- `vultorch.nn.functional` (or `vultorch.nn.F`): Functional stateless operations.
+- `vultorch.nn.init`: Parameter initializations (`xavier_uniform_`, `kaiming_normal_`, etc.).
+- `vultorch.nn.utils`: Gradient clipping (`clip_grad_norm_`, `clip_grad_value_`).
+- `vultorch.optim`: Optimizers (`SGD`, `Adam`, `AdamW`, `RMSprop`).
+- `vultorch.optim.lr_scheduler`: LR schedulers (`StepLR`, `CosineAnnealingLR`, `LinearLR`, `OneCycleLR`).
+- `vultorch.amp`: Automatic mixed precision (`autocast`, `GradScaler`).
+- `vultorch.autograd`: Reverse-mode autodiff, `Function`, `grad`, `no_grad`, `enable_grad`.
+- `vultorch.utils.data`: `Dataset`, `TensorDataset`, `DataLoader`.
+- `vultorch.utils.checkpoint`: Activation checkpointing (`checkpoint`).
+- `vultorch.linalg`: Linear algebra operations (`norm`, `vector_norm`, `matrix_norm`, `inv`, `solve`, `qr`, `svd`).
+- `vultorch.fft`: FFT operations (`fft`, `ifft`, `rfft`, `irfft`).
+- `vultorch.serialization`: Safetensors format reader/writer (`save_safetensors`, `load_safetensors`).
+
+---
+
+## 2. Core `vultorch` API
+### Tensor Constructors
+- `torch.tensor(data, dtype=None, device=None, requires_grad=False)`
+- `torch.zeros(size, dtype=None, device=None, requires_grad=False)`
+- `torch.ones(size, dtype=None, device=None, requires_grad=False)`
+- `torch.empty(size, dtype=None, device=None, requires_grad=False)`
+- `torch.full(size, fill_value, dtype=None, device=None, requires_grad=False)`
+- `torch.randn(*size, dtype=None, device=None, requires_grad=False)`
+- `torch.rand(*size, dtype=None, device=None, requires_grad=False)`
+- `torch.randint(low, high=None, size=(), dtype=torch.int64, device=None)`
+- `torch.arange(start=0, end, step=1, dtype=None, device=None)`
+- `torch.linspace(start, end, steps=100, dtype=None, device=None)`
+- `torch.eye(n, m=None, dtype=None, device=None)`
+- `torch.randperm(n, dtype=torch.int64, device=None)`
+- `*_like` variants: `zeros_like`, `ones_like`, `empty_like`, `full_like`, `rand_like`, `randn_like`, `randint_like`.
+
+### Math & Reductions
+- Elementwise unary: `abs`, `neg`, `exp`, `log`, `sqrt`, `rsqrt`, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `sinh`, `cosh`, `tanh`, `erf`, `sigmoid`, `relu`, `gelu`, `silu`, `round`, `floor`, `ceil`, `trunc`, `isnan`, `isinf`.
+- Elementwise binary: `add`, `sub`, `mul`, `div`, `pow`, `maximum`, `minimum`, `eq`, `ne`, `lt`, `le`, `gt`, `ge`, `logical_and`, `logical_or`, `logical_not`, `isclose`, `allclose`.
+- Reductions: `sum(dim=None, keepdim=False)`, `mean(dim=None, keepdim=False)`, `max(dim=None, keepdim=False)`, `min(dim=None, keepdim=False)`, `argmax(dim=None, keepdim=False)`, `argmin(dim=None, keepdim=False)`, `cumsum(dim)`, `sort(dim=-1, descending=False)`, `topk(k, dim=-1, largest=True, sorted=True)`.
+
+### Linear Algebra & Contractions
+- `mm(input, mat2)` / `input @ mat2`
+- `bmm(batch1, batch2)`
+- `addmm(input, mat1, mat2, beta=1.0, alpha=1.0)`
+- `dot(vec1, vec2)`
+- `mv(mat, vec)`
+- `outer(vec1, vec2)`
+- `einsum(equation, *operands)`
+- `torch.linalg.norm(A, ord=2, dim=None, keepdim=False)`
+- `torch.linalg.qr(A)` / `torch.linalg.svd(A)` / `torch.linalg.inv(A)`
+
+### Compilation & Replay
+- `@vultorch.compile` (or `model = vultorch.compile(model)`): Captures forward/backward dispatches into a cached `VulkanGraph` and replays them on subsequent calls with bit-identical outputs and zero CPU dispatch overhead.
+- `VulkanGraph`: Direct graph capture context manager:
+  ```python
+  g = vultorch.VulkanGraph()
+  with g.capture(device="vk:0"):
+      y = model(x)
+  g.replay()
+  ```
+
+### Vulkan Diagnostics (`vultorch.vulkan`)
+- `vultorch.vulkan.is_available() -> bool`
+- `vultorch.vulkan.device_count() -> int`
+- `vultorch.vulkan.get_device_name(device_id=0) -> str`
+- `vultorch.vulkan.get_device_properties(device_id=0) -> dict`
+- `vultorch.vulkan.synchronize(device_id=0)`
+- `vultorch.vulkan.synchronize_all()`
+- `vultorch.vulkan.get_device_tflops(device_id=0) -> float`
+
+---
+
+## 3. Neural Network Modules (`vultorch.nn`)
+- Core: `nn.Module`, `nn.Parameter`, `nn.Sequential`, `nn.ModuleList`, `nn.ModuleDict`.
+- Layers:
+  - `nn.Linear(in_features, out_features, bias=True)`
+  - `nn.Embedding(num_embeddings, embedding_dim)`
+  - `nn.Conv2d(in_channels, out_channels, kernel_size, stride=1, padding=0, dilation=1, groups=1, bias=True)`
+  - `nn.MaxPool2d(kernel_size, stride=None, padding=0)`
+  - `nn.AvgPool2d(kernel_size, stride=None, padding=0)`
+  - `nn.AdaptiveAvgPool2d(output_size)`
+  - `nn.LayerNorm(normalized_shape, eps=1e-5)`
+  - `nn.RMSNorm(normalized_shape, eps=1e-5)`
+  - `nn.BatchNorm2d(num_features, eps=1e-5, momentum=0.1)`
+  - `nn.GroupNorm(num_groups, num_channels, eps=1e-5)`
+  - `nn.Dropout(p=0.5)`
+  - `nn.MultiheadAttention(embed_dim, num_heads, dropout=0.0, batch_first=False)`
+  - `nn.RotaryEmbedding(dim, max_seq_len=4096)`
+  - `nn.SwiGLU(in_features, hidden_features)`
+  - `nn.Snake(channels, alpha=1.0)` / `nn.SnakeBeta(channels)`
+  - `nn.Mamba(d_model, d_state=16, d_conv=4, expand=2)`
+  - `nn.LSTM(input_size, hidden_size, num_layers=1, bias=True, batch_first=False)`
+  - `nn.GRU(input_size, hidden_size, num_layers=1, bias=True, batch_first=False)`
+  - `nn.TransformerEncoderLayer(d_model, nhead, dim_feedforward=2048, dropout=0.1)`
+  - `nn.TransformerEncoder(encoder_layer, num_layers)`
+- Multi-GPU:
+  - `nn.DataParallel(module, device_ids=['all'], balance='auto')`: Dynamic heterogeneous multi-GPU container with closed-loop latency balancing.
+- Quantization:
+  - `vultorch.quantize(module, bits=4|8)`: In-place int4/int8 weight packing for high-throughput inference.

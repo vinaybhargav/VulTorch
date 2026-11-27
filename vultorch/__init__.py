@@ -33,6 +33,7 @@ from . import optim
 from . import utils
 from . import linalg
 from . import fft
+from . import quantization
 from .serialization import save_safetensors, load_safetensors
 from . import _vultorch_backend as _backend
 

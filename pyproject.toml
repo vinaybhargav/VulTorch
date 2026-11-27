@@ -23,6 +23,24 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
+keywords = [
+    "vulkan",
+    "deep-learning",
+    "pytorch",
+    "slang",
+    "amd",
+    "intel",
+    "gpu",
+    "transformer",
+    "mamba",
+    "quantization",
+]
+
+[project.urls]
+Homepage = "https://github.com/vinayb/VulTorch"
+Documentation = "https://github.com/vinayb/VulTorch/blob/main/README.md"
+Repository = "https://github.com/vinayb/VulTorch.git"
+Issues = "https://github.com/vinayb/VulTorch/issues"
 
 [tool.scikit-build]
 # The wheel layout is defined solely by CMakeLists.txt install() rules. Copying
