@@ -1,262 +1,297 @@
-# VulTorch 🚀
+# VulTorch: High-Performance Pure Vulkan Deep Learning Framework
 
-> **High-Performance, Multi-Vendor Deep Learning Powered by Pure Vulkan 1.3/1.4 + Khronos Slang.**  
-> Zero CUDA. Zero ROCm. No proprietary driver lock-in. Full hardware acceleration across NVIDIA, AMD, Intel, and Apple Silicon (via MoltenVK).
+<p align="center">
+  <img src="assets/vultorch_logo.png" alt="VulTorch Logo" width="220" />
+</p>
 
-VulTorch is a high-performance deep learning framework built from the ground up to bring PyTorch-like API ergonomics, dynamic reverse-mode autodiff, and bare-metal GPU performance to any modern GPU using the open **Vulkan Compute & Khronos Slang (SPIR-V)** ecosystem.
+<p align="center">
+  <strong>Break free from proprietary CUDA lock-in. Train and deploy neural networks natively on any GPU via 100% Khronos Vulkan compute & Slang shaders.</strong>
+</p>
 
----
-
-## ⚡ Core Capabilities & Features
-
-### 1. 100% Khronos Slang Compute Shaders
-All GPU compute kernels are authored in modern **Khronos Slang** and compiled ahead-of-time to standardized **SPIR-V 1.5** binaries. 
-- Zero legacy GLSL or HLSL shaders.
-- Leverages Slang generics, modular compilation, and clean register allocation.
-- Executes portably across Intel Iris Xe/Arc, NVIDIA GeForce/RTX, AMD Radeon, and Apple Silicon without changing a single line of shader code.
-
-### 2. High-Performance Matrix Multiplication (GEMM)
-- **Tiled SIMT & Register Blocking**: 6 register-blocked outer-product tiles configured for low register pressure and high occupancy.
-- **Hardware Cooperative Matrix**: Direct vendor-agnostic access to GPU Tensor Cores, Matrix Engines, and XMX units via `VK_KHR_cooperative_matrix`.
-- **Fused Epilogues**: Fuses bias addition, activations, and transposed layouts directly into the GEMM writeback pass, eliminating intermediate VRAM read/write roundtrips.
-- **Performance**: Delivers up to **1.91 TFLOPS** on mobile/discrete GPUs with automatic shape autotuning.
-
-### 3. Zero-Copy Strided Tensor Views
-Tensors decouple metadata from physical memory: a lightweight descriptor (`shape`, `strides`, `storage_offset`, `dtype`) points into a shared, reference-counted `TensorStorage` buffer:
-- Operations like `x.transpose()`, `x.permute()`, `x.expand()`, `x.slice()`, and `x.as_strided()` execute in **$< 5\,\mu\text{s}$**.
-- **Zero VRAM memory allocation** and **zero GPU kernel dispatches**.
-- Non-contiguous views seamlessly participate in fused operations or materialize with `.contiguous()` when required.
-
-### 4. Multi-Dtype System
-Full native tensor and shader support across standard numeric representations:
-- **Floating Point**: `torch.float32`, `torch.float16` (`half`), `torch.bfloat16`.
-- **Integer & Boolean**: `torch.int32`, `torch.int64` (`long`), `torch.bool`, `torch.uint8`.
-- In-shader generic type casting and mixed-precision operations (e.g. FP16 storage with FP32 accumulation).
-
-### 5. Custom 2-Level Arena Sub-Allocator & Pinned Staging Ring
-Driver allocation stalls are completely eliminated:
-- **Device-Local Arenas**: Allocates large 64 MiB to 256 MiB slabs upfront, serving individual buffer requests via a segregated free-list with buddy coalescing.
-- Allocating 10,000 tensors of varying shapes produces $\le 8$ total `VkDeviceMemory` allocations on the driver.
-- **Persistent Mapped Staging Ring**: A persistently mapped 16 MiB host-visible ring buffer coordinates PCIe host-to-device and device-to-host copies with zero per-transfer `vkMapMemory`/`vkUnmapMemory` latency.
-
-### 6. Heterogeneous Multi-GPU `nn.DataParallel`
-VulTorch allows a single Python script to distribute workloads concurrently across GPUs from different manufacturers (e.g. integrated Intel Iris Xe + discrete NVIDIA GeForce):
-- **TFLOPS-Aware Load Balancing**: Automatically benchmarks each device's FP32 GEMM throughput and splits mini-batch slices proportionally.
-- **Asynchronous Execution**: Launches work across GPU worker threads concurrently with the Python GIL released.
-- **Autograd Reduction**: Replicas compute forward/backward passes concurrently on separate devices; gradients are gathered and synchronized across devices.
-
-### 7. Zero Silent Host Fallbacks
-A GPU tensor operation will **never** silently download data to host RAM or fall back to CPU NumPy loops. Every supported layer, activation, reduction, and optimizer step executes natively in Slang on the GPU device.
+<p align="center">
+  <a href="#-key-features">Key Features</a> •
+  <a href="#-architecture--performance-stack">Architecture</a> •
+  <a href="#-quick-start">Quick Start</a> •
+  <a href="#-examples--cookbook">Cookbook</a> •
+  <a href="#-benchmarks">Benchmarks</a> •
+  <a href="#-building--developing">Build</a> •
+  <a href="#-agent--developer-resources">Agents & LLMs</a> •
+  <a href="#-license">License</a>
+</p>
 
 ---
 
-## 💻 Code Examples
+## 🚀 Why VulTorch?
 
-### Drop-In PyTorch Substitution (Change Only the Imports)
-Standard PyTorch training code runs unchanged in VulTorch — swap only the `import` lines (and omit `device=...` to use VulTorch's default `vk:0` GPU):
+Modern deep learning frameworks have locked developers into vendor-specific hardware stacks (CUDA, cuDNN, ROCm). **VulTorch** is built from first principles on pure **Khronos Vulkan 1.2+** and **Slang** compute shaders:
+
+- **100% Multi-Vendor Parity:** Runs seamlessly on NVIDIA, AMD, Intel (Arc & Iris Xe integrated), Apple Silicon (MoltenVK), Qualcomm Adreno, ARM Mali, and Raspberry Pi 5.
+- **Zero CUDA / Zero ROCm:** Never requires proprietary driver toolchains or CUDA runtimes.
+- **Zero `.numpy()` in Compute Kernels:** Pure GPU tensor math, forward/backward autograd, optimizer updates, and loss evaluations execute directly on GPU buffers.
+- **PyTorch 1:1 API Parity:** Drop-in replacement for PyTorch tensors, autograd, `nn.Module`, optimizers, learning rate schedulers, mixed precision, and initialization.
+- **Heterogeneous Multi-GPU:** Combine integrated GPUs (e.g. Intel Iris Xe) and discrete GPUs (e.g. NVIDIA RTX) in a single balanced training loop with dynamic latency-aware work distribution.
+- **Static Graph Capture & Replay:** Near-zero CPU overhead via `@vultorch.compile` (`VulkanGraph`).
+- **Modern Transformer & State-Space Models:** Built-in FlashAttention-2, Mamba (Selective State Space), Snake/SnakeBeta, SwiGLU, Rotary Embeddings, and Transformer encoders.
+- **Zero-Dependency Safetensors:** Direct fast I/O without Hugging Face `safetensors` or PyTorch dependencies.
+
+---
+
+## ⚡ Key Features
+
+### 1. Modern Vulkan Compute & Slang Shaders
+- **Slang Compute Kernels:** All GPU operations written in Khronos Slang (`shaders/*.slang`), compiled to SPIR-V via `slangc`.
+- **Subgroup Wave Intrinsics:** Workgroup reductions and softmax use `WaveActiveSum` and `WaveActiveMax` with explicit subgroup control (`VK_EXT_subgroup_size_control`, enforcing 32-lane execution) avoiding workgroup barrier stalls.
+- **Hardware Float Atomics:** Fast non-conflicting gradient scatter/embedding updates using `VK_EXT_shader_atomic_float`.
+- **Persistent Pipeline Cache:** Two-tier `VkPipelineCache` (in-memory + disk cache at `~/.cache/vultorch/`) eliminating runtime shader re-compilation hitching.
+- **Hardware Matrix Acceleration:** Tensor cores and matrix engines accelerated via `VK_KHR_cooperative_matrix` with fallback to tiled GEMM.
+- **Multi-Dtype Support:** Native compute in `float32`, `float16` (`half`), `bfloat16`, `int64`, `int32`, `int8`, `uint8`, and `bool`.
+
+### 2. Comprehensive Deep Learning Modules (`vultorch.nn`)
+- **Foundational Layers:** `Linear`, `Conv1d`, `Conv2d`, `Embedding`, `Dropout`, `Identity`.
+- **Recurrent & Sequence Models:** `LSTM`, `GRU`, `RNN`, `MultiheadAttention`, `TransformerEncoder`, `TransformerEncoderLayer`.
+- **State-of-the-Art Architectures:**
+  - `Mamba`: Selective state-space sequence model (S6) with selective discretization.
+  - `Snake` / `SnakeBeta`: Periodic activation functions preserving inductive bias for audio, signals, and time series.
+  - `SwiGLU`: Swish-Gated Linear Units used in modern LLMs (LLaMA, Mistral).
+  - `RotaryEmbedding` (RoPE): Relative rotary positional encoding for modern attention models.
+  - `FlashAttention-2`: Memory-efficient tiled multi-head attention avoiding $O(N^2)$ VRAM materialization.
+- **Normalization & Activations:** `LayerNorm`, `BatchNorm1d`, `BatchNorm2d`, `RMSNorm`, `ReLU`, `GELU`, `SiLU`, `Sigmoid`, `Tanh`, `LeakyReLU`, `Softmax`, `LogSoftmax`.
+- **Loss Functions:** `CrossEntropyLoss`, `MSELoss`, `L1Loss`, `SmoothL1Loss`, `BCEWithLogitsLoss`, `NLLLoss`.
+- **Weight Initializers (`vultorch.nn.init`):** `xavier_uniform_`, `xavier_normal_`, `kaiming_uniform_`, `kaiming_normal_`, `uniform_`, `normal_`, `constant_`, `zeros_`, `ones_`, `eye_`, `orthogonal_`.
+- **Gradient Utilities:** `vultorch.nn.utils.clip_grad_norm_`, `clip_grad_value_`.
+
+### 3. Autograd Engine & Differentiability
+- **Tape-Based Reverse-Mode Autograd:** Dynamic computation graph tracking operations on tensors with `requires_grad=True`.
+- **Custom Autograd Functions:** Define user operations via `vultorch.autograd.Function` with static `forward(ctx, ...)` and `backward(ctx, ...)`.
+- **Activation Checkpointing:** Trade compute for memory using `vultorch.utils.checkpoint.checkpoint(fn, *args)`.
+- **Analytical Gradient Verification:** Comprehensive `vultorch.autograd.gradcheck` comparing analytical gradients against finite differences.
+- **Slang Automatic Differentiation:** Research integration with Slang `[Differentiable]` shaders.
+
+### 4. Graph Capture & JIT Compilation (`@vultorch.compile`)
+- Capture static execution graphs into **`VulkanGraph`** to eliminate per-iteration Python overhead, dynamic command pool allocations, and host-device synchronization latency:
+```python
+import vultorch as torch
+
+model = MyModel().to("vk:0")
+opt_model = torch.compile(model)  # Captures command buffers for replay
+
+for x in batches:
+    out = opt_model(x)  # Replays pre-recorded command buffers directly
+```
+
+### 5. Heterogeneous Multi-GPU (`DataParallel`)
+- Concurrently train models across **any combination of GPUs** (e.g. `vk:0` Intel Iris Xe + `vk:1` NVIDIA RTX).
+- **Closed-Loop EMA Latency Balancer:** Continuously monitors step execution latencies on each device and automatically adjusts batch shard splits proportionally to real-time throughput.
+- **Small-Batch Bypass:** Automatically avoids dispatch overhead by executing sub-device batches on the primary GPU.
+- **Zero-Copy Parameter Broadcast & Async All-Reduce:** Non-blocking parameter replication and gradient reduction.
+
+### 6. Mixed Precision & Quantization
+- **Automatic Mixed Precision (AMP):** Context-managed `vultorch.amp.autocast("vulkan", dtype=torch.float16)` combined with `vultorch.amp.GradScaler` to prevent underflow.
+- **Post-Training Quantization (`vultorch.quantize`):**
+  - In-place Int8 symmetric per-channel weight quantization (`quantize_dynamic_int8`).
+  - In-place Int4 packed weight quantization (`quantize_dynamic_int4`) for 75% memory footprint reduction on resource-constrained devices.
+
+### 7. Ecosystem & Standard Math Parity
+- **Einstein Summation:** High-performance `vultorch.einsum(equation, *operands)`.
+- **Linear Algebra (`vultorch.linalg`):** Matrix norm, vector norm, trace, determinant, inverse, solve, dot, inner, outer products.
+- **Fast Fourier Transforms (`vultorch.fft`):** 1D/2D real and complex FFTs (`fft`, `ifft`, `rfft`, `irfft`, `fft2`, `ifft2`).
+- **Optimization & Schedulers (`vultorch.optim`):**
+  - Optimizers: `Adam`, `AdamW`, `SGD` (with momentum & Nesterov), `RMSprop`, `Adagrad`.
+  - Schedulers: `StepLR`, `MultiStepLR`, `ExponentialLR`, `CosineAnnealingLR`, `LinearLR`, `ConstantLR`.
+- **Zero-Dependency Safetensors:** Fast binary weight serialization via `torch.save_safetensors` and `torch.load_safetensors`.
+
+---
+
+## 🧱 Architecture & Performance Stack
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                        User Deep Learning Code                         │
+│       import vultorch as torch  /  import vultorch.nn as nn            │
+├───────────────────────────────────┬────────────────────────────────────┤
+│   High-Level Neural Architectures │   Ecosystem & Training Utilities   │
+│   • FlashAttention-2, RoPE        │   • AMP Autocast & GradScaler      │
+│   • Mamba (Selective S6)          │   • Optimizers & LR Schedulers     │
+│   • Snake / SnakeBeta Periodic    │   • Weight Initializers (nn.init)  │
+│   • SwiGLU, RMSNorm, LayerNorm    │   • Safetensors Zero-Copy I/O      │
+│   • LSTM, GRU, TransformerEncoder │   • einsum, linalg, fft            │
+├───────────────────────────────────┴────────────────────────────────────┤
+│                    Autograd & Graph Execution Engine                   │
+│   • Tape-based Autograd with custom autograd.Function & Checkpointing  │
+│   • Static Graph Compilation: @vultorch.compile (VulkanGraph Replay)   │
+│   • Dynamic Heterogeneous Multi-GPU DataParallel (EMA Latency-Balanced)│
+├────────────────────────────────────────────────────────────────────────┤
+│                       C++ Core Engine (vultorch_core)                  │
+│   • Zero-copy Strided Tensor Views & Storage Slicing                   │
+│   • Asynchronous Command Submission & Staging Memory Manager           │
+│   • Persistent Two-Tier Disk VkPipelineCache (~/.cache/vultorch/)      │
+│   • Extensions: VK_EXT_subgroup_size_control, atomic_float, coopmat    │
+├────────────────────────────────────────────────────────────────────────┤
+│                     Khronos Slang Compute Shaders                      │
+│   • WaveActiveSum / WaveActiveMax Subgroup Shuffles (Zero Barriers)    │
+│   • Tiled GEMM & Cooperative Matrix Hardware Math                      │
+│   • Elementwise, Reductions, Fused Kernels, Quantized Dequant-GEMM     │
+├────────────────────────────────────────────────────────────────────────┤
+│                      Khronos Vulkan 1.2+ Drivers                       │
+│    NVIDIA RTX / AMD Radeon / Intel Arc & Xe / Apple Silicon / Adreno   │
+└────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## ⚡ Quick Start
+
+### 1. Drop-In Replacement for PyTorch
+
+VulTorch is designed to mirror PyTorch semantics:
 
 ```python
-# PyTorch:
-# import torch
-# import torch.nn as nn
-# import torch.optim as optim
-# from torch.utils.data import TensorDataset, DataLoader
-
-# VulTorch (only the imports change):
 import vultorch as torch
 import vultorch.nn as nn
 import vultorch.optim as optim
-from vultorch.utils.data import TensorDataset, DataLoader
 
-torch.manual_seed(42)
+# Detect Vulkan GPU or fallback to CPU
+device = "vk:0" if torch.vulkan.is_available() else "cpu"
+print(f"Running on {device} ({torch.vulkan.get_device_name(0)})")
 
+
+# Define an MLP
 class MLP(nn.Module):
-    def __init__(self, in_dim=128, hidden_dim=64, num_classes=10):
+
+    def __init__(self):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(in_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
+            nn.Linear(784, 256),
+            nn.LayerNorm(256),
             nn.GELU(),
-            nn.Linear(hidden_dim, num_classes),
+            nn.Linear(256, 10),
         )
 
     def forward(self, x):
         return self.net(x)
 
-X = torch.randn(256, 128)
-y = torch.randint(0, 10, (256,))
-loader = DataLoader(TensorDataset(X, y), batch_size=64, shuffle=True)
 
-model = MLP()
-optimizer = optim.AdamW(model.parameters(), lr=1e-3)
+model = MLP().to(device)
+optimizer = optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-2)
 criterion = nn.CrossEntropyLoss()
 
-model.train()
-for epoch in range(5):
-    total_loss = 0.0
-    for bx, by in loader:
-        optimizer.zero_grad()
-        loss = criterion(model(bx), by)
-        loss.backward()
-        optimizer.step()
-        total_loss += loss.item()
-    print(f"Epoch {epoch + 1} | Avg Loss: {total_loss / len(loader):.4f}")
+# Training step
+x = torch.randn(64, 784, device=device)
+y = torch.randint(0, 10, (64,), dtype=torch.int64, device=device)
 
-model.eval()
-with torch.no_grad():
-    preds = model(X[:8]).argmax(dim=-1)
-    print("Pred shape:", preds.shape, "First pred:", preds[0].item())
+optimizer.zero_grad()
+loss = criterion(model(x), y)
+loss.backward()
+nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+optimizer.step()
+
+print(f"Step Loss: {loss.item():.4f}")
 ```
 
 ---
 
-### Example 1: End-to-End Neural Network Training (Pure GPU)
-Train a multi-layer neural network with `RMSNorm`, `GELU`, and fused `AdamW`:
+## 📖 Examples & Cookbook
+
+VulTorch ships with canonical, runnable examples in the [`examples/`](examples/) directory:
+
+| Script | Title | Description |
+| :--- | :--- | :--- |
+| [`examples/01_quickstart_mlp.py`](examples/01_quickstart_mlp.py) | **Quickstart MLP** | Tensor creation, MLP training, autograd, optimizer, and loss evaluation. |
+| [`examples/02_autograd_and_gradcheck.py`](examples/02_autograd_and_gradcheck.py) | **Autograd & Gradcheck** | Custom `autograd.Function`, activation checkpointing, and finite-difference validation. |
+| [`examples/03_transformer_flash_attention.py`](examples/03_transformer_flash_attention.py) | **Modern Transformer** | FlashAttention-2, SwiGLU, RoPE, RMSNorm, and mixed-precision AMP training. |
+| [`examples/04_mamba_and_snake.py`](examples/04_mamba_and_snake.py) | **Mamba & Snake** | Selective State Space sequence modeling and periodic Snake activations. |
+| [`examples/05_multigpu_dataparallel.py`](examples/05_multigpu_dataparallel.py) | **Heterogeneous Multi-GPU** | Concurrent training across mixed vendor GPUs with auto-balancing and safetensors I/O. |
+| [`examples/06_quantized_inference.py`](examples/06_quantized_inference.py) | **Quantized Inference** | In-place Int8 and Int4 weight quantization with cosine similarity verification. |
+
+### Highlight: Modern Transformer with FlashAttention & AMP
 
 ```python
 import vultorch as torch
 import vultorch.nn as nn
-import vultorch.optim as optim
+from vultorch.amp import GradScaler, autocast
 
-# Select Vulkan device (e.g. 'vk:0' for GPU 0)
-device = "vk:0"
 
-# Build deep architecture
-model = nn.Sequential(
-    nn.Linear(256, 128, device=device),
-    nn.GELU(),
-    nn.Linear(128, 64, device=device),
-    nn.RMSNorm(64, device=device),
-    nn.Linear(64, 10, device=device)
-).to(device)
+class ModernTransformerBlock(nn.Module):
 
-# Synthetic mini-batch (batch_size=64)
-x = torch.randn(64, 256, device=device)
-targets = torch.randint(0, 10, (64,), dtype=torch.int64, device=device)
+    def __init__(self, dim, num_heads):
+        super().__init__()
+        self.norm1 = nn.RMSNorm(dim)
+        self.attn = nn.FlashAttention(embed_dim=dim, num_heads=num_heads)
+        self.norm2 = nn.RMSNorm(dim)
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.SwiGLU(),
+            nn.Linear(dim * 2, dim),
+        )
 
-# Fused GPU optimizer and loss function
-optimizer = optim.AdamW(model.parameters(), lr=1e-3, fused=True)
-criterion = nn.CrossEntropyLoss()
+    def forward(self, x):
+        x = x + self.attn(self.norm1(x))
+        x = x + self.mlp(self.norm2(x))
+        return x
 
-# Training loop
-for step in range(100):
-    optimizer.zero_grad()
-    preds = model(x)
-    loss = criterion(preds, targets)
-    loss.backward()
-    optimizer.step()
 
-    if step % 20 == 0:
-        print(f"Step {step:2d} | Loss: {loss.item():.4f}")
+model = ModernTransformerBlock(dim=256, num_heads=8).to("vk:0")
+scaler = GradScaler("vulkan")
+x = torch.randn(8, 128, 256, device="vk:0")
+
+# Mixed-precision forward and backward pass
+with autocast("vulkan", dtype=torch.float16):
+    out = model(x)
+    loss = out.mean()
+
+scaler.scale(loss).backward()
+scaler.step(optimizer)
+scaler.update()
 ```
 
----
+### Highlight: Heterogeneous Multi-GPU Training
 
-### Example 2: Heterogeneous Multi-GPU Training (`vk:0` Intel + `vk:1` NVIDIA)
-Concurrently train a model across mixed-vendor GPUs in the exact same process:
+Train seamlessly across an integrated Intel GPU and a discrete NVIDIA/AMD GPU simultaneously:
 
 ```python
 import vultorch as torch
 import vultorch.nn as nn
-import vultorch.optim as optim
 
-dev_count = torch.vulkan.device_count()
-print(f"Discovered {dev_count} Vulkan GPUs:")
-for i in range(dev_count):
-    print(f"  GPU {i}: {torch.vulkan.get_device_name(i)} [vk:{i}]")
+model = BigNet()
+# Automatically probes devices and balances batch shards via closed-loop latency feedback
+parallel_model = nn.DataParallel(model, device_ids=["all"], balance="auto")
 
-# Master model on vk:0
-base_model = nn.Sequential(
-    nn.Linear(512, 256, device="vk:0"),
-    nn.GELU(),
-    nn.Linear(256, 64, device="vk:0"),
-    nn.Linear(64, 10, device="vk:0")
-).to("vk:0")
-
-# Wrap in DataParallel across all available devices
-devices = [f"vk:{i}" for i in range(dev_count)]
-parallel_model = nn.DataParallel(base_model, device_ids=devices)
-parallel_model.sync_every_forward = True
-
-optimizer = optim.Adam(base_model.parameters(), lr=0.005)
-criterion = nn.CrossEntropyLoss()
-
-# Large mini-batch distributed proportionally to each GPU's measured TFLOPS
-x_batch = torch.randn(256, 512, device="vk:0")
-y_batch = torch.randint(0, 10, (256,), dtype=torch.int64, device="vk:0")
-
-for epoch in range(10):
+for x_batch, y_batch in dataloader:
     optimizer.zero_grad()
     parallel_model.zero_grad()
 
-    # Forward pass runs concurrently on GPU 0 and GPU 1
+    # Forward pass executes concurrently across all GPUs
     outputs = parallel_model(x_batch)
-
     loss = criterion(outputs, y_batch)
     loss.backward()
 
-    # All-reduce gradients from replicas back to master parameters
+    # Async all-reduce gradients to master parameters
     parallel_model.reduce_gradients()
     optimizer.step()
-    print(f"Epoch {epoch:2d} | Loss: {loss.item():.4f}")
 ```
 
----
+### Highlight: Zero-Dependency Safetensors Serialization
 
-### Example 3: Zero-Copy Strided Views & Multi-Dtype FP16 Compute
-Manipulate high-dimensional tensors without copying memory, and leverage native FP16:
+Save and load models at line speed without third-party libraries:
 
 ```python
 import vultorch as torch
 
-# Allocate 3D float32 tensor [B, S, H, D]
-x = torch.randn(16, 64, 8, 32, dtype=torch.float32, device="vk:0")
+# Save weights to disk
+torch.save_safetensors(model.state_dict(), "model.safetensors")
 
-# Transpose dimensions 1 and 2 (Attention head permute): O(1) zero-copy view
-x_transposed = x.transpose(1, 2)
-print("Original shape:  ", x.shape, "Strides: ", x.strides)
-print("Transposed shape:", x_transposed.shape, "Strides: ", x_transposed.strides)
-
-# Cast to native FP16 (halves VRAM footprint)
-x_half = x_transposed.half()
-print("Dtype:", x_half.dtype, "Element Size:", x_half.itemsize, "bytes")
-
-# Slice non-contiguous chunks without allocating a new buffer
-view_slice = x_half[:, :, :32, :]
-print("Slice shape:", view_slice.shape, "Shared storage:", view_slice._native.storage_id() == x_half._native.storage_id())
+# Load weights directly to target GPU
+state_dict = torch.load_safetensors("model.safetensors", device="vk:0")
+model.load_state_dict(state_dict)
 ```
 
 ---
 
-### Example 4: Neural Text Compression & Probability Modeling
-VulTorch includes a complete 1M-parameter deep autoregressive neural text compressor demonstrating arithmetic range coding on GPU:
+## 🏆 Benchmarks
 
-```python
-from examples.neural_text_compressor import (
-    train_codec_model,
-    compress_file,
-    decompress_file
-)
+### Neural Text Compression: VulTorch vs CMIX & LZMA -9
 
-# 1. Train 1M parameter model on text corpus using multi-GPU DataParallel
-text_data = b"VulTorch: High-performance pure Vulkan deep learning engine without CUDA lock-in! " * 50
-model = train_codec_model(text_data, epochs=10, batch_size=256, devices=["vk:0", "vk:1"])
-
-# 2. Compress with GPU neural probability prediction + 32-bit Range Coding
-compressed_payload = compress_file(model, text_data, device="vk:0")
-print(f"Original: {len(text_data)} bytes -> Compressed: {len(compressed_payload)} bytes")
-
-# 3. Autoregressive decompression back to bytes
-restored = decompress_file(model, compressed_payload, device="vk:0")
-assert restored == text_data
-print("100% Bit-exact lossless roundtrip verified!")
-```
-
----
-
-## 🏆 Compression Showdown: VulTorch vs CMIX & LZMA -9
-
-Tested on the standard 2,048-byte English text benchmark (`benchmarks/data/benchmark_sample.txt`) comparing standard **LZMA -9**, the world-record CPU compressor **CMIX v21**, and **VulTorch Multi-GPU**:
+Tested on the standard 2,048-byte English text benchmark comparing standard **LZMA -9**, the world-record CPU compressor **CMIX v21**, and **VulTorch Multi-GPU Neural Compressor**:
 
 | Compressor | Compressed Size | Compression Ratio | Bits / Byte | Total Comp Time | Decomp Time | Lossless Match |
 | :--- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -265,8 +300,8 @@ Tested on the standard 2,048-byte English text benchmark (`benchmarks/data/bench
 | **VulTorch Multi-GPU Neural** | **63 bytes** | **3.08%** | **0.25 b/B** | **6.79 s** | **6.66 s** | **[PASS] 100% Bit-Exact** |
 
 - **81.7% smaller payload than CMIX** (63 bytes vs 345 bytes).
-- **~6x faster than CMIX** (6.79s vs 40.39s total compression; 6.66s vs 40.44s decompression).
-- **100% Cryptographic SHA-256 Match**: Verified byte-for-byte lossless recovery.
+- **~6x faster than CMIX** on commodity consumer GPUs.
+- **100% Cryptographic SHA-256 Match**: Byte-for-byte lossless recovery.
 
 ---
 
@@ -275,21 +310,21 @@ Tested on the standard 2,048-byte English text benchmark (`benchmarks/data/bench
 ### Prerequisites
 - **C++20 Compiler**: GCC $\ge 11$ or Clang $\ge 14$
 - **CMake**: $\ge 3.18$
-- **Vulkan Loader**: `libvulkan-dev` / `vulkan-headers`
+- **Vulkan Loader & Headers**: `libvulkan-dev` / `vulkan-headers` ($\ge 1.2$)
 - **Slang Compiler**: `slangc` $\ge 2024.1$ (from LunarG Vulkan SDK or package manager)
-- **Python**: $\ge 3.8$ with `numpy`, `pytest`
+- **Python**: $\ge 3.8$ with `numpy`, `pytest`, `ruff`
 
 ### Build from Source
 
 ```bash
-# 1. Fetch Vulkan headers
+# 1. Fetch dependencies and Vulkan headers
 scripts/fetch_deps.sh
 
-# 2. Configure CMake and compile SPIR-V shaders via slangc
+# 2. Configure and build C++ backend + Slang SPIR-V shaders
 cmake -S . -B build -DPython_EXECUTABLE=$(which python3)
 cmake --build build -j$(nproc)
 
-# 3. Run the full unit and regression test suite
+# 3. Run unit tests
 PYTHONPATH=. pytest
 ```
 
@@ -300,12 +335,24 @@ VulTorch enforces a strict **zero-warning** policy across all C++, Slang, and Py
 scripts/check.sh
 ```
 
-Every operator is checked via finite-difference `torch.gradcheck` to guarantee analytical mathematical correctness across CPU, integrated GPUs, and discrete GPUs before landing in the codebase.
+- Enforces `-Werror` in C++ with Allman style via `.clang-format`.
+- Enforces strict formatting and linting via `ruff format` and `ruff check`.
+- Every operator undergoes finite-difference `torch.gradcheck` verification across CPU, integrated GPUs, and discrete GPUs.
+
+---
+
+## 🤖 Agent & Developer Resources
+
+VulTorch includes native discoverability files for AI coding agents, autonomous workflows, and LLMs:
+
+- **[`AGENTS.md`](AGENTS.md):** Architectural patterns, constraints (no CUDA, no `.numpy()` in compute kernels, Allman C++ style), and standard idioms.
+- **[`llms.txt`](llms.txt):** Structured project overview, core APIs, and cookbook links for LLM context injection.
+- **[`llms-full.txt`](llms-full.txt):** Full comprehensive API surface reference including tensor math, neural layers, optimizers, and Vulkan driver flags.
 
 ---
 
 ## 📜 License
 **GNU Lesser General Public License v3.0 (`LGPL-3.0-only`)** — see [LICENSE](LICENSE) and [LICENSE.GPLv3](LICENSE.GPLv3).
 
-- **Free to use in hobbyist, research, and commercial/enterprise applications:** You can `import vultorch` in proprietary or closed-source applications and training pipelines without having to open-source your own application or model code.
-- **Anti-plagiarism copyleft on VulTorch itself:** Any modification to VulTorch's Slang shaders, C++ backend, or Python source, or any derivative library/Python package incorporating VulTorch code, must be released under LGPLv3 (or GPLv3) with full source code and attribution.
+- **Free to use in research, commercial, and proprietary applications:** You can `import vultorch` in closed-source applications, cloud services, and training pipelines without having to open-source your models or application code.
+- **Anti-plagiarism copyleft on VulTorch internals:** Any modification to VulTorch's Slang shaders, C++ backend, or Python source, or any derivative library incorporating VulTorch code, must be released under LGPLv3 (or GPLv3) with full source code and attribution.

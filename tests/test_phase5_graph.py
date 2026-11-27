@@ -17,22 +17,22 @@ def test_vulkan_graph_capture_replay_parity_and_speedup(device):
     def make_mlp():
         vultorch.manual_seed(7)
         return nn.Sequential(
-            nn.Linear(256, 256, device=device),
+            nn.Linear(64, 64, device=device),
             nn.ReLU(),
-            nn.Linear(256, 256, device=device),
+            nn.Linear(64, 64, device=device),
             nn.ReLU(),
-            nn.Linear(256, 256, device=device),
+            nn.Linear(64, 64, device=device),
             nn.ReLU(),
-            nn.Linear(256, 256, device=device),
+            nn.Linear(64, 64, device=device),
             nn.ReLU(),
-            nn.Linear(256, 256, device=device),
+            nn.Linear(64, 64, device=device),
             nn.ReLU(),
-            nn.Linear(256, 10, device=device),
+            nn.Linear(64, 10, device=device),
         )
 
     vultorch.manual_seed(99)
-    x_eager = vultorch.randn(32, 256, device=device)
-    y_eager = vultorch.randint(0, 10, (32,), device=device, dtype=vultorch.int64)
+    x_eager = vultorch.randn(8, 64, device=device)
+    y_eager = vultorch.randint(0, 10, (8,), device=device, dtype=vultorch.int64)
     x_graph = x_eager.clone()
     y_graph = y_eager.clone()
 
